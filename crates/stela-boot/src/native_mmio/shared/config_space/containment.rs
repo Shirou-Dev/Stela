@@ -1169,7 +1169,7 @@ impl Source {
                 crate::apic::rdtsc().wrapping_sub(started) >= limit
             })?;
             // Stopped controls read back, and Bus Master is sealed: clear,
-            // or proven hard-wired on a root-bus host bridge.
+            // or proven hard-wired on a root-bus host or ISA bridge.
             plan.seal(&mut config)?;
             if header.bridge.is_some() {
                 config.seal_bus_routing()?;

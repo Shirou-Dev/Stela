@@ -892,6 +892,43 @@ fn containment_refuses_a_hardwired_bus_master_off_the_root_bus() {
     assert!(!config.master_sealed);
 }
 
+/// An ISA/LPC bridge on the root bus, class 0601 with no INTx pin, as the
+/// chipsets report it. Intel's PCH reads 0x0007 and implements no INTx
+/// Disable; AMD's FCH reads 0x040f. Both hold Bus Master set: the seal
+/// proves it and accepts it. Behind a downstream port the same function
+/// is refused, and one whose bit clears is sealed as clear.
+#[test]
+fn containment_seals_a_root_bus_isa_bridge_whose_bus_master_is_hardwired() {
+    fn isa_bridge(command: u16, fixed: u16) -> Function<Config> {
+        let mut function = host_bridge(0, 0);
+        let config = function.config();
+        config.write32(8, 0x0601_0000).unwrap();
+        config.write16(regs::COMMAND, command).unwrap();
+        config.command_fixed = fixed;
+        function
+    }
+    for (found, stopped) in [(0x0007, 0x0403), (0x040f, 0x040b)] {
+        let mut function = isa_bridge(found, u16::MAX);
+        let config = function.config();
+        config.command_writes.clear();
+        assert_eq!(contain(config, true), Ok(()));
+        assert_eq!(config.read16(regs::COMMAND), Ok(found));
+        assert!(config.master_sealed);
+        assert_eq!(config.command_writes, [stopped, stopped]);
+        assert!(config.write16(regs::COMMAND, found).is_err());
+
+        let mut function = isa_bridge(found, u16::MAX);
+        let config = function.config();
+        assert!(contain(config, false).is_err());
+        assert!(!config.master_sealed);
+    }
+    let mut function = isa_bridge(0x0007, 0);
+    let config = function.config();
+    assert_eq!(contain(config, true), Ok(()));
+    assert_eq!(config.read16(regs::COMMAND), Ok(0x0403));
+    assert!(config.master_sealed);
+}
+
 #[test]
 fn containment_sets_intx_disable_where_writable_even_without_a_pin() {
     let mut function = endpoint();
