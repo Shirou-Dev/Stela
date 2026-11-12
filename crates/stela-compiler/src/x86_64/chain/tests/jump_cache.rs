@@ -176,12 +176,17 @@ const fn exit(target: u64, kind: ExitKind) -> (u64, u64) {
     (target, kind as u64 | (RAN as u64) << 20)
 }
 
-/// A probe's transfer fills the entry, which the next transfer takes from
-/// the tail without the ITLB or the table: until the serial moves, after
-/// which the forgotten page exits as the probe would.
+/// A probe's transfer fills the entry, counted as a fill, which the next
+/// transfer takes from the tail without the ITLB or the table: until the
+/// serial moves, after which the forgotten page exits as the probe would.
 #[test]
 fn a_filled_entry_holds_until_the_serial_moves() {
     const PC: u64 = 0x1_0000_0100;
+    let filled = |world: &World| {
+        // SAFETY: the world's stamps, whose table lives.
+        let counts = unsafe { stamp_counts(world.control.stamps) };
+        counts[StampCount::Filled as usize]
+    };
     let mut world = World::new();
     world.map(PC, block_key(0x4000_0000, 1), 3, 0b1111);
     world.enter();
@@ -194,12 +199,14 @@ fn a_filled_entry_holds_until_the_serial_moves() {
         ),
         (1, u64::from(RAN), 3)
     );
+    assert_eq!(filled(&world), 1);
     // A TLBI of the page: the probe would exit, the cached entry still
     // holds in this serial (as a direct link would, until the run ends).
     let page = PC & !0xfff;
     assert!(world.itlb.forget_range(page..=page | 0xfff, u64::MAX));
     assert_eq!(world.run(0, PC), (0x7703, 99));
     assert_eq!(world.control.hits, 2);
+    assert_eq!(filled(&world), 1, "the cache's hit fills nothing");
     assert_eq!(world.run(16, PC), exit(PC, ExitKind::Return));
     // The next native entry moves the serial: the tail misses, and the
     // probe exits.

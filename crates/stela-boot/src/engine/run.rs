@@ -1626,9 +1626,13 @@ impl Heartbeat {
                 "PES STORE user_compiled/user_unstorable/user_pack/user_shared/user_rebased",
                 "/kernel_compiled/kernel_unstorable/kernel_pack/kernel_shared/kernel_rebased",
             ));
-            let mut stamped = String::from(
-                "PES STAMPED hits/miss_epoch/miss_context/miss_interrupt/restamped/changed/promoted",
-            );
+            // Per PE: stamped tail hits and misses by cause, stamps written,
+            // changed cells, table probe transfers (jump cache misses), stamped
+            // tails made, then every probe transfer (jump cache and table).
+            let mut stamped = String::from(concat!(
+                "PES STAMPED hits/miss_epoch/miss_context/miss_interrupt/restamped/changed",
+                "/filled/promoted/probe_hits",
+            ));
             let mut stamped_in_use = 0;
             let mut predicted = 0;
             let mut pac_fills = 0;
@@ -1787,6 +1791,10 @@ impl Heartbeat {
                     &now.stamped[..promoted],
                     &before.stamped[..promoted],
                 );
+                stamped.push_str(&format!(
+                    "/{}",
+                    now.stamped[promoted + 2].saturating_sub(before.stamped[promoted + 2])
+                ));
                 stamped_in_use = stamped_in_use.max(now.stamped[promoted]);
                 predicted += now.stamped[promoted + 1].saturating_sub(before.stamped[promoted + 1]);
                 pac_fills += now.pac_fills.saturating_sub(before.pac_fills);

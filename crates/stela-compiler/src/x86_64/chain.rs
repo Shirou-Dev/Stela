@@ -737,10 +737,14 @@ pub enum StampCount {
     /// Stamping cell probe transfers through a cell changed since its link,
     /// which no stamp names until the exit is linked again.
     Changed,
+    /// Table probe transfers, each of which fills the jump cache: the
+    /// lookup tail transfers the cache did not serve. The other probe
+    /// transfers counted in `ChainControl::hits` are the cache's hits.
+    Filled,
 }
 
 /// How many [`StampCount`]s there are.
-pub const STAMP_COUNTS: usize = 6;
+pub const STAMP_COUNTS: usize = 7;
 
 impl StampCount {
     /// Its word's offset from the stamps.
@@ -2861,8 +2865,9 @@ fn lookup_tail_with_policy(
     code.try_into().ok()
 }
 
-/// Fill this PE's jump cache entry of the target in RAX ([`lookup_tail`])
-/// with the block the table probe just entered: its code in R9, its index
+/// Count a table probe transfer ([`StampCount::Filled`]) and fill this
+/// PE's jump cache entry of the target in RAX ([`lookup_tail`]) with the
+/// block the table probe just entered: its code in R9, its index
 /// in R8D and its entry's last word in R11D, as the probe read them, whose
 /// low byte is the BTYPEs it accepts (`META_TARGETS`), all a tail reads of
 /// it; nothing for a control without stamps. Clobbers RDX, R10 and R11.
@@ -2872,6 +2877,12 @@ fn fill_jump_cache(asm: &mut crate::x86_64::asm::Asm) {
     asm.mov_load(Qword, R10, Mem::base(Rcx, STAMPS));
     asm.test(Qword, R10, R10);
     let none = asm.jcc8(Cond::E);
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(R10, StampCount::Filled.offset()),
+        1,
+    );
     asm.mov(Dword, Rdx, Rax);
     asm.alu_imm32(Alu::And, Dword, Rdx, JUMP_INDEX);
     asm.mov_store(Qword, entry(JUMP_PC), Rax);

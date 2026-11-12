@@ -380,7 +380,7 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     assert_eq!(through(&mut control, &table), ((0x7703, 99), true));
     assert_eq!(through(&mut control, &table), ((0x7703, 99), false));
     assert_eq!((control.budget, control.retired, control.block), (98, 8, 3));
-    assert_eq!(counts(), [1, 1, 0, 0, 1, 0]);
+    assert_eq!(counts(), [1, 1, 0, 0, 1, 0, 0]);
     // A drop in the half: the probe again, which stamps again.
     itlb.forget_range_where(0..=0, |_| true);
     assert_eq!(through(&mut control, &table), ((0x7703, 99), false));
