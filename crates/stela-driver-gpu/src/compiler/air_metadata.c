@@ -2300,7 +2300,11 @@ metadata_arguments(struct stela_air_metadata *t, LLVMValueRef fn, LLVMValueRef a
          if (indirect && !argument_fields(t, kernel, struct_info, desc.type_size, index, 0,
                                           &argument_buffer))
             return false;
-         if (shared && (!has_size || !has_align || !desc.type_size || !desc.type_alignment))
+         /* A threadgroup void * declares neither size nor alignment: its
+          * bytes are only the length its dispatches set, placed as any
+          * threadgroup buffer is, and its accesses aligned as LLVM says, as
+          * a device void *'s are. A typed one declares both. */
+         if (shared && (has_size != has_align || (has_size && !desc.type_size)))
             return fail(t, STELA_AIR_ARGUMENT, "invalid/unbound threadgroup buffer %u", index);
       } else if (payload) {
          /* An object function writes its payload; its mesh functions read it. */

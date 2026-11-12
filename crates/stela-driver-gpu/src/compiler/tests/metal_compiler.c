@@ -4488,6 +4488,74 @@ dynamic_kernels_take_their_dispatch_shape(void)
           error.kind == STELA_AIR_INPUT);
 }
 
+/* `shaped` with its threadgroup buffer's metadata typed by `typing`. */
+static char *
+shaped_typed(const char *typing)
+{
+   static const char typed[] =
+      "!\"air.address_space\", i32 3, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4,"
+      " !\"air.arg_type_name\", !\"uint\",";
+   const char *at = strstr(shaped, typed);
+   assert(at && !strstr(at + 1, typed));
+   return ralloc_asprintf(NULL, "%.*s!\"air.address_space\", i32 3%s%s", (int)(at - shaped), shaped,
+                          typing, at + strlen(typed));
+}
+
+/* A `threadgroup void *` argument, which declares neither size nor
+ * alignment, as MPS's reductions take theirs: it reflects no bytes of its
+ * own, takes its dispatch's length and placement, and its stores reach the
+ * memory a typed buffer's do. Half a declaration is refused. */
+static void
+untyped_threadgroup_buffers_take_their_dispatch_lengths(void)
+{
+   struct stela_air_error error;
+   char *untyped = shaped_typed(", !\"air.arg_type_name\", !\"void\",");
+   struct stela_metal_reflection reflection;
+   assert(reflect(untyped, "shaped", &reflection, &error));
+   assert(reflection.threadgroup_count == 1 && reflection.threadgroup[0].index == 1 &&
+          reflection.threadgroup[0].bytes == 0);
+
+   struct stela_metal_specialization specialization = {
+      .workgroup_size = {64, 1, 1}, .dynamic_threadgroups = 1,
+   };
+   nir_shader *shader = compile(untyped, "shaped", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "untyped dynamic: %u %s\n", error.kind, error.detail);
+   assert(shader);
+   struct air_effect_store trace[8];
+   assert(run_shaped(shader, 5, trace, ARRAY_SIZE(trace)) == 4);
+   expect_store(&trace[0], false, BASE + OUT, (const uint32_t[]){1, 1, 0}, 3);
+   expect_store(&trace[1], false, BASE + OUT + 16, (const uint32_t[]){4, 2, 1}, 3);
+   expect_store(&trace[2], false, BASE + OUT + 32, (const uint32_t[]){5, 1, 0}, 3);
+   expect_store(&trace[3], true, 48, (const uint32_t[]){1}, 1);
+   stela_metal_release(shader);
+
+   const struct stela_metal_threadgroup_length lengths[] = {{1, 256}};
+   specialization = (struct stela_metal_specialization){
+      .workgroup_size = {64, 1, 1}, .threadgroup_length_count = 1, .threadgroup_lengths = lengths,
+   };
+   shader = compile(untyped, "shaped", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "untyped: %u %s\n", error.kind, error.detail);
+   assert(shader && shader->info.shared_size >= 256);
+   stela_metal_release(shader);
+   /* Its only bytes are its dispatch's length. */
+   specialization.threadgroup_length_count = 0;
+   assert(!compile(untyped, "shaped", &specialization, &error) && error.kind == STELA_AIR_ARGUMENT);
+   ralloc_free(untyped);
+
+   const char *halves[] = {
+      ", !\"air.arg_type_size\", i32 4, !\"air.arg_type_name\", !\"uint\",",
+      ", !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", !\"uint\",",
+      ", !\"air.arg_type_size\", i32 0, !\"air.arg_type_align_size\", i32 4,",
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(halves); i++) {
+      char *half = shaped_typed(halves[i]);
+      assert(!reflect(half, "shaped", &reflection, &error) && error.kind == STELA_AIR_ARGUMENT);
+      ralloc_free(half);
+   }
+}
+
 /* TEMPORARY host harness (not for commit). */
 static void
 harness(void)
@@ -4573,6 +4641,7 @@ main(void)
    reflection_requires_a_unique_listed_entry();
    kernels_reflect_and_compile_their_threadgroup_memory();
    dynamic_kernels_take_their_dispatch_shape();
+   untyped_threadgroup_buffers_take_their_dispatch_lengths();
    render_stages_compile_at_their_linked_locations();
    patch_functions_compile_behind_their_tessellation_stages();
    kernels_compile_with_their_stage_in();
