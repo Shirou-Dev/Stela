@@ -774,14 +774,9 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
             "repair it with this older stela",
         )?;
     }
-    // Its copy of the active build is gone for the new one's room: the
-    // update finishes it, and repair would download the old one again.
-    if let Some(next) = &record.replacing {
-        bail!(
-            "the update to macOS {next} stopped before its copy was complete: {} finishes it",
-            fix(usb, &format!("update --macos {next}"))
-        );
-    }
+    // A macOS switch that stopped part way never comes here: `repair`
+    // finishes it as an update (`Request::dispatch`).
+    debug_assert!(record.replacing.is_none());
     let esp = record.esp.clone();
     let mut text = format!("Stela repair on {}:\n", esp.display());
     text.push_str(&device_skips(&esp, "stela setup repair", command.dry_run)?);
