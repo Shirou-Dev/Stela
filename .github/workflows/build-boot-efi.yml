@@ -18,7 +18,7 @@ defaults:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
+  CARGO_INCREMENTAL: "1"
 
 jobs:
   efi:
@@ -70,6 +70,15 @@ jobs:
         with:
           path: target/gpu
           key: nvk-${{ steps.keys.outputs.nvk }}-${{ hashFiles('xtask/src/gpu/**', 'crates/stela-driver-gpu/**', 'third_party/patches/**', 'third_party/*.sparse') }}
+
+      - uses: actions/cache@v4
+        id: boot-cache
+        with:
+          path: target/boot
+          key: boot-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/stela-boot/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            boot-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/stela-boot/Cargo.lock') }}-
+            boot-${{ runner.os }}-
 
       - name: Fetch upstream sources
         run: cargo xtask gpu fetch

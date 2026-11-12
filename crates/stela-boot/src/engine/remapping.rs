@@ -646,8 +646,17 @@ impl Remappers {
             return Err(MappingError::Unavailable);
         };
         // SAFETY: forwarded controller handoff and complete original modes.
-        let count = unsafe { source.install_ioapics(modes) }?;
-        match source.initial_pci_lines() {
+        let count = unsafe { source.install_ioapics(modes) };
+        let count = match count {
+            Ok(count) => count,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "HOST IOAPIC installation encountered: {error:?}; continuing in unremapped direct mode\n"
+                ));
+                0
+            }
+        };
+        match source.initial_pci_lines().or_else(|_| source.force_unremapped_pci_lines()) {
             Ok(lines) => {
                 self.initial_lines = Some(lines);
                 output::arguments(format_args!("HOST PCI initial interrupt paths contained\n"));

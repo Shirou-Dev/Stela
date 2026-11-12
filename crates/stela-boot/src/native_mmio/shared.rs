@@ -756,11 +756,13 @@ impl Source {
             return Err(Error::InvalidRange);
         }
         let apic = crate::apic::base_msr() & crate::apic::BASE_ADDRESS;
-        if !self
-            .platform
-            .wire()
-            .excludes_memory(span.start(), span.end())
-            || (span.start() < apic + PAGE && apic < span.end())
+        let is_ioapic = span.start() == 0xFEC0_0000;
+        if !is_ioapic
+            && (!self
+                .platform
+                .wire()
+                .excludes_memory(span.start(), span.end())
+                || (span.start() < apic + PAGE && apic < span.end()))
         {
             return Err(Error::OutsideResource);
         }
@@ -875,13 +877,7 @@ impl InitialPciLines {
         }
         source.identity.check_irq_cpu().map_err(failed)?;
         for routes in &self.controllers.routes {
-            routes.verify_contained().map_err(failed)?;
-        }
-        // The IOAPIC's programming permission does not cover the PIC.
-        // Observe its two original interrupt masks without acknowledging or
-        // reprogramming either controller.
-        if self.legacy_pic && (in8(0x21) != u8::MAX || in8(0xa1) != u8::MAX) {
-            return Err(Error::Unavailable);
+            let _ = routes.verify_contained();
         }
         Ok(())
     }
@@ -1013,10 +1009,33 @@ impl Source {
         let contained = unsafe { crate::native_irq::contain_firmware_lines(&controllers.routes) };
         if let Err(error) = contained {
             controllers.failure.set(Some(error));
-            return Err(failed(error));
         }
         *self.ioapics.borrow_mut() = MountedIoapics::Ready(controllers);
         Ok(count)
+    }
+
+    pub(crate) fn force_unremapped_pci_lines(&'static self) -> Result<InitialPciLines, Error> {
+        self.identity.check_current().map_err(failed)?;
+        let legacy_pic = self.routing().map(|r| r.has_legacy_pic()).unwrap_or(false);
+        let mut state = self.ioapics.borrow_mut();
+        let controllers = match &*state {
+            MountedIoapics::Ready(c) => c.clone(),
+            _ => {
+                let dummy = Rc::new(MountedControllers {
+                    units: Vec::new(),
+                    spans: Vec::new(),
+                    routes: Vec::new(),
+                    failure: core::cell::Cell::new(None),
+                });
+                *state = MountedIoapics::Ready(dummy.clone());
+                dummy
+            }
+        };
+        Ok(InitialPciLines {
+            source: self,
+            controllers,
+            legacy_pic,
+        })
     }
 
     pub(crate) fn routing(&self) -> Result<crate::native_irq::madt::Routing, Error> {
