@@ -42,10 +42,10 @@ and supports the Metal3 and Apple7 GPU families.
 
 1. Download `stela` from the
    [releases page](https://github.com/tylertms/Stela/releases).
-2. Run `sudo ./stela setup` (Linux, macOS) or double-click `stela.exe`
+2. Run `sudo ./stela` (Linux, macOS) or double-click `stela.exe`
    (Windows).
-3. Choose the USB stick, the installer, the macOS version and the Mac model,
-   then confirm. Setup erases the USB stick.
+3. Choose the USB stick and the installer, then confirm. This erases the USB
+   stick.
 4. Boot the PC from the USB stick.
 
 ## Update
@@ -53,13 +53,13 @@ and supports the Metal3 and Apple7 GPU families.
 Download the new `stela`, plug the USB stick in and run:
 
 ```sh
-sudo ./stela setup update stela
+sudo ./stela update
 ```
 
 On Windows, open Terminal with Run as administrator and run:
 
 ```
-.\stela.exe setup update stela
+.\stela.exe update
 ```
 
 ## Logs
@@ -68,7 +68,7 @@ If Stela does not work, plug the USB stick into the computer that made it and
 save the boot log. Include `log.txt` in your GitHub Issue.
 
 ```sh
-sudo ./stela setup boot-log --output log.txt
+sudo ./stela log --output log.txt
 ```
 
 On Windows, open Terminal with Run as administrator and run:

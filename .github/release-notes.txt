@@ -5,13 +5,13 @@ Download the archive for your system, unpack it and plug in the USB stick. Then 
 Make a new stick (this erases it):
 
 ```
-sudo ./stela setup
+sudo ./stela
 ```
 
 Update an existing Stela stick to v@VERSION@:
 
 ```
-sudo ./stela setup update stela
+sudo ./stela update
 ```
 
 On Windows, open Terminal with Run as administrator and write `.\stela.exe` in place of `sudo ./stela`.
@@ -25,5 +25,5 @@ Then boot the PC from the stick.
 If Stela does not work, save the boot log and include `log.txt` in your report:
 
 ```
-sudo ./stela setup boot-log --output log.txt
+sudo ./stela log --output log.txt
 ```
