@@ -4,7 +4,7 @@ use crate::bus::{
     pci::{Address, ConfigSpace},
 };
 use alloc::collections::BTreeMap;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 #[derive(Default)]
 struct Model {
@@ -17,6 +17,11 @@ struct Model {
     mdic_timeout: bool,
     mdic_error: bool,
     wrong_register: bool,
+    /// MDIO ownership claims refused before one is granted.
+    ownership_refusals: Cell<usize>,
+    /// Reads of the PHY control register that still show a PHY reset.
+    phy_reset_polls: Cell<usize>,
+    phy_reset_left: Cell<usize>,
 }
 
 impl Model {
@@ -39,6 +44,11 @@ impl Registers for Model {
         if offset == EXTCNF_CTRL && self.ownership_blocked {
             value &= !MDIO_OWN;
         }
+        if offset == EXTCNF_CTRL && value & MDIO_OWN != 0 && self.ownership_refusals.get() != 0 {
+            self.ownership_refusals
+                .set(self.ownership_refusals.get() - 1);
+            value &= !MDIO_OWN;
+        }
         if offset == CTRL {
             if value & CTRL_RST != 0 && !self.reset_stuck {
                 value &= !CTRL_RST;
@@ -53,8 +63,15 @@ impl Registers for Model {
                 value |= MDIC_ERROR;
             } else if value & MDIC_READ != 0 {
                 value |= u32::from(self.phy.borrow()[register]);
+                if register == usize::from(PHY_CONTROL) && self.phy_reset_left.get() != 0 {
+                    self.phy_reset_left.set(self.phy_reset_left.get() - 1);
+                    value |= u32::from(PHY_RESET);
+                }
             } else {
                 let data = value as u16;
+                if register == usize::from(PHY_CONTROL) && data & PHY_RESET != 0 {
+                    self.phy_reset_left.set(self.phy_reset_polls.get());
+                }
                 self.phy.borrow_mut()[register] = if register == usize::from(PHY_CONTROL) {
                     data & !(PHY_RESET | PHY_RESTART)
                 } else {
@@ -94,6 +111,161 @@ impl Timer for ModelTimer {
         self.waits.borrow_mut().push(microseconds);
         (0..4).any(|_| ready())
     }
+}
+
+/// A clock whose waits poll every 100 us of model time, as a real deadline
+/// wait polls, counting the time waited.
+#[derive(Default)]
+struct PollingTimer {
+    elapsed: Cell<u64>,
+}
+
+impl Timer for PollingTimer {
+    fn delay(&self, microseconds: u64) -> Result<(), BlockError> {
+        self.elapsed.set(self.elapsed.get() + microseconds);
+        Ok(())
+    }
+
+    fn wait(&self, microseconds: u64, mut ready: impl FnMut() -> bool) -> bool {
+        let mut waited = 0;
+        loop {
+            if ready() {
+                return true;
+            }
+            if waited >= microseconds {
+                return false;
+            }
+            waited += 100;
+            self.elapsed.set(self.elapsed.get() + 100);
+        }
+    }
+}
+
+/// A reset task waiting on MDIO ownership firmware holds and on slow PHY
+/// resets, about a second in all, runs in steps: none waits more than
+/// 60 ms, and it makes the same register writes as the blocking one.
+#[test]
+fn a_stepped_reinitialization_matches_the_blocking_one_and_waits_little_per_step() {
+    let run = |stepped: bool| {
+        let model = Model::ready();
+        model.ownership_refusals.set(1_500);
+        model.phy_reset_polls.set(300);
+        let timer = PollingTimer::default();
+        let mut steps = 0;
+        let result = if stepped {
+            let slice = Allowance::new(STEP_US);
+            let hardware = Hardware::new(&model, &timer).sliced(&slice);
+            let mut task = core::pin::pin!(hardware.reinitialize());
+            loop {
+                slice.refill();
+                let before = timer.elapsed.get();
+                let step = stela_driver_base::stepped::poll_once(task.as_mut());
+                let waited = timer.elapsed.get() - before;
+                assert!(waited <= 60_000, "step {steps} waited {waited} us");
+                steps += 1;
+                if let Poll::Ready(result) = step {
+                    break result;
+                }
+            }
+        } else {
+            block_on(Hardware::new(&model, &timer).reinitialize())
+        };
+        let writes = model.writes.borrow().clone();
+        (result, steps, writes, timer.elapsed.get())
+    };
+    let (blocking, _, writes, waited) = run(false);
+    let (stepped, steps, stepped_writes, stepped_waited) = run(true);
+    assert_eq!(blocking, Ok(()));
+    assert_eq!(stepped, Ok(()));
+    assert_eq!(stepped_writes, writes);
+    assert!(waited > 700_000, "{waited}");
+    // A piece ends with one more poll at its expiry, so a little less.
+    assert!(
+        waited - stepped_waited < 10_000,
+        "{stepped_waited} {waited}"
+    );
+    assert!(steps > 15, "{steps}");
+}
+
+/// A PHY check on ownership firmware holds runs in steps too.
+#[test]
+fn a_stepped_phy_check_waits_little_per_step() {
+    let model = Model::ready();
+    model.phy.borrow_mut()[usize::from(PHY_RECEIVE_ERRORS)] = u16::MAX;
+    model.phy.borrow_mut()[usize::from(PHY_GIGABIT_STATUS)] = PHY_IDLE_ERRORS;
+    model.ownership_refusals.set(1_500);
+    let timer = PollingTimer::default();
+    let slice = Allowance::new(STEP_US);
+    let hardware = Hardware::new(&model, &timer).sliced(&slice);
+    let mut task = core::pin::pin!(hardware.phy_hung());
+    let mut steps = 0;
+    let hung = loop {
+        slice.refill();
+        let before = timer.elapsed.get();
+        let step = stela_driver_base::stepped::poll_once(task.as_mut());
+        assert!(timer.elapsed.get() - before <= 60_000);
+        steps += 1;
+        if let Poll::Ready(hung) = step {
+            break hung;
+        }
+    };
+    assert!(hung);
+    assert!(steps >= 4, "{steps}");
+    assert_eq!(model.read(EXTCNF_CTRL) & MDIO_OWN, 0);
+}
+
+/// While a reset runs, every link call takes one step of at most 60 ms:
+/// the carrier is down, frames are refused and received frames wait, and
+/// neither ring moves. Here the bus master never drains, so it fails
+/// after its 160 ms, as the blocking reset did.
+#[test]
+fn link_calls_take_a_reset_a_step_at_a_time_and_leave_the_rings_alone() {
+    let mut fixture = Fixture::new();
+    let _clock = crate::test_clock::virtualize();
+    let nominal = Clock {
+        ticks_per_microsecond: 1,
+    };
+    let (timing, minimum) = crate::timing::counted_model(nominal);
+    fixture.net.clock = timing;
+    fixture.net.transmit(&[1; 60]).unwrap();
+    fixture.inject(0, 60, RX_DONE | RX_EOP, 0, 7);
+    fixture.registers[STATUS / 4] = STATUS_LU | STATUS_MASTER;
+    let spent = || nominal.now_us() + minimum.get();
+    let before = spent();
+    assert_eq!(fixture.net.reinitialize(), Ok(()));
+    assert!(spent() - before <= 60_000);
+    assert!(fixture.net.resetting());
+    let (tail, head) = (fixture.registers[TDT / 4], fixture.registers[RDT / 4]);
+    let receive = fixture.net.receive.descriptors.bytes().to_vec();
+    let mut calls = 0;
+    while fixture.net.resetting() {
+        let before = spent();
+        let result = match calls % 3 {
+            0 => Ok(fixture.net.carrier()).map(|up| assert!(!up)),
+            1 => fixture
+                .net
+                .transmit(&[2; 60])
+                .map(|()| panic!("sent while resetting")),
+            _ => fixture.net.receive().map(|frame| assert_eq!(frame, None)),
+        };
+        calls += 1;
+        assert!(spent() - before <= 60_000, "call {calls}");
+        match result {
+            // The call that ends the reset reports its failure.
+            Err(LinkError::Adapter(message)) => {
+                assert!(message.contains("reinitialization failed"), "{message}");
+                assert!(!fixture.net.resetting());
+            }
+            Err(LinkError::NoCarrier) | Ok(()) => {}
+            other => panic!("{other:?}"),
+        }
+        if fixture.net.resetting() {
+            assert_eq!(fixture.registers[TDT / 4], tail);
+            assert_eq!(fixture.registers[RDT / 4], head);
+            assert_eq!(fixture.net.receive.descriptors.bytes(), receive);
+        }
+    }
+    assert!(calls >= 3, "{calls}");
 }
 
 #[test]
@@ -339,6 +511,7 @@ impl Fixture {
             timing_failure: None,
             location: String::from("model"),
             signalled: false,
+            work: None,
         };
         net.start();
         registers[STATUS / 4] = STATUS_LU;
