@@ -1018,6 +1018,21 @@ impl Request {
         if !matches!(action, Action::UpdateOs) {
             self.build = record.build.clone();
         }
+        // An older stela asks before it changes a newer stick; `update` and
+        // a plain `repair` ask in their own words.
+        let changes_stick = match &action {
+            Action::Repair => !record.complete || record.replacing.is_some(),
+            Action::UpdateOs | Action::Configure | Action::HostFirmwareInstall(_) => true,
+            _ => false,
+        };
+        if changes_stick && !self.dry_run {
+            release::allow_older(
+                environment,
+                &record,
+                self.yes,
+                "change it with this older stela",
+            )?;
+        }
         match action {
             // An interrupted first setup is finished as it began.
             Action::Repair if !record.complete => self.finish_create(environment, &record),

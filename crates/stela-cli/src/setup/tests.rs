@@ -5799,9 +5799,20 @@ fn an_older_stela_asks_before_it_changes_a_newer_stick_and_a_no_changes_nothing(
             "the stick changed"
         )
     };
-    for action in [|| Action::UpdateStela, || Action::Repair] {
+    for action in [
+        || Action::UpdateStela,
+        || Action::Repair,
+        || Action::Configure,
+    ] {
+        let action = || {
+            let action = action();
+            let configure = matches!(action, Action::Configure);
+            (action, configure.then_some(command::Wait::Seconds(3)))
+        };
         // Without a terminal: refused, naming --yes.
-        let error = rerun(&f, |c| c.action = action()).unwrap_err().to_string();
+        let error = rerun(&f, |c| (c.action, c.chooser_timeout) = action())
+            .unwrap_err()
+            .to_string();
         assert!(
             error.contains("newer than this stela") && error.contains("Add --yes"),
             "{error}"
@@ -5810,7 +5821,8 @@ fn an_older_stela_asks_before_it_changes_a_newer_stick_and_a_no_changes_nothing(
         // Asked on a terminal, and declined.
         let no = ui::tests::Scripted::new(&["no"]);
         let mut request = command(&f, &f.esp);
-        (request.ipsw, request.model, request.action) = (None, None, action());
+        (request.ipsw, request.model) = (None, None);
+        (request.action, request.chooser_timeout) = action();
         let environment = Environment {
             ui: &no,
             ..environment(&f.host)
@@ -5823,6 +5835,22 @@ fn an_older_stela_asks_before_it_changes_a_newer_stick_and_a_no_changes_nothing(
         );
         unchanged();
     }
+    // Finishing a macOS switch the newer Stela began asks too.
+    let mut switching = record(&f);
+    switching.replacing = Some("STELA2".into());
+    record::write_record(&f.esp, &switching).unwrap();
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    let error = rerun(&f, |c| c.action = Action::Repair)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("newer than this stela") && error.contains("Add --yes"),
+        "{error}"
+    );
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+    let mut done = record(&f);
+    done.replacing = None;
+    record::write_record(&f.esp, &done).unwrap();
     // --yes puts this Stela on it.
     rerun(&f, |c| {
         c.action = Action::UpdateStela;
