@@ -1633,6 +1633,7 @@ fn installed_disk_preserves_boot_choices_and_partitions() {
         error.contains("is not connected to this computer"),
         "{error}"
     );
+    assert!(error.contains("run stela on the PC itself"), "{error}");
     assert_eq!(partition_bytes(&f, NOR), nor);
     f.host.partitions.get_mut(NOR).unwrap().0.guid = NOR_GUID.to_ascii_lowercase();
 
