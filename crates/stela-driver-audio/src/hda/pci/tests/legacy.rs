@@ -377,12 +377,13 @@ fn nvidia_coherence_and_dma_policy() {
     );
 }
 
+/// An RTX 50's audio function has PM at 0x40 and a 64-bit MSI at 0x48, whose
+/// address occupies the 0x4c..0x4e coherence bytes of the chipset functions.
+/// It is started, and nothing is written into the MSI capability.
 #[test]
-fn nvidia_controls_inside_an_msi_body_name_the_overlap() {
+fn nvidia_controls_inside_an_msi_body_are_left_out() {
     let (mut function, timer, bar) = fixture(3);
     set_identity(&mut function, NVIDIA, 0x22e9);
-    // A GPU HDMI function's layout: PM40 -> 64-bit MSI48, whose address
-    // occupies the 4ch..4eh coherence controls of the chipset functions.
     let config = function.config();
     config.words[13] = 0x40;
     config.words[16] = 0x0003_4801;
@@ -391,13 +392,12 @@ fn nvidia_controls_inside_an_msi_body_name_the_overlap() {
     config.words[20] = 0;
     config.words[24] = 0;
     config.words[28] = 0;
-    assert_eq!(
-        prepare_model(&mut function, &timer, bar).unwrap_err(),
-        AttachError::InvalidCapabilities(CapabilityRefusal::ControlOverlap {
-            control: NVIDIA_TRANSREG,
-            offset: 0x48,
-            id: 5,
-        })
+    prepare_model(&mut function, &timer, bar).unwrap();
+    assert!(
+        !function
+            .config()
+            .writes
+            .iter()
+            .any(|(offset, bytes, _, _)| *bytes == 1 || (0x4c..0x56).contains(offset))
     );
-    assert!(function.config().writes.is_empty());
 }

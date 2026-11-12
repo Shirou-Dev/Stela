@@ -122,7 +122,7 @@ impl ConfigSpace for Model {
     fn write16(&mut self, offset: u16, value: u16) -> Result<(), crate::bus::pci::ConfigError> {
         assert!(matches!(
             offset,
-            regs::COMMAND | 0x54 | 0x62 | 0x72 | 0xb2 | SCH_HDA_DEVC
+            regs::COMMAND | 0x44 | 0x4a | 0x54 | 0x62 | 0x72 | 0xb2 | SCH_HDA_DEVC
         ));
         self.writes
             .push((offset, 2, u32::from(value), self.now.get()));

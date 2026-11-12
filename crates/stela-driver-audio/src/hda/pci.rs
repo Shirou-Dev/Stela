@@ -462,6 +462,28 @@ struct Capabilities {
     pcie: Option<u16>,
 }
 
+/// The identity's vendor controls and the function's capabilities, checked
+/// against each other.
+///
+/// NVIDIA's coherence bytes at 0x4c..0x4e are the nForce chipset function's.
+/// A GPU's audio function whose capability list covers those bytes (an RTX 50
+/// has its MSI capability at 0x48) has no such registers, so it is started
+/// without them and the capability is not written through.
+fn controls_and_capabilities<C: ConfigSpace>(
+    config: &C,
+    selected: Identity,
+) -> Result<(&'static [Control], Capabilities), AttachError> {
+    let controls = selected.setup.controls();
+    match capabilities(config, controls, selected.reset_policy) {
+        Err(AttachError::InvalidCapabilities(CapabilityRefusal::ControlOverlap { .. }))
+            if selected.setup == Setup::Nvidia =>
+        {
+            Ok((&[], capabilities(config, &[], selected.reset_policy)?))
+        }
+        result => Ok((controls, result?)),
+    }
+}
+
 fn capabilities<C: ConfigSpace>(
     config: &C,
     controls: &[Control],
@@ -677,7 +699,7 @@ unsafe fn prepare_mapped<'a, C: ConfigSpace, R: Registers>(
     if registers.region_bytes() < 0x440 || registers.region_bytes() as u64 > bytes {
         return Err(AttachError::InvalidBar);
     }
-    let caps = capabilities(config, selected.setup.controls(), selected.reset_policy)?;
+    let (_, caps) = controls_and_capabilities(config, selected)?;
     let command = config.read16(regs::COMMAND)?;
     if command == u16::MAX || command & regs::COMMAND_MEMORY == 0 {
         return Err(AttachError::PowerNotReady);
@@ -849,8 +871,7 @@ unsafe fn prepare_inner<C: ConfigSpace>(
     }
     check_subsystem(config, actual, board)?;
     let (base, bytes, wide) = validated_bar(config, bar0)?;
-    let controls = selected.setup.controls();
-    let caps = capabilities(config, controls, selected.reset_policy)?;
+    let (controls, caps) = controls_and_capabilities(config, selected)?;
     let pmcsr = if let Some(pm) = caps.pm {
         let version = config.read16(pm + 2)? & 7;
         Some((pm + 4, version, config.read16(pm + 4)?))
