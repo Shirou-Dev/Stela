@@ -435,6 +435,14 @@ impl Host {
                     .borrow_mut()
                     .current_port_reset(None, port)?;
             }
+        } else if status & CCS == 0 {
+            // A device that was refused or retired while it stayed
+            // connected kept its grant with no owner. The port is empty
+            // now, so the grant goes, as hub.c's budget drops a
+            // disconnected child.
+            self.controller
+                .borrow_mut()
+                .current_port_reset(None, port)?;
         }
         // A USB 3 device whose link a warm reset must bring up shows no
         // connection until then (`hub_port_warm_reset_required`).

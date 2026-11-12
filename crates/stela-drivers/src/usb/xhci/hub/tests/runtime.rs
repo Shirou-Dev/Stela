@@ -758,6 +758,54 @@ fn runtime_hub_recovery_acknowledges_cools_rechecks_and_publishes_fresh_subtree(
     }
 }
 
+/// A root port's device whose slot went while it stayed connected (a
+/// refused enumeration) keeps its grant with no owner. The port's polls
+/// then find no owner and no failure, where each once refused the port,
+/// and its disconnection is seen and releases the grant.
+#[test]
+fn runtime_root_port_with_an_ownerless_grant_is_polled_and_released_on_disconnect() {
+    let speed = HIGH_SPEED;
+    let nodes = BTreeMap::from([(0, unbound_leaf(speed))]);
+    let mut dma = TestRegion::new(1024 * 1024 * 8);
+    let (mut c, model) = controller(&mut dma, 64, nodes);
+    let status = PP | CCS | PED | u32::from(speed) << 10;
+    model.borrow_mut().root_status = Some(status);
+    let mut failures = Vec::new();
+    let devices = c.enumerate(&mut dma, &mut failures);
+    assert_eq!(devices.len(), 1);
+    let slot = devices[0].slot;
+    let shared = Rc::new(RefCell::new(c));
+    let mut host = Host::new(shared.clone(), &devices, &mut dma, &mut failures);
+    runtime_poll(&mut host, &mut dma);
+    shared.borrow_mut().slots[usize::from(slot)] = None;
+    assert_eq!(shared.borrow().current_port_owner(None, 1), Ok(None));
+    for _ in 0..3 {
+        let changed = runtime_poll(&mut host, &mut dma);
+        assert!(
+            changed
+                .added
+                .failures
+                .iter()
+                .all(|(location, _)| !location.contains("root port")),
+            "{:?}",
+            changed.added.failures
+        );
+        assert!(shared.borrow().power.retained(slot));
+    }
+    model.borrow_mut().root_status = Some(PP | CSC);
+    let changed = runtime_poll(&mut host, &mut dma);
+    assert!(
+        changed
+            .added
+            .failures
+            .iter()
+            .all(|(location, _)| !location.contains("root port")),
+        "{:?}",
+        changed.added.failures
+    );
+    assert!(!shared.borrow().power.retained(slot));
+}
+
 #[test]
 fn runtime_persistent_hub_power_fault_keeps_public_aliases_fenced_until_restoration() {
     for local_loss in [false, true] {
