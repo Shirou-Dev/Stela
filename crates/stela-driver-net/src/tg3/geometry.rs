@@ -11,7 +11,7 @@ impl Geometry {
     pub const fn of(asic: Asic) -> Self {
         match asic {
             // 5761 is 5705_PLUS without LRG_PROD_RING_CAP/JUMBO_CAPABLE.
-            Asic::Bcm5761 => Self {
+            Asic::Bcm5761 | Asic::Bcm5784 => Self {
                 rx: 512,
                 returns: 512,
             },

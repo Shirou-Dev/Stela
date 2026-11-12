@@ -628,7 +628,7 @@ impl Device {
         self.require_bits(
             0x4800,
             0x1800_0000,
-            if self.is_5761() {
+            if self.is_legacy() {
                 0x0800_0000
             } else {
                 0x1800_0000
@@ -638,6 +638,8 @@ impl Device {
             self.require_5762_dma();
         } else if self.is_5761() {
             self.require_5761_dma();
+        } else if self.is_5784() {
+            self.require_5784_dma();
         }
         if matches!(path, DmaPath::Tx | DmaPath::Rx) {
             let mode = match self.phy[&0x19] & 0x700 {
@@ -654,7 +656,7 @@ impl Device {
         }
         match path {
             DmaPath::Status => {
-                let attention = !(self.is_5761() || self.is_5719() || self.is_57765());
+                let attention = !(self.is_legacy() || self.is_5719() || self.is_57765());
                 self.require_bits(0x3c00, 0x187, if attention { 0x106 } else { 0x102 });
                 self.require_bits(0x4c00, 3, 2); // host status needs write DMA.
             }
@@ -680,7 +682,7 @@ impl Device {
                 let keep = if asf { 0 } else { 0x400 };
                 self.require_bits(0x468, 0x403, 0x2 | keep);
                 self.require_bits(0x4c00, 3, 2);
-                let large = !(self.is_5761() || self.is_57765());
+                let large = !(self.is_legacy() || self.is_57765());
                 self.require_bits(0x2400, 0x10003, if large { 0x10002 } else { 2 });
                 for at in [0x2c00, 0x2000, 0x2800, 0x3000] {
                     self.require_bits(at, 3, 2);
@@ -758,7 +760,7 @@ impl Device {
         if self.match_receive_filter && !self.accepts_destination(frame) {
             return;
         }
-        let (rx_count, ret_count, flags) = if self.is_5761() {
+        let (rx_count, ret_count, flags) = if self.is_legacy() {
             (512, 512, 512 << 16)
         } else if self.is_57765() {
             (512, 1024, (512 << 16) | (1536 << 2))
@@ -1859,6 +1861,7 @@ mod bcm5761_power;
 mod bcm5762;
 mod bcm57765;
 mod bcm57766;
+mod bcm5784;
 mod phy_link;
 mod phy_power;
 mod rdma_mode;

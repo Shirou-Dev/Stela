@@ -127,10 +127,23 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     }
     fn initialize_phy_inner(&mut self, board: Board) -> Result<(), Error> {
         self.read_phy_identity()?;
-        let bcm5761 = self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5761;
+        let asic = self.identity.ok_or(Error::NotIdentified)?.asic;
+        let bcm5761 = asic == Asic::Bcm5761;
+        let bcm5784 = asic == Asic::Bcm5784;
         self.clear_packet_mac_status()?;
         self.pr(BMSR)?;
         self.pr(BMSR)?;
+        // tg3_phy_reset: a 5784 after AX resets its PHY with the CPMU's
+        // 10-Mb/s receive-only mode off, then rejects 2-MHz energy.
+        let cpmu = if bcm5784 {
+            let control = self.read(TG3_CPMU_CTRL)?;
+            if control & CPMU_CTRL_GPHY_10MB_RXONLY != 0 {
+                self.write(TG3_CPMU_CTRL, control & !CPMU_CTRL_GPHY_10MB_RXONLY)?;
+            }
+            control
+        } else {
+            0
+        };
         self.pw(BMCR, u32::from(BMCR_RESET))?;
         let mut reset = false;
         for _ in 0..5000 {
@@ -144,6 +157,13 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             return Err(Error::PhyResetTimeout);
         }
         self.wait(40)?;
+        if cpmu & CPMU_CTRL_GPHY_10MB_RXONLY != 0 {
+            self.dsp_write(
+                MII_TG3_DSP_EXP8,
+                MII_TG3_DSP_EXP8_AEDW | MII_TG3_DSP_EXP8_REJ2MHZ,
+            )?;
+            self.write(TG3_CPMU_CTRL, cpmu)?;
+        }
         if bcm5761 {
             let clock = self.read(TG3_CPMU_LSPD_1000MB_CLK)?;
             if clock & CPMU_LSPD_1000MB_MACCLK_MASK == CPMU_LSPD_1000MB_MACCLK_12_5 {
@@ -157,6 +177,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 }
             }
         }
+        if board.phy_otp != 0 {
+            self.apply_otp(board.phy_otp)?;
+        }
+        // tg3_phy_toggle_apd: a 5784 enabling APD keeps the DLL running.
         self.pw(
             MII_TG3_MISC_SHDW,
             MII_TG3_MISC_SHDW_WREN
@@ -165,7 +189,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 | MII_TG3_MISC_SHDW_SCR5_DLPTLM
                 | MII_TG3_MISC_SHDW_SCR5_SDTL
                 | MII_TG3_MISC_SHDW_SCR5_C125OE
-                | MII_TG3_MISC_SHDW_SCR5_DLLAPD,
+                | if bcm5784 && board.apd {
+                    0
+                } else {
+                    MII_TG3_MISC_SHDW_SCR5_DLLAPD
+                },
         )?;
         self.pw(
             MII_TG3_MISC_SHDW,
@@ -178,8 +206,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                     0
                 },
         )?;
-        if bcm5761 {
-            // Source 5761 has JITTER_BUG without ADJUST_TRIM and no jumbo PHY.
+        if asic.legacy() {
+            // Source 5761 and 5784 have JITTER_BUG without ADJUST_TRIM and
+            // no jumbo PHY.
             self.smdsp(true)?;
             let result = (|| {
                 self.pw(MII_TG3_DSP_ADDRESS, 0x000a)?;
@@ -221,7 +250,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if !super::super::ten_hundred_only(self.identity.ok_or(Error::NotIdentified)?.device) {
             self.pw(CTRL1000, 0x0200)?;
         }
-        if !bcm5761 {
+        // TG3_PHYFLG_EEE_CAP: neither 5761 nor 5784.
+        if !asic.legacy() {
             self.flush(
                 TG3_CPMU_EEE_LNKIDL_CTRL,
                 TG3_CPMU_EEE_LNKIDL_PCIE_NL0 | TG3_CPMU_EEE_LNKIDL_UART_IDL,
@@ -254,6 +284,47 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.pw(MII_TG3_TEST1, test | MII_TG3_TEST1_CRC_EN)?;
         self.pr(MII_TG3_RXR_COUNTERS)?;
         Ok(())
+    }
+    /// `tg3_phydsp_write`.
+    fn dsp_write(&mut self, at: u32, value: u32) -> Result<(), Error> {
+        self.pw(MII_TG3_DSP_ADDRESS, at)?;
+        self.pw(MII_TG3_DSP_RW_PORT, value)
+    }
+    /// `tg3_phy_apply_otp`: the OTP's PHY trim into the DSP.
+    fn apply_otp(&mut self, otp: u32) -> Result<(), Error> {
+        self.smdsp(true)?;
+        let result = (|| {
+            self.dsp_write(
+                MII_TG3_DSP_TAP1,
+                ((otp & TG3_OTP_AGCTGT_MASK) >> TG3_OTP_AGCTGT_SHIFT)
+                    | MII_TG3_DSP_TAP1_AGCTGT_DFLT,
+            )?;
+            self.dsp_write(
+                MII_TG3_DSP_AADJ1CH0,
+                ((otp & TG3_OTP_HPFFLTR_MASK) >> TG3_OTP_HPFFLTR_SHIFT)
+                    | ((otp & TG3_OTP_HPFOVER_MASK) >> TG3_OTP_HPFOVER_SHIFT),
+            )?;
+            self.dsp_write(
+                MII_TG3_DSP_AADJ1CH3,
+                ((otp & TG3_OTP_LPFDIS_MASK) >> TG3_OTP_LPFDIS_SHIFT)
+                    | MII_TG3_DSP_AADJ1CH3_ADCCKADJ,
+            )?;
+            self.dsp_write(
+                MII_TG3_DSP_EXP75,
+                (otp & TG3_OTP_VDAC_MASK) >> TG3_OTP_VDAC_SHIFT,
+            )?;
+            self.dsp_write(
+                MII_TG3_DSP_EXP96,
+                (otp & TG3_OTP_10BTAMP_MASK) >> TG3_OTP_10BTAMP_SHIFT,
+            )?;
+            self.dsp_write(
+                MII_TG3_DSP_EXP97,
+                ((otp & TG3_OTP_ROFF_MASK) >> TG3_OTP_ROFF_SHIFT)
+                    | ((otp & TG3_OTP_RCOFF_MASK) >> TG3_OTP_RCOFF_SHIFT),
+            )
+        })();
+        let disable = self.smdsp(false);
+        self.combine(result, disable)
     }
     fn clear_packet_mac_status(&mut self) -> Result<(), Error> {
         self.write(MAC_EVENT, 0)?;

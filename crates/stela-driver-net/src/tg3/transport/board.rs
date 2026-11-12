@@ -16,6 +16,9 @@ pub(in crate::tg3) struct Board {
     pub capacitive: bool,
     pub profile_5762: Option<super::bcm5762::Profile>,
     pub profile_5761: Option<super::bcm5761::Profile>,
+    /// A 5784's PHY trim from its OTP (`tg3_read_otp_phycfg`); zero for
+    /// every other chip.
+    pub phy_otp: u32,
 }
 impl<R: Registers, D: Delay> Hardware<R, D> {
     /// Only matching copper BCM5720/5761/5762 A0 or BCM5717/5718/5719
@@ -46,8 +49,12 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         // read DMA errata are not implemented here, and treats every later
         // revision alike (a 5717 C0 is identified as a 5720 A0).
         // tg3 has no 57766 revision errata: every 57766 is admitted.
+        // A 5784 AX's CPMU clock, MAC prescaler and LED errata are not
+        // implemented; later 5784 revisions share one path in tg3.
         let admitted = if id.asic == Asic::Bcm57766 {
             true
+        } else if id.asic == Asic::Bcm5784 {
+            id.chip_revision >> 8 != CHIPREV_5784_AX
         } else if id.asic == Asic::Bcm57765 {
             id.chip_revision != CHIPREV_ID_57765_A0
         } else if id.asic == Asic::Bcm5717 {
@@ -144,6 +151,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let atmel = kind == Nvram::Atmel;
         let page = if eeprom {
             0
+        } else if asic == Asic::Bcm5784 {
+            // tg3_get_5787_nvram_info fixes the page by part, not strap.
+            if atmel { 264 } else { 256 }
         } else {
             match nvcfg & NVRAM_CFG1_5752PAGE_SIZE_MASK {
                 FLASH_5752PAGE_SIZE_256 => 256,
@@ -176,6 +186,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             mac = self.fallback_mac()?;
         }
         let led = super::board::decode_led(cfg2)?;
+        let phy_otp = if asic == Asic::Bcm5784 {
+            self.bcm5784_board()?
+        } else {
+            0
+        };
         Ok(Board {
             mac,
             local,
@@ -184,7 +199,55 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             capacitive: cfg2 & (1 << 17) != 0,
             profile_5762: None,
             profile_5761: None,
+            phy_otp,
         })
+    }
+    /// A 5784's board deltas in `tg3_get_invariants` and
+    /// `tg3_get_eeprom_hw_cfg`: the PCIe endpoint's CLKREQ_BUG from its
+    /// first observed Link Control, the PHY trim from OTP
+    /// (`TG3_OTP_DEFAULT` when unreadable), and a refusal of the
+    /// ASPM_WORKAROUND board, whose per-link L1 threshold changes are not
+    /// implemented.
+    fn bcm5784_board(&mut self) -> Result<u32, Error> {
+        if self.sram(NIC_SRAM_DATA_CFG_3, None)? & NIC_SRAM_ASPM_DEBOUNCE != 0 {
+            return Err(Error::UnsupportedBoard);
+        }
+        let pcie = self.pcie_capability()?;
+        let control = Self::checked(self.regs().config_read32(pcie + 0x10)?)? as u16;
+        if control == u16::MAX {
+            return Err(Error::Removed);
+        }
+        self.clkreq_bug.get_or_insert(control & 0x100 != 0);
+        self.write(OTP_MODE, OTP_MODE_OTP_THRU_GRC)?;
+        let otp = (|| {
+            if !self.otp_command(OTP_CTRL_OTP_CMD_INIT)? {
+                return Ok(0);
+            }
+            self.write(OTP_ADDRESS, OTP_ADDRESS_MAGIC1)?;
+            if !self.otp_command(OTP_CTRL_OTP_CMD_READ)? {
+                return Ok(0);
+            }
+            let top = self.regs().read32(OTP_READ_DATA)?;
+            self.write(OTP_ADDRESS, OTP_ADDRESS_MAGIC2)?;
+            if !self.otp_command(OTP_CTRL_OTP_CMD_READ)? {
+                return Ok(0);
+            }
+            let bottom = self.regs().read32(OTP_READ_DATA)?;
+            Ok::<_, Error>(((top & 0xffff) << 16) | (bottom >> 16))
+        })()?;
+        Ok(if otp == 0 { TG3_OTP_DEFAULT } else { otp })
+    }
+    /// `tg3_issue_otp_command`: up to 1 ms for the command to finish.
+    fn otp_command(&mut self, command: u32) -> Result<bool, Error> {
+        self.write(OTP_CTRL, command | OTP_CTRL_OTP_CMD_START)?;
+        self.write(OTP_CTRL, command)?;
+        for _ in 0..100 {
+            if self.read(OTP_STATUS)? & OTP_STATUS_CMD_DONE != 0 {
+                return Ok(true);
+            }
+            self.wait(10)?;
+        }
+        Ok(self.read(OTP_STATUS)? & OTP_STATUS_CMD_DONE != 0)
     }
     pub(super) fn nvram_configuration(&mut self) -> Result<u32, Error> {
         self.nvram_lock()?;
@@ -195,7 +258,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             let vendor = config & NVRAM_CFG1_5752VENDOR_MASK;
             let eeprom = match self.identity.ok_or(Error::NotIdentified)?.asic {
                 Asic::Bcm5762 => matches!(vendor, FLASH_5762_EEPROM_HD | FLASH_5762_EEPROM_LD),
-                asic @ (Asic::Bcm57765
+                asic @ (Asic::Bcm5784
+                | Asic::Bcm57765
                 | Asic::Bcm57766
                 | Asic::Bcm5717
                 | Asic::Bcm5719
@@ -269,11 +333,29 @@ enum Nvram {
     St,
 }
 
-/// tg3_get_57780_nvram_info, tg3_get_5717_nvram_info and
+/// tg3_get_5787_nvram_info, tg3_get_57780_nvram_info, tg3_get_5717_nvram_info and
 /// tg3_get_5720_nvram_info's vendor pinstrap decode. The tables reuse codes
 /// for different parts.
 fn nvram_kind(asic: Asic, vendor: u32) -> Option<Nvram> {
     Some(match (asic, vendor) {
+        (
+            Asic::Bcm5784,
+            FLASH_5787VENDOR_ATMEL_EEPROM_64KHZ
+            | FLASH_5787VENDOR_ATMEL_EEPROM_376KHZ
+            | FLASH_5787VENDOR_MICRO_EEPROM_64KHZ
+            | FLASH_5787VENDOR_MICRO_EEPROM_376KHZ,
+        ) => Nvram::Eeprom,
+        (
+            Asic::Bcm5784,
+            FLASH_5752VENDOR_ATMEL_FLASH_BUFFERED
+            | FLASH_5755VENDOR_ATMEL_FLASH_1
+            | FLASH_5755VENDOR_ATMEL_FLASH_2
+            | FLASH_5755VENDOR_ATMEL_FLASH_3,
+        ) => Nvram::Atmel,
+        (
+            Asic::Bcm5784,
+            FLASH_5752VENDOR_ST_M45PE10 | FLASH_5752VENDOR_ST_M45PE20 | FLASH_5752VENDOR_ST_M45PE40,
+        ) => Nvram::St,
         (
             Asic::Bcm57765 | Asic::Bcm57766,
             FLASH_5787VENDOR_ATMEL_EEPROM_376KHZ | FLASH_5787VENDOR_MICRO_EEPROM_376KHZ,

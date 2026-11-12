@@ -126,6 +126,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 magic,
                 subsystem: Self::checked(self.regs().config_read32(0x2c)?)?,
             }),
+            phy_otp: 0,
         })
     }
 }

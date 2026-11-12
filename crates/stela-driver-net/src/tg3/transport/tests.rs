@@ -267,6 +267,7 @@ unsafe impl Registers for Reg {
 fn model(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>) {
     let (device, revision, identity) = match asic {
         Asic::Bcm5761 => (0x1681u16, 0x0576_1000, 0xbc05_0fd3u32),
+        Asic::Bcm5784 => (0x1698, 0x0578_4100, 0xbc05_0fa1),
         Asic::Bcm57765 => (0x16b4, 0x5778_5100, 0x5c0d_8a41),
         Asic::Bcm57766 => (0x1686, 0x5776_6001, 0x5c0d_8a41),
         Asic::Bcm5717 => (0x1655, 0x0571_7100, 0x5c0d_8a01),
@@ -283,7 +284,7 @@ fn model(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>)
     m.config.insert(MISC_HOST_CTRL, 0xf000_0000);
     m.config.insert(
         match asic {
-            Asic::Bcm5761 => PRODID,
+            Asic::Bcm5761 | Asic::Bcm5784 => PRODID,
             Asic::Bcm57765 | Asic::Bcm57766 => GEN15_PRODID,
             _ => GEN2_PRODID,
         },
@@ -319,6 +320,7 @@ fn identified(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Mod
 fn config_revision_and_phy_oui_select_each_named_family() {
     for asic in [
         Asic::Bcm5761,
+        Asic::Bcm5784,
         Asic::Bcm57765,
         Asic::Bcm57766,
         Asic::Bcm5717,
@@ -724,6 +726,7 @@ fn reset_model(asic: Asic) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>) {
 fn core_reset_uses_config_while_mmio_decode_is_gone() {
     for asic in [
         Asic::Bcm5761,
+        Asic::Bcm5784,
         Asic::Bcm57765,
         Asic::Bcm57766,
         Asic::Bcm5717,
@@ -752,7 +755,9 @@ fn core_reset_uses_config_while_mmio_decode_is_gone() {
         );
         assert!(m.trace.contains(&Event::Write(MAC_MI_MODE, 0x8000)));
         match asic {
-            Asic::Bcm5761 => assert!(m.trace.contains(&Event::Write(0x7c00, 1 << 25))),
+            Asic::Bcm5761 | Asic::Bcm5784 => {
+                assert!(m.trace.contains(&Event::Write(0x7c00, 1 << 25)))
+            }
             Asic::Bcm57765 | Asic::Bcm57766 => {
                 // No clock override, and no APE space opened again.
                 assert!(

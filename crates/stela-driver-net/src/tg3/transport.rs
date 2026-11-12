@@ -325,6 +325,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         let asic = match (device, chip_revision >> 12) {
             (0x1680 | 0x1681 | 0x1688 | 0x1689, 0x5761) => Asic::Bcm5761,
+            (0x1698 | 0x1684, 0x5784) => Asic::Bcm5784,
             // tg3_get_invariants: a 5717 C0 is a 5720 A0.
             (0x1655 | 0x1656 | 0x1665, 0x5717) if chip_revision == regs::CHIPREV_ID_5717_C0 => {
                 chip_revision = regs::CHIPREV_ID_5720_A0;
@@ -585,6 +586,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             };
             let expected = match chip.asic {
                 Asic::Bcm5761 => 0xbc05_0fd0,
+                // TG3_PHY_ID_BCM5784, which TG3_KNOWN_PHY_ID leaves out:
+                // it always comes from the signed SRAM.
+                Asic::Bcm5784 => 0xbc05_0fa0,
                 // tg3 names no 57766 PHY; its family's is the 57765's.
                 Asic::Bcm57765 | Asic::Bcm57766 => 0x5c0d_8a40,
                 Asic::Bcm5717 => 0x5c0d_8a00,

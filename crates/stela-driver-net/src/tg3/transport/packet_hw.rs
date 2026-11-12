@@ -34,6 +34,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             || observed.led != board.led
             || observed.profile_5762 != board.profile_5762
             || observed.profile_5761 != board.profile_5761
+            || observed.phy_otp != board.phy_otp
         {
             return Err(Error::UnsupportedBoard);
         }
@@ -58,7 +59,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         let asic = self.identity.ok_or(Error::NotIdentified)?.asic;
         let bcm5762 = asic == Asic::Bcm5762;
-        let legacy = asic == Asic::Bcm5761;
+        let legacy = asic.legacy();
         let bcm5717 = asic == Asic::Bcm5717;
         let class_57765 = asic.class_57765();
         let bcm5719 = asic == Asic::Bcm5719;
@@ -349,6 +350,14 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 // (TG3_TX_BD_DMA_MAX_2K). Every frame here is a single BD
                 // below 2K, so none needs splitting.
                 | if asic == Asic::Bcm57766 { RDMAC_MODE_JMB_2K_MMRR } else { 0 }
+                // tg3_reset_hw: a 5784 checks its BDs and mbufs for corruption.
+                | if asic == Asic::Bcm5784 {
+                    RDMAC_MODE_BD_SBD_CRPT_ENAB
+                        | RDMAC_MODE_MBUF_RBD_CRPT_ENAB
+                        | RDMAC_MODE_MBUF_SBD_CRPT_ENAB
+                } else {
+                    0
+                }
                 | RDMAC_MODE_IPV4_LSO_EN // source HW_TSO_2/3 mode; descriptors remain plain.
                 | RDMAC_MODE_ENABLE
                 | RDMAC_MODE_TGTABORT_ENAB
@@ -388,7 +397,12 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             (RCVDCC_MODE, RCVDCC_MODE_ENABLE | RCVDCC_MODE_ATTN_ENABLE),
             (
                 SNDDATAC_MODE,
-                SNDDATAC_MODE_ENABLE | if legacy { SNDDATAC_MODE_CDELAY } else { 0 },
+                SNDDATAC_MODE_ENABLE
+                    | if asic == Asic::Bcm5761 {
+                        SNDDATAC_MODE_CDELAY
+                    } else {
+                        0
+                    },
             ),
             (SNDBDC_MODE, SNDBDC_MODE_ENABLE | SNDBDC_MODE_ATTN_ENABLE),
             (RCVBDI_MODE, RCVBDI_MODE_ENABLE | RCVBDI_MODE_RCB_ATTN_ENAB),

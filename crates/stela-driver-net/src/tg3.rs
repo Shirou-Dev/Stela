@@ -165,6 +165,7 @@ pub use crate::bus::pci::power::Timer as Delay;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Asic {
     Bcm5761,
+    Bcm5784,
     Bcm57765,
     Bcm57766,
     Bcm5717,
@@ -177,6 +178,12 @@ impl Asic {
     /// comes from the CPMU and addresses the PHY at port + 1.
     pub const fn plus_5717(self) -> bool {
         matches!(self, Self::Bcm5717 | Self::Bcm5719 | Self::Bcm5720)
+    }
+    /// The named 5755_PLUS ASICs before 57765_PLUS (5761 and 5784): no
+    /// jumbo ring, 512-entry rings, PCIe 1.0a reset fixes and the PHY
+    /// jitter workaround.
+    pub const fn legacy(self) -> bool {
+        matches!(self, Self::Bcm5761 | Self::Bcm5784)
     }
     /// tg3's 57765_CLASS: ASIC_REV_57765 and ASIC_REV_57766.
     pub const fn class_57765(self) -> bool {
@@ -229,7 +236,9 @@ pub fn candidate(vendor: u16, device: u16, class: [u8; 3]) -> bool {
         && (gen15_product(device)
             || matches!(
                 device,
-                0x1655
+                0x1698
+                    | 0x1684
+                    | 0x1655
                     | 0x1656
                     | 0x1665
                     | 0x1657

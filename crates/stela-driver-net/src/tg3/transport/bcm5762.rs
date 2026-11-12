@@ -138,6 +138,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 subsystem,
             }),
             profile_5761: None,
+            phy_otp: 0,
         })
     }
 }

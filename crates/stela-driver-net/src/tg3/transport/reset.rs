@@ -163,7 +163,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             // itself undoes the NVRAM lock (Linux has no matching unlock).
             let preparation = (|| {
                 self.write(GRC_FASTBOOT_PC, 0)?;
-                if identity.asic == Asic::Bcm5761 && self.read(PHY_TEST_CONTROL)? == PCIE10_PSCRAM {
+                if identity.asic.legacy() && self.read(PHY_TEST_CONTROL)? == PCIE10_PSCRAM {
                     self.write(PHY_TEST_CONTROL, PSCRAM)?;
                 }
                 self.write(GRC_MISC_CFG, RESET_PCIE_CLOCK)?;
@@ -221,7 +221,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             self.unlock(1)?;
             self.flush(MAC_MI_MODE, 0x8000)?; // CPMU's 500-kHz MDIO clock.
             self.wait(80)?;
-            if identity.asic == Asic::Bcm5761 {
+            if identity.asic.legacy() {
                 let value = self.read(POST_RESET_PCIE)?;
                 self.write(POST_RESET_PCIE, value | PCIE_POST_RESET_FIX)?;
             }
