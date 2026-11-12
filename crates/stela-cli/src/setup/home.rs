@@ -241,7 +241,9 @@ pub(super) fn report(sticks: &[Stick]) -> (String, bool) {
         }
         match stick.next(several) {
             Some(command) => {
-                due = true;
+                // Only a stick that holds Stela can be due: a blank one may
+                // be meant for anything.
+                due |= stick.record.is_some();
                 let _ = writeln!(text, "Next: {command}");
             }
             None if stick.record.is_some() => {

@@ -6285,6 +6285,14 @@ fn journey_h_without_a_terminal_plain_stela_reports_and_fails_when_something_is_
     let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
     assert!(!due, "{text}");
     assert!(text.contains("Nothing to do."), "{text}");
+    // A blank stick names the command that makes an installer, and is not
+    // due.
+    let f = fixture(64 * GIB, false);
+    let request = Request::home(command::Global::default());
+    home::run(&environment(&f.host), request).unwrap();
+    let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
+    assert!(!due, "{text}");
+    assert!(text.contains("Next: stela create /dev/disk5"), "{text}");
 }
 
 #[test]
