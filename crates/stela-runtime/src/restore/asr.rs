@@ -201,7 +201,9 @@ impl Sender {
                 break r;
             }
         };
-        if matches!(r, Poll::Ready(Err(_))) {
+        // A source that only ran out of the time it may wait has changed
+        // nothing here: the next poll takes the same step again.
+        if matches!(r, Poll::Ready(Err(ref e)) if !matches!(e, Error::Pending)) {
             self.phase = Phase::Failed;
             self.recycled.clear();
         }
@@ -487,6 +489,57 @@ mod tests {
         assert_eq!(sender.phase(), Phase::Complete);
         assert!(sender.recycled.is_empty());
         assert!(stream.output.ends_with(&data));
+    }
+    /// A source whose every other read runs out of the time it may wait, as
+    /// a network source's does.
+    struct Late<S>(S, bool);
+    impl<S: ImageSource> ImageSource for Late<S> {
+        fn size(&self, component: &str) -> Result<u64> {
+            self.0.size(component)
+        }
+        fn read_at(&mut self, component: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+            self.1 = !self.1;
+            if self.1 {
+                return Err(Error::Pending);
+            }
+            self.0.read_at(component, offset, len)
+        }
+    }
+    #[test]
+    fn a_source_that_runs_out_of_wait_time_reads_on_at_the_next_poll() {
+        let data: Vec<_> = (0..2 * CHUNK_BYTES + 5).map(|i| (i * 7) as u8).collect();
+        let mut source = Late(fixture(&data, false), false);
+        let mut input = xml(Value::dict([("Command", Value::from("Initiate"))]));
+        input.extend(xml(Value::dict([
+            ("Command", Value::from("OOBData")),
+            ("OOB Offset", Value::Integer(3)),
+            ("OOB Length", Value::Integer(CHUNK_BYTES as u64 + 9)),
+        ])));
+        input.extend(xml(Value::dict([("Command", Value::from("Payload"))])));
+        let mut stream = Memory::new(input, 30000);
+        let mut sender = Sender::new("os.dmg".into(), &source).unwrap();
+        let mut waits = 0;
+        let mut done = false;
+        for _ in 0..100_000 {
+            match sender.poll(&mut stream, &mut source) {
+                Poll::Pending => {}
+                Poll::Ready(Err(Error::Pending)) => {
+                    assert_ne!(sender.phase(), Phase::Failed);
+                    waits += 1;
+                }
+                Poll::Ready(r) => {
+                    r.unwrap();
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done && waits >= 4);
+        assert_eq!(sender.phase(), Phase::Complete);
+        // The OOB range and the payload each went out once, in order.
+        let mut expected = data[3..3 + CHUNK_BYTES + 9].to_vec();
+        expected.extend_from_slice(&data);
+        assert!(stream.output.ends_with(&expected));
     }
     #[test]
     fn large_oob_is_chunked_and_overflow_refuses_with_original_request() {
