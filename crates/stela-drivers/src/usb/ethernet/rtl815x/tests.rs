@@ -478,6 +478,61 @@ fn unchanged_linux_ocp_request_trace_matches_native_helpers() {
     assert_eq!(actual, std::fs::read_to_string(path).unwrap());
 }
 
+/// A frame whose transmit TD the controller has not finished is queued and
+/// the call returns at once, as usbnet submits its URB; the next frame is
+/// busy until the TD completes, and a TD past its 1 s deadline is cancelled
+/// and reported before the buffer is reused.
+#[test]
+fn a_transmit_in_flight_makes_the_next_busy_until_it_ends_or_times_out() {
+    use crate::net::{Link, LinkError};
+    let mut dma = TestRegion::new(128 * 1024 * 8);
+    let (mut controller, model) = unconfigured_cancellation_controller_with_configurations(
+        &mut dma,
+        &[vec![9, 2, 9, 0, 0, 7, 0, 0x80, 50]],
+    );
+    controller.set_slot_speed(1, HIGH_SPEED);
+    model.borrow_mut().ethernet = Some(ethernet::rtl815x::tests::Model::new(0x4c00));
+    let configuration = vec![
+        9, 2, 32, 0, 1, 7, 0, 0x80, 50, 9, 4, 0, 0, 2, 0xff, 0, 0, 0, 7, 5, 0x81, 2, 0, 2, 0, 7, 5,
+        0x02, 2, 0, 2, 0,
+    ];
+    let mut device = model::addressed_device(&controller, vec![configuration]);
+    device.speed = HIGH_SPEED;
+    device.descriptor[8..12].copy_from_slice(&[0xda, 0x0b, 0x52, 0x81]);
+    controller.preflight_vendor_ethernet(&mut device).unwrap();
+    model::select(&mut device).unwrap();
+    let shared = Rc::new(RefCell::new(controller));
+    let mut found = Found::default();
+    bind(&shared, device, &mut dma, &mut found);
+    let mut link = found.vendor_links.pop().unwrap();
+    assert!(link.carrier());
+    let clock = shared.borrow().clock;
+    let elapsed = |since: u64| clock.now_us() - since;
+
+    model.borrow_mut().silence_transfer = Some(4);
+    let before = clock.now_us();
+    link.transmit(&[1; 60]).unwrap();
+    assert!(link.sending.is_some());
+    let sent = link.send.bytes().to_vec();
+    assert_eq!(link.transmit(&[2; 60]), Err(LinkError::Busy));
+    assert_eq!(link.send.bytes(), sent);
+    assert!(elapsed(before) < 100_000);
+    crate::test_clock::advance(clock, 1_000_000);
+    assert!(matches!(
+        link.transmit(&[3; 60]),
+        Err(LinkError::Adapter(message)) if message.ends_with("device timeout")
+    ));
+    assert!(link.sending.is_none());
+
+    model.borrow_mut().silence_transfer = None;
+    let outgoing = model.borrow().outgoing.len();
+    link.transmit(&[4; 60]).unwrap();
+    assert!(link.sending.is_none());
+    assert_eq!(model.borrow().outgoing.len(), outgoing + 1);
+    link.transmit(&[5; 60]).unwrap();
+    assert_eq!(model.borrow().outgoing.len(), outgoing + 2);
+}
+
 #[test]
 fn rtl8152b_binds_real_xhci_dma_moves_aggregates_wraps_and_quiesces() {
     use crate::net::Link;
