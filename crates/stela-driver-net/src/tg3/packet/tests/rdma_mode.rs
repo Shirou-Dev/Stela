@@ -9,6 +9,8 @@ fn parts_for(chip: u32) -> (Hardware<Reg, Timer>, Pages, Arc<Domain>, Arc<Mutex<
         let value = parts();
         if chip == 0x0576_2000 {
             *value.3.lock().unwrap() = Device::new_5762();
+        } else if chip == 0x0571_7100 {
+            *value.3.lock().unwrap() = Device::new_5717(0x1655, 0);
         } else if chip == 0x0571_9001 {
             *value.3.lock().unwrap() = Device::new_5719();
         } else {
@@ -23,7 +25,13 @@ fn rdma_modes_match_source_for_every_asic() {
     if crate::test_process::isolate_model() {
         return;
     }
-    for chip in [0x0571_9001, 0x0572_0000, 0x0576_1000, 0x0576_2000] {
+    for chip in [
+        0x0571_7100,
+        0x0571_9001,
+        0x0572_0000,
+        0x0576_1000,
+        0x0576_2000,
+    ] {
         let (hardware, pages, domain, peer) = parts_for(chip);
         // These are firmware-observed control bits, with RESET/ENABLE clear.
         peer.lock().unwrap().mac.insert(0x4800, 0x3fff_fffc);
@@ -39,6 +47,8 @@ fn rdma_modes_match_source_for_every_asic() {
                 0x0576_1000 => 0x0803_03fe,
                 // Only 5720 and 5762 keep the firmware's H2BNC_VLAN_DET.
                 0x0571_9001 => 0x1803_03fe,
+                // 5717 adds MULT_DMA_RD_DIS.
+                0x0571_7100 => 0x1903_03fe,
                 _ => 0x3803_03fe,
             }
         );

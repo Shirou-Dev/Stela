@@ -3,7 +3,7 @@
 // Copyright (C) 2001-2003 Jeff Garzik
 // Copyright (C) 2004 Sun Microsystems Inc.
 // Copyright (C) 2005-2018 Broadcom
-//! BCM5719/5720/5761/5762 copper setup. EEE and pause are explicitly not advertised.
+//! BCM5717/5718/5719/5720/5761/5762 copper setup. EEE and pause are explicitly not advertised.
 use super::{board::Board, regs::*, *};
 const BMCR: u32 = 0;
 const BMSR: u32 = 1;
@@ -30,7 +30,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if !self.stopped || self.failure.is_some() || self.cleanup_failure.is_some() {
             return Err(Error::Poisoned);
         }
-        let bcm5761 = self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5761;
+        let identity = self.identity.ok_or(Error::NotIdentified)?;
+        let bcm5761 = identity.asic == Asic::Bcm5761;
+        // tg3_phy_power_bug: a 5717's port 0 PHY is never powered down.
+        let power_bug = identity.asic == Asic::Bcm5717 && identity.function == 0;
         let management = self.observe_management();
         // tg3_power_down_prepare: ASF firmware keeps using the PHY, so it
         // stays powered.
@@ -70,6 +73,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 {
                     return Err(Error::ConfigDidNotLatch);
                 }
+            }
+            if power_bug {
+                return Ok(());
             }
             self.pw(BMCR, u32::from(BMCR_POWER_DOWN))?;
             if self.pr(BMCR)? & BMCR_POWER_DOWN == 0 {
@@ -219,11 +225,14 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             )?;
             self.flush(TG3_CPMU_EEE_CTRL, TG3_CPMU_EEE_CTRL_EXIT_20_1_US)?;
             self.flush(TG3_CPMU_EEE_MODE, 0)?;
-            let bcm5719 = self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5719;
+            let tap26 = matches!(
+                self.identity.ok_or(Error::NotIdentified)?.asic,
+                Asic::Bcm5717 | Asic::Bcm5719
+            );
             self.smdsp(true)?;
             let result = (|| {
                 self.write_mmd(7, 0x3c, 0)?; // MDIO_AN_EEE_ADV, disabled policy.
-                if bcm5719 {
+                if tap26 {
                     // tg3_phy_autoneg_cfg: nothing advertised, so 5717/5719
                     // clear TAP26 before the shared CH34TP2 change.
                     self.pw(MII_TG3_DSP_ADDRESS, MII_TG3_DSP_TAP26)?;

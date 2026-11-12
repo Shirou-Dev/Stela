@@ -268,7 +268,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         let mut chip_revision = host >> 16;
         if chip_revision >> 12 == 0xf {
-            let at = if matches!(device, 0x1657 | 0x165f | 0x1687) {
+            let at = if matches!(device, 0x1655 | 0x1656 | 0x1665 | 0x1657 | 0x165f | 0x1687) {
                 GEN2_PRODID
             } else {
                 PRODID
@@ -277,6 +277,12 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         let asic = match (device, chip_revision >> 12) {
             (0x1680 | 0x1681 | 0x1688 | 0x1689, 0x5761) => Asic::Bcm5761,
+            // tg3_get_invariants: a 5717 C0 is a 5720 A0.
+            (0x1655 | 0x1656 | 0x1665, 0x5717) if chip_revision == regs::CHIPREV_ID_5717_C0 => {
+                chip_revision = regs::CHIPREV_ID_5720_A0;
+                Asic::Bcm5720
+            }
+            (0x1655 | 0x1656 | 0x1665, 0x5717) => Asic::Bcm5717,
             (0x1657, 0x5719) => Asic::Bcm5719,
             (0x165f, 0x5720) => Asic::Bcm5720,
             (0x1687, 0x5762) => Asic::Bcm5762,
@@ -300,7 +306,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             } else {
                 self.read(CPMU_STATUS)?
             };
-            (status >> 30) as u8
+            if asic == Asic::Bcm5717 {
+                u8::from(status & regs::CPMU_STATUS_FMSK_5717 != 0)
+            } else {
+                (status >> 30) as u8
+            }
         } else {
             bdf_function & 3
         };
@@ -478,6 +488,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             let identity = (high << 10) | ((low & 0xfc00) << 16) | (low & 0x3ff);
             let expected = match self.identity.expect("identified").asic {
                 Asic::Bcm5761 => 0xbc05_0fd0,
+                Asic::Bcm5717 => 0x5c0d_8a00,
                 Asic::Bcm5719 => 0x5c0d_8a20,
                 Asic::Bcm5720 => 0x5c0d_8b60,
                 Asic::Bcm5762 => 0x8580_3780,

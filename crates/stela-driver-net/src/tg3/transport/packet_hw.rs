@@ -3,7 +3,7 @@
 // Copyright (C) 2001-2003 Jeff Garzik
 // Copyright (C) 2004 Sun Microsystems Inc.
 // Copyright (C) 2005-2018 Broadcom
-//! One BCM5719/5720/5761/5762 host-send/standard-receive/return queue, polled status DMA.
+//! One BCM5717/5718/5719/5720/5761/5762 host-send/standard-receive/return queue, polled status DMA.
 use super::{board::Board, phy::Speed, regs::*, *};
 
 impl<R: Registers, D: Delay> Hardware<R, D> {
@@ -59,8 +59,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let asic = self.identity.ok_or(Error::NotIdentified)?.asic;
         let bcm5762 = asic == Asic::Bcm5762;
         let legacy = asic == Asic::Bcm5761;
+        let bcm5717 = asic == Asic::Bcm5717;
         let bcm5719 = asic == Asic::Bcm5719;
-        // tg3's statistics workaround (5720 A0 and 5762, not 5719 after A0)
+        // tg3's statistics workaround (5717, 5720 A0 and 5762, not 5719
+        // after A0)
         // and its kept transmit length and mode fields (5720 and 5762).
         let attention = Self::statistics_attention(asic);
         let keeps_tx_fields = matches!(asic, Asic::Bcm5720 | Asic::Bcm5762);
@@ -228,7 +230,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         } else {
             TG3_LSO_RD_DMA_CRPTEN_CTRL
         };
-        if !legacy {
+        // tg3_reset_hw: 5719, 5720 and 5762 only.
+        if !(legacy || bcm5717) {
             let corruption = self.read(corruption_register)?
                 | TG3_LSO_RD_DMA_CRPTEN_CTRL_BLEN_BD_4K
                 | TG3_LSO_RD_DMA_CRPTEN_CTRL_BLEN_LSO_4K;
@@ -302,7 +305,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         )?;
         self.wait(40)?;
         // BCM5762 uses a different register and rewrites the source
-        // margin/watermark fields. BCM5719 after A0, BCM5720 and BCM5761
+        // margin/watermark fields. BCM5717, BCM5719 after A0, BCM5720 and BCM5761
         // only add FIFO_OFLW_FIX.
         // Preserve every unrelated observed bit.
         let reserve_register = if bcm5762 {
@@ -333,7 +336,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         };
         self.flush(
             RDMAC_MODE,
-            rdma | RDMAC_MODE_IPV4_LSO_EN // source HW_TSO_2/3 mode; descriptors remain plain.
+            rdma | if bcm5717 { RDMAC_MODE_MULT_DMA_RD_DIS } else { 0 }
+                | RDMAC_MODE_IPV4_LSO_EN // source HW_TSO_2/3 mode; descriptors remain plain.
                 | RDMAC_MODE_ENABLE
                 | RDMAC_MODE_TGTABORT_ENAB
                 | RDMAC_MODE_MSTABORT_ENAB
@@ -349,7 +353,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.wait(40)?;
         // Observe the residual channel lengths before applying 5719's or
         // 5720's documented workaround; no synthetic normal-channel assumption.
-        for index in 0..if bcm5762 || legacy {
+        for index in 0..if bcm5762 || legacy || bcm5717 {
             0
         } else {
             TG3_NUM_RDMA_CHANNELS
@@ -435,10 +439,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.stopped = false;
         Ok(())
     }
-    /// tg3_get_invariants' statistics workaround: 5720 A0 and 5762 raise
-    /// flow attention for the MBUF low-water discard indication.
+    /// tg3_get_invariants' statistics workaround: 5717, 5720 A0 and 5762
+    /// raise flow attention for the MBUF low-water discard indication.
     fn statistics_attention(asic: Asic) -> bool {
-        matches!(asic, Asic::Bcm5720 | Asic::Bcm5762)
+        matches!(asic, Asic::Bcm5717 | Asic::Bcm5720 | Asic::Bcm5762)
     }
     pub(in crate::tg3) fn packet_carrier(&mut self) -> Result<bool, Error> {
         self.copper_carrier()

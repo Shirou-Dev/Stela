@@ -165,6 +165,7 @@ pub use crate::bus::pci::power::Timer as Delay;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Asic {
     Bcm5761,
+    Bcm5717,
     Bcm5719,
     Bcm5720,
     Bcm5762,
@@ -173,7 +174,7 @@ impl Asic {
     /// tg3's 5717_PLUS class among the named ASICs: the internal port
     /// comes from the CPMU and addresses the PHY at port + 1.
     pub const fn plus_5717(self) -> bool {
-        matches!(self, Self::Bcm5719 | Self::Bcm5720)
+        matches!(self, Self::Bcm5717 | Self::Bcm5719 | Self::Bcm5720)
     }
 }
 
@@ -183,7 +184,7 @@ pub fn candidate(vendor: u16, device: u16, class: [u8; 3]) -> bool {
         && class == [2, 0, 0]
         && matches!(
             device,
-            0x1657 | 0x165f | 0x1680 | 0x1681 | 0x1688 | 0x1689 | 0x1687
+            0x1655 | 0x1656 | 0x1665 | 0x1657 | 0x165f | 0x1680 | 0x1681 | 0x1688 | 0x1689 | 0x1687
         )
 }
 

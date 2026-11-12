@@ -18,8 +18,8 @@ pub(in crate::tg3) struct Board {
     pub profile_5761: Option<super::bcm5761::Profile>,
 }
 impl<R: Registers, D: Delay> Hardware<R, D> {
-    /// Only matching copper BCM5720/5761/5762 A0 or BCM5719 after A0 is a
-    /// packet candidate.
+    /// Only matching copper BCM5720/5761/5762 A0 or BCM5717/5718/5719
+    /// after A0 is a packet candidate.
     pub(super) fn packet_identity(&mut self) -> Result<Identity, Error> {
         self.timer_ready()?;
         // Read static PCI/subsystem denials before identify changes host/MMIO
@@ -41,10 +41,13 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let id = self.identify()?;
         // Upper bits identify the ASIC, lower 12 keep revision/metal. This
         // packet backend implements exact A0 deltas; no extrapolated IDs.
-        // BCM5719 is the exception: tg3 singles out only its A0, whose TSO,
-        // jumbo ring, statistics and read DMA errata are not implemented
-        // here, and treats every later 5719 revision alike.
-        let admitted = if id.asic == Asic::Bcm5719 {
+        // BCM5717/5718 and BCM5719 are the exception: tg3 singles out only
+        // their A0, whose PHY strap, EEE, TSO, jumbo ring, statistics and
+        // read DMA errata are not implemented here, and treats every later
+        // revision alike (a 5717 C0 is identified as a 5720 A0).
+        let admitted = if id.asic == Asic::Bcm5717 {
+            id.chip_revision != CHIPREV_ID_5717_A0
+        } else if id.asic == Asic::Bcm5719 {
             id.chip_revision != CHIPREV_ID_5719_A0
         } else {
             id.chip_revision & 0xfff == 0
@@ -93,7 +96,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             let result = (|| {
                 let identity = self.identity.unwrap();
                 let shift = TG3_APE_GPIO_MSG_SHIFT + 4 * u32::from(identity.function);
-                if identity.asic == Asic::Bcm5719 {
+                if matches!(identity.asic, Asic::Bcm5717 | Asic::Bcm5719) {
                     let status = self.ape_read(TG3_APE_GPIO_MSG)?;
                     self.regs()
                         .ape_write32(TG3_APE_GPIO_MSG, (status & !(3 << shift)) | (1 << shift))?;
@@ -174,7 +177,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             let vendor = config & NVRAM_CFG1_5752VENDOR_MASK;
             let eeprom = match self.identity.ok_or(Error::NotIdentified)?.asic {
                 Asic::Bcm5762 => matches!(vendor, FLASH_5762_EEPROM_HD | FLASH_5762_EEPROM_LD),
-                asic @ (Asic::Bcm5719 | Asic::Bcm5720) => {
+                asic @ (Asic::Bcm5717 | Asic::Bcm5719 | Asic::Bcm5720) => {
                     nvram_kind(asic, vendor) == Some(Nvram::Eeprom)
                 }
                 Asic::Bcm5761 => false, // Source pinstraps are buffered flash.
@@ -250,10 +253,13 @@ enum Nvram {
 /// decode. The two tables reuse codes for different parts.
 fn nvram_kind(asic: Asic, vendor: u32) -> Option<Nvram> {
     Some(match (asic, vendor) {
-        (Asic::Bcm5719, FLASH_5717VENDOR_ATMEL_EEPROM | FLASH_5717VENDOR_MICRO_EEPROM)
+        (
+            Asic::Bcm5717 | Asic::Bcm5719,
+            FLASH_5717VENDOR_ATMEL_EEPROM | FLASH_5717VENDOR_MICRO_EEPROM,
+        )
         | (Asic::Bcm5720, FLASH_5720_EEPROM_HD | FLASH_5720_EEPROM_LD) => Nvram::Eeprom,
         (
-            Asic::Bcm5719,
+            Asic::Bcm5717 | Asic::Bcm5719,
             FLASH_5717VENDOR_ATMEL_MDB011D
             | FLASH_5717VENDOR_ATMEL_ADB011B
             | FLASH_5717VENDOR_ATMEL_ADB011D
@@ -278,7 +284,7 @@ fn nvram_kind(asic: Asic, vendor: u32) -> Option<Nvram> {
             | FLASH_5720VENDOR_ATMEL_45USPT,
         ) => Nvram::Atmel,
         (
-            Asic::Bcm5719,
+            Asic::Bcm5717 | Asic::Bcm5719,
             FLASH_5717VENDOR_ST_M_M25PE10
             | FLASH_5717VENDOR_ST_A_M25PE10
             | FLASH_5717VENDOR_ST_M_M45PE10

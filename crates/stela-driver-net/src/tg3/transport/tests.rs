@@ -225,6 +225,7 @@ unsafe impl Registers for Reg {
 fn model(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>) {
     let (device, revision, identity) = match asic {
         Asic::Bcm5761 => (0x1681u16, 0x0576_1000, 0xbc05_0fd3u32),
+        Asic::Bcm5717 => (0x1655, 0x0571_7100, 0x5c0d_8a01),
         Asic::Bcm5719 => (0x1657, 0x0571_9001, 0x5c0d_8a21),
         Asic::Bcm5720 => (0x165f, 0x0572_0000, 0x5c0d_8b62),
         Asic::Bcm5762 => (0x1687, 0x0576_2000, 0x8580_3781),
@@ -248,8 +249,13 @@ fn model(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>)
     m.phy
         .insert(3, (((identity >> 16) & 0xfc00) | (identity & 0x3ff)) as u16);
     m.phy.insert(7, 0xa55a);
-    m.sram
-        .insert(SRAM_CPMU_STATUS, (u32::from(function) << 30) | CPMU_STATUS);
+    // TG3_CPMU_STATUS_FMSK_5717 holds a 5717's one function bit.
+    let port = if asic == Asic::Bcm5717 {
+        u32::from(function & 1) << 29
+    } else {
+        u32::from(function) << 30
+    };
+    m.sram.insert(SRAM_CPMU_STATUS, port | CPMU_STATUS);
     let m = Rc::new(RefCell::new(m));
     // SAFETY: both original owners belong to this isolated symbolic device.
     (
@@ -266,11 +272,22 @@ fn identified(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Mod
 
 #[test]
 fn config_revision_and_phy_oui_select_each_named_family() {
-    for asic in [Asic::Bcm5761, Asic::Bcm5719, Asic::Bcm5720, Asic::Bcm5762] {
+    for asic in [
+        Asic::Bcm5761,
+        Asic::Bcm5717,
+        Asic::Bcm5719,
+        Asic::Bcm5720,
+        Asic::Bcm5762,
+    ] {
         for function in 0..4 {
             let (mut hardware, _) = model(asic, function);
             let identity = hardware.identify().unwrap();
             assert_eq!(identity.asic, asic);
+            let function = if asic == Asic::Bcm5717 {
+                function & 1
+            } else {
+                function
+            };
             assert_eq!(identity.function, function);
             assert_eq!(
                 identity.phy_address,
@@ -295,6 +312,19 @@ fn a_candidate_id_cannot_authorize_wrong_asic_or_serdes() {
     let (mut hardware, m) = model(Asic::Bcm5719, 0);
     m.borrow_mut().config.insert(GEN2_PRODID, 0x0572_0000);
     assert_eq!(hardware.identify(), Err(Error::UnsupportedRevision));
+    // tg3_get_invariants renames a 5717 C0 a 5720 A0, with its PHY.
+    for device in [0x1655u32, 0x1656, 0x1665] {
+        let (mut hardware, m) = model(Asic::Bcm5720, 1);
+        m.borrow_mut().config.insert(0, (device << 16) | 0x14e4);
+        m.borrow_mut().config.insert(GEN2_PRODID, 0x0571_7200);
+        let identity = hardware.identify().unwrap();
+        assert_eq!(
+            (identity.asic, identity.chip_revision),
+            (Asic::Bcm5720, 0x0572_0000)
+        );
+        assert_eq!((identity.function, identity.phy_address), (1, 2));
+        hardware.read_phy_identity().unwrap();
+    }
     // A 5720 PHY OUI never stands in for a 5719's.
     let (mut hardware, m) = model(Asic::Bcm5719, 0);
     let identity = 0x5c0d_8b62u32;
@@ -645,7 +675,13 @@ fn reset_model(asic: Asic) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>) {
 
 #[test]
 fn core_reset_uses_config_while_mmio_decode_is_gone() {
-    for asic in [Asic::Bcm5761, Asic::Bcm5719, Asic::Bcm5720, Asic::Bcm5762] {
+    for asic in [
+        Asic::Bcm5761,
+        Asic::Bcm5717,
+        Asic::Bcm5719,
+        Asic::Bcm5720,
+        Asic::Bcm5762,
+    ] {
         let (mut hardware, m) = reset_model(asic);
         hardware.reset_core().unwrap();
         assert!(hardware.core_reset_completed());
@@ -668,6 +704,19 @@ fn core_reset_uses_config_while_mmio_decode_is_gone() {
         assert!(m.trace.contains(&Event::Write(MAC_MI_MODE, 0x8000)));
         match asic {
             Asic::Bcm5761 => assert!(m.trace.contains(&Event::Write(0x7c00, 1 << 25))),
+            Asic::Bcm5717 => {
+                // tg3_override_clk and tg3_restore_clk's enable bit.
+                let set = m
+                    .trace
+                    .iter()
+                    .position(|e| *e == Event::Write(0x3628, 1 << 13));
+                let reset = m
+                    .trace
+                    .iter()
+                    .position(|e| *e == Event::Write(0x6804, 0x2000_0001));
+                assert!(set.unwrap() < reset.unwrap());
+                assert!(m.trace[reset.unwrap()..].contains(&Event::Write(0x3628, 0)));
+            }
             Asic::Bcm5719 | Asic::Bcm5720 => {
                 assert!(m.trace.contains(&Event::Write(0x3624, 1 << 31)));
             }

@@ -892,6 +892,8 @@ unsafe impl Registers for Reg {
             0x44c => {
                 let expected_phy = if p.config[&0] == 0x1687_14e4 {
                     1
+                } else if p.is_5717() {
+                    ((p.sram[&0xe00] >> 29) & 1) + 1
                 } else {
                     ((p.sram[&0xe00] >> 30) + 1) & 31
                 };
@@ -1805,6 +1807,7 @@ fn fatal_flow_observed_during_low_water_ack_is_never_discarded() {
     assert!(packet.retire().is_ok());
 }
 
+mod bcm5717;
 mod bcm5719;
 mod bcm5761;
 mod bcm5761_power;
