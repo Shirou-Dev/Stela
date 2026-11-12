@@ -62,6 +62,9 @@ pub struct Host {
     hubs: Vec<Hub>,
     roots: Vec<u32>,
     sleep: suspend::Sleep,
+    /// The failures the last poll found, each reported then. One that
+    /// stands from poll to poll is reported once, until it changes or ends.
+    standing: Vec<(String, BlockError)>,
 }
 impl Host {
     /// Transfer this inventory's unbound Address-state device to the
@@ -108,6 +111,7 @@ impl Host {
             hubs: Vec::new(),
             roots,
             sleep: suspend::Sleep::default(),
+            standing: Vec::new(),
         };
         host.register_hubs(devices, dma, failures);
         host
@@ -229,6 +233,23 @@ impl Host {
     /// No completion or new identity is inferred from elapsed time. Topology
     /// mutation is serialized through this controller's native Rc owner.
     pub fn poll(
+        &mut self,
+        dma: &mut dyn DmaAllocator,
+        firmware: &dyn crate::firmware::Provider,
+    ) -> Changes {
+        let mut changes = self.poll_changes(dma, firmware);
+        // A port or hub whose refusal stands fails the same way on every
+        // poll, thousands of times a second: say it once.
+        let found = changes.added.failures.clone();
+        changes
+            .added
+            .failures
+            .retain(|failure| !self.standing.contains(failure));
+        self.standing = found;
+        changes
+    }
+
+    fn poll_changes(
         &mut self,
         dma: &mut dyn DmaAllocator,
         firmware: &dyn crate::firmware::Provider,

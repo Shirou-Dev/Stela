@@ -829,7 +829,9 @@ fn runtime_persistent_hub_power_fault_keeps_public_aliases_fenced_until_restorat
             let changed = runtime_poll(&mut host, &mut dma);
             assert_eq!(changed.removed.len(), if iteration == 0 { 2 } else { 0 });
             assert!(changed.added.devices.is_empty());
-            assert!(!changed.added.failures.is_empty());
+            // The fault is reported as it begins and as recovery first
+            // finds it standing; the same refusal is not repeated after.
+            assert_eq!(changed.added.failures.is_empty(), iteration == 2);
             for old in &devices {
                 assert!(shared.borrow_mut().live_slot(old.slot).is_err());
                 assert!(shared.borrow().power.retained(old.slot));
