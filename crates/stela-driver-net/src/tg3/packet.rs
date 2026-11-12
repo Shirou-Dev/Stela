@@ -10,8 +10,12 @@ use crate::{
     },
     check_frame,
 };
-use alloc::{sync::Arc, vec::Vec};
-use stela_driver_base::stepped::block_on;
+use alloc::{boxed::Box, rc::Rc, sync::Arc, vec::Vec};
+use core::{
+    ops::{Deref, DerefMut},
+    task::Poll,
+};
+use stela_driver_base::stepped::{Allowance, Stepped, block_on};
 mod memory;
 use super::geometry::Geometry;
 #[cfg(test)]
@@ -19,6 +23,52 @@ use memory::RX;
 use memory::{Memory, TX};
 
 const SD_STATUS_ERROR: u32 = 4;
+/// Each runtime call's share of waiting for work in steps: up to this, plus
+/// the one delay that crosses it. Between two 10-us waits a poll makes a
+/// few register accesses, which can double a step's real time; a
+/// processor's exit must end well inside half a second.
+const STEP_US: u64 = 20_000;
+/// `tg3_timer`'s once-a-second link check.
+const LINK_POLL_US: u64 = 1_000_000;
+
+/// The hardware, which work in steps holds while it runs.
+struct Held<T>(Option<T>);
+impl<T> Held<T> {
+    fn take(&mut self) -> T {
+        self.0.take().expect("hardware is held")
+    }
+    fn put(&mut self, value: T) {
+        self.0 = Some(value);
+    }
+}
+impl<T> Deref for Held<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.as_ref().expect("no work holds the hardware")
+    }
+}
+impl<T> DerefMut for Held<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.0.as_mut().expect("no work holds the hardware")
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// The copper link check.
+    Link,
+}
+/// Hardware work run a step per runtime call. It owns the hardware until
+/// it ends, so meanwhile the carrier is down, receive finds nothing and
+/// transmit has no carrier.
+struct Work<R: Registers, D: Delay> {
+    kind: Kind,
+    task: Stepped<'static, Finished<R, D>>,
+}
+struct Finished<R: Registers, D: Delay> {
+    hardware: Hardware<R, D>,
+    result: Result<bool, Error>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -32,7 +82,14 @@ enum State {
 /// form one lifetime. An uncertain epoch keeps all of them. No IRQs or worker
 /// callbacks are registered by this polled backend.
 pub struct Packet<R: Registers, D: Delay> {
-    hardware: Hardware<R, D>,
+    hardware: Held<Hardware<R, D>>,
+    /// Work in steps under way, holding the hardware.
+    work: Option<Work<R, D>>,
+    /// Each runtime call's share of waiting for that work.
+    allowance: Rc<Allowance>,
+    /// When the next link check is due; none when it is due now, and on a
+    /// timer that keeps no interval, where every call checks.
+    link_due: Option<Box<dyn crate::bus::pci::power::Interval>>,
     memory: Option<Memory>,
     domain: Arc<dyn DmaDomain>,
     attachment: Option<Attachment>,
@@ -60,7 +117,7 @@ pub struct Packet<R: Registers, D: Delay> {
     /// receive never touches the caller's buffer.
     received: Vec<u8>,
 }
-impl<R: Registers, D: Delay> Packet<R, D> {
+impl<R: Registers + 'static, D: Delay + 'static> Packet<R, D> {
     /// Attach an exclusively owned stopped requester, with real NVM
     /// bootcode already present. Errors return the whole epoch.
     ///
@@ -88,7 +145,10 @@ impl<R: Registers, D: Delay> Packet<R, D> {
         domain: Arc<dyn DmaDomain>,
     ) -> Result<Self, (Error, Self)> {
         let mut value = Self {
-            hardware,
+            hardware: Held(Some(hardware)),
+            work: None,
+            allowance: Rc::new(Allowance::new(STEP_US)),
+            link_due: None,
             memory: None,
             domain,
             attachment: None,
@@ -179,6 +239,11 @@ impl<R: Registers, D: Delay> Packet<R, D> {
     /// Already completed frames are not retracted. On error, the uncertain
     /// original epoch is held and packet publication remains fenced.
     pub fn set_receive_filter(&mut self, filter: ReceiveFilter) -> Result<(), Error> {
+        // Work under way holds the hardware; it takes this call's step.
+        self.allowance.refill();
+        if self.advance().is_pending() {
+            return Err(Error::Stopped);
+        }
         self.check()?;
         filter.validate()?;
         match block_on(self.hardware.packet_receive_filter(&filter)) {
@@ -221,6 +286,82 @@ impl<R: Registers, D: Delay> Packet<R, D> {
             Err(Error::Stopped)
         }
     }
+    /// Hand the hardware to `kind` of work, which runs `run` on it a step
+    /// at a time within each call's share of waiting.
+    fn begin<F>(&mut self, kind: Kind, run: impl FnOnce(Hardware<R, D>) -> F)
+    where
+        F: core::future::Future<Output = Finished<R, D>> + 'static,
+    {
+        let mut hardware = self.hardware.take();
+        hardware.steps(Some(self.allowance.clone()));
+        self.work = Some(Work {
+            kind,
+            task: Stepped::new(run(hardware)),
+        });
+    }
+    /// The copper link check, as work in steps.
+    fn begin_link(&mut self) {
+        self.begin(Kind::Link, |mut hardware| async move {
+            let result = hardware.packet_carrier().await;
+            Finished { hardware, result }
+        });
+    }
+    /// One step of the work under way, and of any work its end starts, in
+    /// this call's share: pending while it continues, otherwise the result
+    /// of the work that ended last (`Ok` when there was none).
+    fn advance(&mut self) -> Poll<Result<(), Error>> {
+        while let Some(work) = &mut self.work {
+            let Poll::Ready(mut finished) = work.task.step() else {
+                return Poll::Pending;
+            };
+            let kind = work.kind;
+            self.work = None;
+            finished.hardware.steps(None);
+            self.hardware.put(finished.hardware);
+            let result = self.finished(kind, finished.result);
+            if result.is_err() || self.work.is_none() {
+                return Poll::Ready(result);
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+    /// The work under way run to its end in this call, as attachment and
+    /// teardown may.
+    fn finish(&mut self) -> Result<(), Error> {
+        loop {
+            self.allowance.refill();
+            if let Poll::Ready(result) = self.advance() {
+                return result;
+            }
+        }
+    }
+    /// What ended work leaves behind.
+    fn finished(&mut self, kind: Kind, result: Result<bool, Error>) -> Result<(), Error> {
+        match (kind, result) {
+            (Kind::Link, Ok(carrier)) => {
+                let due = self.hardware.begin_interval(LINK_POLL_US);
+                self.link_due = due.map_err(|error| self.fault(error))?;
+                if !carrier && self.carrier_up {
+                    self.carrier_up = false;
+                    self.restart().map_err(|error| self.fault(error))?;
+                    // The restarted link is checked at the next call.
+                    self.link_due = None;
+                    return Ok(());
+                }
+                self.carrier_up = carrier;
+                Ok(())
+            }
+            (_, Err(error)) => Err(self.fault(error)),
+        }
+    }
+    /// Whether the link check is due: once a second, as `tg3_timer` checks
+    /// it, or at every call on a timer that keeps no interval.
+    fn link_due(&mut self) -> Result<bool, Error> {
+        match &self.link_due {
+            None => Ok(true),
+            Some(interval) => interval.elapsed().map_err(Error::Timing),
+        }
+    }
     fn poll(&mut self) -> Result<usize, Error> {
         self.check()?;
         self.hardware.asf_heartbeat()?;
@@ -250,6 +391,8 @@ impl<R: Registers, D: Delay> Packet<R, D> {
     /// remapper's posted payload drain. A failed attempt remains retryable only
     /// for containment; it can never resume submission or invent completion.
     pub fn stop(&mut self) -> Result<(), Error> {
+        // Work under way ends first; its failure faults the epoch.
+        let _ = self.finish();
         if matches!(self.state, State::Stopped | State::PhySuspended) {
             return Ok(());
         }
@@ -444,31 +587,31 @@ impl<R: Registers, D: Delay> Packet<R, D> {
         })
     }
 }
-impl<R: Registers, D: Delay> Link for Packet<R, D> {
+impl<R: Registers + 'static, D: Delay + 'static> Link for Packet<R, D> {
     fn mac(&self) -> Mac {
         self.mac
     }
+    /// The last link check's carrier. A check runs when one is due, as
+    /// work in steps; calls in between make no PHY access. While work holds
+    /// the hardware the carrier is down.
     fn carrier(&mut self) -> bool {
-        if self.check().is_err() {
+        self.allowance.refill();
+        if self.advance().is_pending() || self.check().is_err() {
             return false;
         }
-        match block_on(self.hardware.packet_carrier()) {
-            Ok(carrier) => {
-                if !carrier && self.carrier_up {
-                    self.carrier_up = false;
-                    if let Err(error) = self.restart() {
-                        self.fault(error);
-                        return false;
-                    }
-                }
-                self.carrier_up = carrier;
-                carrier
-            }
+        match self.link_due() {
+            Ok(false) => return self.carrier_up,
+            Ok(true) => {}
             Err(error) => {
                 self.fault(error);
-                false
+                return false;
             }
         }
+        self.begin_link();
+        if self.advance().is_pending() {
+            return false;
+        }
+        self.check().is_ok() && self.carrier_up
     }
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         check_frame(frame)?;

@@ -133,7 +133,7 @@ pub struct Hardware<R: Registers, D: Delay> {
     /// APE (`tg3_timer`'s `asf_counter`).
     asf_heartbeat: Option<alloc::boxed::Box<dyn crate::bus::pci::power::Interval>>,
     /// The share of waiting a call has while work runs in steps
-    /// ([`Allowance`]); none while it runs to completion.
+    /// ([`Self::steps`]); none while it runs to completion.
     allowance: Option<Rc<Allowance>>,
 }
 impl<R: Registers, D: Delay> Drop for Hardware<R, D> {
@@ -171,6 +171,21 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             asf_heartbeat: None,
             allowance: None,
         }
+    }
+    /// Run this owner's waits in steps of `allowance`, or to completion
+    /// when `None`.
+    pub(in crate::tg3) fn steps(&mut self, allowance: Option<Rc<Allowance>>) {
+        self.allowance = allowance;
+    }
+    /// A nonblocking minimum interval from this owner's timer, when it can
+    /// keep one.
+    pub(in crate::tg3) fn begin_interval(
+        &self,
+        microseconds: u64,
+    ) -> Result<Option<alloc::boxed::Box<dyn crate::bus::pci::power::Interval>>, Error> {
+        self.delay
+            .begin_interval(microseconds)
+            .map_err(Error::Timing)
     }
     /// Stop inherited packet engines while the original configuration/root
     /// and DMA backing remain held. This publishes no DMA or reset operation.

@@ -409,6 +409,9 @@ struct Device {
     dsp_select: u16,
     command: Option<u32>,
     busy: bool,
+    /// Further reads each MDIO command stays busy for.
+    mdio_slow: usize,
+    slow_left: usize,
     tx: usize,
     rx: usize,
     ret: usize,
@@ -561,7 +564,11 @@ impl Device {
             }
             0x44c => {
                 if self.busy {
-                    self.busy = false;
+                    if self.slow_left > 0 {
+                        self.slow_left -= 1;
+                    } else {
+                        self.busy = false;
+                    }
                     self.command.unwrap()
                 } else if let Some(command) = self.command {
                     let at = ((command >> 16) & 31) as u8;
@@ -950,6 +957,7 @@ unsafe impl Registers for Reg {
                 );
                 p.command = Some(value);
                 p.busy = true;
+                p.slow_left = p.mdio_slow;
             }
             0x7020 if value == 2 => {
                 p.mac.insert(at, 0x202);
@@ -1875,6 +1883,7 @@ mod phy_link;
 mod phy_power;
 mod rdma_mode;
 mod restart;
+mod stepped;
 
 mod timing;
 
