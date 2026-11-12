@@ -148,6 +148,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             if self.regs().config_read32(regs::COMMAND)? as u16 != command {
                 return Err(Error::ConfigDidNotLatch);
             }
+            // tg3_reset_hw: tg3_stop_fw, then tg3_write_sig_pre_reset.
+            self.stop_firmware()?;
             self.sram(FIRMWARE_MBOX, Some(FIRMWARE_MAGIC))?;
             self.asf_driver_state(management::DRV_STATE_START)?;
             self.nvram_lock()?;
@@ -195,9 +197,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             let host = Self::checked(self.regs().config_read32(MISC_HOST_CTRL)?)?;
             self.regs()
                 .config_write32(MISC_HOST_CTRL, (host & 0xffff_0000) | HOST_ACCESS)?;
-            self.regs().config_write32(PCISTATE, 0x60 | ALLOW_APE)?;
+            // tg3_restore_pci_state: the APE space only for a chip with one.
+            let allow = if identity.ape { ALLOW_APE } else { 0 };
+            self.regs().config_write32(PCISTATE, 0x60 | allow)?;
             if Self::checked(self.regs().config_read32(MISC_HOST_CTRL)?)? & 0xffff != HOST_ACCESS
-                || Self::checked(self.regs().config_read32(PCISTATE)?)? & ALLOW_APE != ALLOW_APE
+                || Self::checked(self.regs().config_read32(PCISTATE)?)? & ALLOW_APE != allow
             {
                 return Err(Error::ConfigDidNotLatch);
             }

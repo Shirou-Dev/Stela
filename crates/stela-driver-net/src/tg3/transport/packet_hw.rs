@@ -282,8 +282,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 | MAC_MODE_RDE_ENABLE
                 | MAC_MODE_FHDE_ENABLE
                 // ENABLE_APE: the APE sends and receives through the MAC.
-                | MAC_MODE_APE_TX_EN
-                | MAC_MODE_APE_RX_EN
+                | if self.identity.ok_or(Error::NotIdentified)?.ape {
+                    MAC_MODE_APE_TX_EN | MAC_MODE_APE_RX_EN
+                } else {
+                    0
+                }
                 | MAC_MODE_RXSTAT_CLEAR
                 | MAC_MODE_TXSTAT_CLEAR,
         )?;
@@ -518,9 +521,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     pub(in crate::tg3) fn rx_consumer(&mut self, index: usize) -> Result<(), Error> {
         self.flush(MAILBOX_RCVRET_CON_IDX_0 + 4, index as u32)
     }
-    /// tg3_halt's `tg3_write_sig_pre_reset(RESET_KIND_SHUTDOWN)`, before
-    /// the engines stop.
+    /// tg3_halt's `tg3_stop_fw` and `tg3_write_sig_pre_reset(RESET_KIND_SHUTDOWN)`,
+    /// before the engines stop.
     pub(in crate::tg3) fn packet_unload_begin(&mut self) -> Result<(), Error> {
+        self.stop_firmware()?;
         self.asf_driver_state(super::management::DRV_STATE_UNLOAD)
     }
     /// tg3_halt's `tg3_write_sig_post_reset(RESET_KIND_SHUTDOWN)` and

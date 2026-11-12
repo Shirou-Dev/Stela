@@ -60,6 +60,8 @@ pub struct Identity {
     /// live CPMU status, which need not equal the BDF function.
     pub function: u8,
     pub phy_address: u8,
+    /// ENABLE_APE: the chip has an APE (see [`super::ape`]).
+    pub ape: bool,
 }
 
 /// One serialized hardware epoch. Drop keeps its real registers/reservation;
@@ -85,6 +87,9 @@ pub struct Hardware<R: Registers, D: Delay> {
     ape_heartbeat: u32,
     /// Whether the APE was last told the driver started.
     ape_started: bool,
+    /// The interval until the next ASF heartbeat to firmware without an
+    /// APE (`tg3_timer`'s `asf_counter`).
+    asf_heartbeat: Option<alloc::boxed::Box<dyn crate::bus::pci::power::Interval>>,
 }
 impl<R: Registers, D: Delay> Drop for Hardware<R, D> {
     fn drop(&mut self) {
@@ -118,6 +123,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             management: management::Management::default(),
             ape_heartbeat: 0,
             ape_started: false,
+            asf_heartbeat: None,
         }
     }
     /// Stop inherited packet engines while the original configuration/root
@@ -314,10 +320,15 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         } else {
             bdf_function & 3
         };
-        let state = Self::checked(self.regs().config_read32(PCISTATE)?)?;
-        self.regs().config_write32(PCISTATE, state | ALLOW_APE)?;
-        if Self::checked(self.regs().config_read32(PCISTATE)?)? & ALLOW_APE != ALLOW_APE {
-            return Err(Error::ConfigDidNotLatch);
+        let ape = super::ape(device);
+        // tg3_get_invariants opens the APE register and memory space only
+        // on a chip with an APE.
+        if ape {
+            let state = Self::checked(self.regs().config_read32(PCISTATE)?)?;
+            self.regs().config_write32(PCISTATE, state | ALLOW_APE)?;
+            if Self::checked(self.regs().config_read32(PCISTATE)?)? & ALLOW_APE != ALLOW_APE {
+                return Err(Error::ConfigDidNotLatch);
+            }
         }
         // tg3_mdio_init: only 5717_PLUS changes the PHY address.
         let phy_address = if asic.plus_5717() {
@@ -335,8 +346,12 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             bdf_function,
             function,
             phy_address,
+            ape,
         };
         self.identity = Some(identity);
+        if !ape {
+            return Ok(identity);
+        }
         // tg3_ape_lock_init clears only this port's stale grant bits;
         // it never invents an acquisition or clears a competitor's bit.
         let grant_base = if asic == Asic::Bcm5761 {
@@ -378,7 +393,12 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             bit,
         ))
     }
+    /// tg3_ape_lock: without an APE there is no one to share with, and the
+    /// lock is taken at once.
     fn lock(&mut self, lock: u8) -> Result<(), Error> {
+        if !self.identity.ok_or(Error::NotIdentified)?.ape {
+            return Ok(());
+        }
         let (request, grant, bit) = self.lock_coordinates(lock)?;
         self.regs().ape_write32(request, bit)?;
         let result = (|| {
@@ -399,6 +419,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         result
     }
     fn unlock(&mut self, lock: u8) -> Result<(), Error> {
+        if !self.identity.ok_or(Error::NotIdentified)?.ape {
+            return Ok(());
+        }
         let (_, grant, bit) = self.lock_coordinates(lock)?;
         self.regs().ape_write32(grant, bit)
     }

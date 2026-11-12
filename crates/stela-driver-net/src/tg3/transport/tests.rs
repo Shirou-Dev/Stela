@@ -42,6 +42,14 @@ struct Model {
     fail_delay: Option<usize>,
     /// The APE firmware never takes a posted event.
     ape_busy: bool,
+    /// Every NIC SRAM store, in order.
+    sram_writes: Vec<(u32, u32)>,
+    /// The RX CPU never takes a driver event.
+    rx_cpu_busy: bool,
+    /// The timer keeps no interval.
+    no_interval: bool,
+    /// Whether the heartbeat interval has run out.
+    interval_elapsed: bool,
 }
 impl Model {
     fn event(&mut self, event: Event) -> Result<(), Error> {
@@ -76,6 +84,27 @@ unsafe impl Delay for Timer {
         } else {
             Ok(())
         }
+    }
+    fn begin_interval(
+        &self,
+        microseconds: u64,
+    ) -> Result<
+        Option<alloc::boxed::Box<dyn crate::bus::pci::power::Interval>>,
+        crate::bus::pci::power::Error,
+    > {
+        assert_eq!(microseconds, 2_000_000);
+        let mut model = self.0.borrow_mut();
+        if model.no_interval {
+            return Ok(None);
+        }
+        model.interval_elapsed = false;
+        Ok(Some(alloc::boxed::Box::new(Interval(self.0.clone()))))
+    }
+}
+struct Interval(Rc<RefCell<Model>>);
+impl crate::bus::pci::power::Interval for Interval {
+    fn elapsed(&self) -> Result<bool, crate::bus::pci::power::Error> {
+        Ok(self.0.borrow().interval_elapsed)
     }
 }
 // SAFETY: a symbolic isolated test device only; no production address/permission.
@@ -153,6 +182,11 @@ unsafe impl Registers for Reg {
         if at == MEM_DATA {
             let window = *m.mac.get(&MEM_BASE).unwrap_or(&0);
             m.sram.insert(window, value);
+            m.sram_writes.push((window, value));
+        } else if at == 0x6810 {
+            // The RX CPU takes a driver event at once unless it is busy.
+            let busy = m.rx_cpu_busy;
+            m.mac.insert(at, if busy { value } else { value & !0x4000 });
         } else if at == MAC_MI_COM {
             m.command = value;
             m.busy_reads = 1;
@@ -1039,3 +1073,101 @@ fn every_core_reset_wait_failure_prevents_completion_and_keeps_original_epoch() 
 }
 
 mod cold;
+
+/// A chip without an APE (as the desktop Tigon3 parts are).
+fn without_ape(hardware: &mut Hardware<Reg, Timer>) {
+    hardware.identity.as_mut().unwrap().ape = false;
+}
+
+#[test]
+fn without_an_ape_every_lock_is_taken_at_once_and_no_ape_space_is_touched() {
+    let (mut hardware, m) = reset_model(Asic::Bcm5720);
+    without_ape(&mut hardware);
+    m.borrow_mut().trace.clear();
+    assert_eq!(hardware.read_phy(7), Ok(0xa55a));
+    hardware.ape_driver_start().unwrap();
+    hardware.reset_core().unwrap();
+    hardware.management_started().unwrap();
+    hardware.ape_driver_unload().unwrap();
+    let m = m.borrow();
+    assert!(
+        !m.trace
+            .iter()
+            .any(|e| matches!(e, Event::ApeRead(..) | Event::ApeWrite(..)))
+    );
+    // tg3_restore_pci_state opens no APE space.
+    assert!(m.trace.contains(&Event::ConfigWrite(PCISTATE, 0x60)));
+}
+
+#[test]
+fn a_board_claiming_an_ape_the_chip_lacks_is_refused() {
+    let (mut hardware, m) = reset_model(Asic::Bcm5720);
+    without_ape(&mut hardware);
+    m.borrow_mut().sram.insert(0xb58, 0x0020_0000);
+    assert_eq!(hardware.observe_management(), Err(Error::UnsupportedBoard));
+}
+
+#[test]
+fn asf_firmware_without_an_ape_pauses_before_each_reset_and_hears_a_heartbeat() {
+    let (mut hardware, m) = reset_model(Asic::Bcm5720);
+    without_ape(&mut hardware);
+    m.borrow_mut().sram.insert(0xb58, 0x80);
+    hardware.reset_core().unwrap();
+    {
+        let m = m.borrow();
+        // tg3_stop_fw's PAUSE_FW and its event, then the pre-reset signature.
+        let pause = m.sram_writes.iter().position(|w| *w == (0xb78, 2)).unwrap();
+        let magic = m
+            .sram_writes
+            .iter()
+            .position(|w| *w == (FIRMWARE_MBOX, FIRMWARE_MAGIC))
+            .unwrap();
+        assert!(pause < magic);
+        assert!(m.trace.contains(&Event::Write(0x6810, 0x4000)));
+        assert_eq!(m.sram[&0xc04], 1);
+    }
+    hardware.management_started().unwrap();
+    m.borrow_mut().sram_writes.clear();
+    // Nothing is due before the two-second interval runs out.
+    hardware.asf_heartbeat().unwrap();
+    assert!(m.borrow().sram_writes.is_empty());
+    m.borrow_mut().interval_elapsed = true;
+    hardware.asf_heartbeat().unwrap();
+    assert_eq!(
+        m.borrow().sram_writes,
+        [(0xb78, 0xe), (0xb7c, 4), (0xb80, 5)]
+    );
+    assert!(!m.borrow().interval_elapsed, "a new interval began");
+    // A busy RX CPU delays the command by at most 2.5 ms; it still goes.
+    m.borrow_mut().rx_cpu_busy = true;
+    m.borrow_mut().interval_elapsed = true;
+    m.borrow_mut().sram_writes.clear();
+    hardware.asf_heartbeat().unwrap();
+    m.borrow_mut().interval_elapsed = true;
+    let before = m.borrow().delay_count;
+    hardware.asf_heartbeat().unwrap();
+    assert_eq!(m.borrow().delay_count - before, 313);
+    assert_eq!(m.borrow().sram_writes.len(), 6);
+}
+
+#[test]
+fn asf_firmware_without_an_ape_needs_a_timer_that_keeps_the_heartbeat() {
+    let (mut hardware, m) = reset_model(Asic::Bcm5720);
+    without_ape(&mut hardware);
+    m.borrow_mut().sram.insert(0xb58, 0x80);
+    m.borrow_mut().no_interval = true;
+    hardware.reset_core().unwrap();
+    assert_eq!(hardware.management_started(), Err(Error::UnsupportedBoard));
+    // With an APE, or without ASF, no heartbeat is kept.
+    let (mut hardware, m) = reset_model(Asic::Bcm5720);
+    m.borrow_mut().sram.insert(0xb58, 0x80);
+    m.borrow_mut().no_interval = true;
+    hardware.reset_core().unwrap();
+    hardware.management_started().unwrap();
+    let (mut hardware, m) = reset_model(Asic::Bcm5720);
+    without_ape(&mut hardware);
+    m.borrow_mut().no_interval = true;
+    hardware.reset_core().unwrap();
+    hardware.management_started().unwrap();
+    hardware.asf_heartbeat().unwrap();
+}

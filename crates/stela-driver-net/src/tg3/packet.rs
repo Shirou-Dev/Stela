@@ -219,6 +219,7 @@ impl<R: Registers, D: Delay> Packet<R, D> {
     }
     fn poll(&mut self) -> Result<usize, Error> {
         self.check()?;
+        self.hardware.asf_heartbeat()?;
         self.hardware.request_status()?;
         let (flags, tx, rx) = self.memory.as_ref().unwrap().status()?;
         if flags & SD_STATUS_ERROR != 0 && self.hardware.packet_attention()? {

@@ -4,16 +4,30 @@
 // Copyright (C) 2004 Sun Microsystems Inc.
 // Copyright (C) 2005-2018 Broadcom
 //! The driver's side of the management firmware handshake: Linux tg3's
-//! ASF driver-state mailbox and APE host segment, driver state and events.
+//! ASF driver-state mailbox, APE host segment, driver state and events,
+//! and, for ASF firmware on a chip without an APE, `tg3_stop_fw`'s pause
+//! command and `tg3_timer`'s ASF heartbeat.
 //!
-//! Every named chip has an APE, so Linux sets ENABLE_APE for each and ASF
-//! follows the signed board configuration. ENABLE_APE with ASF makes
-//! `tg3_stop_fw`'s pause command and the legacy ASF heartbeat unused here.
+//! ENABLE_APE is a property of the chip ([`super::super::ape`]); ASF
+//! follows the signed board configuration.
 use super::*;
 
 const SRAM_DATA_SIGNATURE: u32 = 0xb54;
 const SRAM_DATA_CONFIG: u32 = 0xb58;
 const ASF_ENABLE: u32 = 0x80;
+const APE_ENABLE: u32 = 0x0020_0000;
+const FW_CMD_MBOX: u32 = 0xb78;
+const FW_CMD_LEN_MBOX: u32 = 0xb7c;
+const FW_CMD_DATA_MBOX: u32 = 0xb80;
+const FWCMD_NICDRV_PAUSE_FW: u32 = 2;
+const FWCMD_NICDRV_ALIVE3: u32 = 0xe;
+const GRC_RX_CPU_EVENT: u32 = 0x6810;
+const GRC_RX_CPU_DRIVER_EVENT: u32 = 0x4000;
+/// `TG3_FW_EVENT_TIMEOUT_USEC`, polled in 8-us steps.
+const FW_EVENT_POLLS: u32 = (2500 >> 3) + 1;
+/// `TG3_FW_UPDATE_TIMEOUT_SEC`, and the heartbeat every half of it.
+const FW_UPDATE_TIMEOUT_SEC: u32 = 5;
+const FW_UPDATE_FREQ_US: u64 = 2_000_000;
 const DRV_STATE_MBOX: u32 = 0xc04;
 pub(super) const DRV_STATE_START: u32 = 0x0000_0001;
 pub(super) const DRV_STATE_START_DONE: u32 = 0x8000_0001;
@@ -75,6 +89,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             return Err(Error::UnsignedBoard);
         }
         let config = self.sram(SRAM_DATA_CONFIG, None)?;
+        // tg3_get_eeprom_hw_cfg would set ENABLE_APE from this bit on a
+        // chip Linux maps no APE window for; such a board is refused.
+        if config & APE_ENABLE != 0 && !self.identity.ok_or(Error::NotIdentified)?.ape {
+            return Err(Error::UnsupportedBoard);
+        }
         let management = Management {
             asf: config & ASF_ENABLE != 0,
         };
@@ -95,11 +114,79 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     fn ape_write(&mut self, at: u32, value: u32) -> Result<(), Error> {
         self.regs().ape_write32(at, value)
     }
+    fn ape(&self) -> Result<bool, Error> {
+        Ok(self.identity.ok_or(Error::NotIdentified)?.ape)
+    }
+    /// ASF firmware that talks to the driver through the RX CPU event
+    /// mailbox: ENABLE_ASF without ENABLE_APE.
+    fn legacy_asf(&self) -> Result<bool, Error> {
+        Ok(self.management.asf && !self.ape()?)
+    }
+    /// `tg3_wait_for_event_ack`: give the RX CPU up to 2.5 ms to take the
+    /// previous event. Like Linux, the driver goes on when it does not.
+    fn wait_for_event_ack(&mut self) -> Result<(), Error> {
+        for _ in 0..FW_EVENT_POLLS {
+            if self.read(GRC_RX_CPU_EVENT)? & GRC_RX_CPU_DRIVER_EVENT == 0 {
+                break;
+            }
+            self.wait(8)?;
+        }
+        Ok(())
+    }
+    /// `tg3_generate_fw_event`.
+    fn generate_firmware_event(&mut self) -> Result<(), Error> {
+        let event = self.read(GRC_RX_CPU_EVENT)?;
+        self.flush(GRC_RX_CPU_EVENT, event | GRC_RX_CPU_DRIVER_EVENT)
+    }
+    /// `tg3_stop_fw`: ASF firmware without an APE pauses before the driver
+    /// resets or halts the chip.
+    pub(super) fn stop_firmware(&mut self) -> Result<(), Error> {
+        if !self.legacy_asf()? {
+            return Ok(());
+        }
+        self.wait_for_event_ack()?;
+        self.sram(FW_CMD_MBOX, Some(FWCMD_NICDRV_PAUSE_FW))?;
+        self.generate_firmware_event()?;
+        self.wait_for_event_ack()
+    }
+    /// `tg3_timer`'s ASF heartbeat for firmware without an APE: every two
+    /// seconds, FWCMD_NICDRV_ALIVE3 with a five-second timeout, so the
+    /// firmware checks the rings before it would reset a silent driver.
+    /// The packet poll calls this; a timer with no retained interval
+    /// cannot keep the beat, and such a function is refused at start.
+    pub(in crate::tg3) fn asf_heartbeat(&mut self) -> Result<(), Error> {
+        if !self.legacy_asf()? {
+            return Ok(());
+        }
+        let elapsed = match &self.asf_heartbeat {
+            Some(interval) => interval.elapsed().map_err(Error::Timing),
+            None => Err(Error::NotIdentified),
+        };
+        if !self.record(elapsed)? {
+            return Ok(());
+        }
+        self.wait_for_event_ack()?;
+        self.sram(FW_CMD_MBOX, Some(FWCMD_NICDRV_ALIVE3))?;
+        self.sram(FW_CMD_LEN_MBOX, Some(4))?;
+        self.sram(FW_CMD_DATA_MBOX, Some(FW_UPDATE_TIMEOUT_SEC))?;
+        self.generate_firmware_event()?;
+        self.begin_heartbeat_interval()
+    }
+    fn begin_heartbeat_interval(&mut self) -> Result<(), Error> {
+        let interval = self.delay.begin_interval(FW_UPDATE_FREQ_US);
+        match self.record(interval.map_err(Error::Timing))? {
+            Some(interval) => {
+                self.asf_heartbeat = Some(interval);
+                Ok(())
+            }
+            None => self.record(Err(Error::UnsupportedBoard)),
+        }
+    }
     /// `tg3_ape_driver_state_change(RESET_KIND_INIT)`, once per driver
     /// start: the host segment, driver identity and START state, then the
     /// state-change event.
     pub(super) fn ape_driver_start(&mut self) -> Result<(), Error> {
-        if self.ape_started {
+        if self.ape_started || !self.ape()? {
             return Ok(());
         }
         let heartbeat = self.ape_heartbeat;
@@ -118,8 +205,16 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     /// The end of `tg3_reset_hw`: the heartbeat interval and ASF's
     /// START_DONE.
     pub(super) fn management_started(&mut self) -> Result<(), Error> {
-        self.ape_write(APE_HOST_HEARTBEAT_INT_MS, APE_HOST_HEARTBEAT_INT_DISABLE)?;
-        self.asf_driver_state(DRV_STATE_START_DONE)
+        if self.ape()? {
+            self.ape_write(APE_HOST_HEARTBEAT_INT_MS, APE_HOST_HEARTBEAT_INT_DISABLE)?;
+        }
+        self.asf_driver_state(DRV_STATE_START_DONE)?;
+        // tg3_timer_start: the first ASF heartbeat is due one interval on.
+        self.asf_heartbeat = None;
+        if self.legacy_asf()? {
+            self.begin_heartbeat_interval()?;
+        }
+        Ok(())
     }
     /// `tg3_ape_driver_state_change(RESET_KIND_SHUTDOWN)` without wake-up:
     /// the UNLOAD state and its event, so the firmware takes the port back.

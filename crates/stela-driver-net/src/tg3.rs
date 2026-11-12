@@ -178,6 +178,30 @@ impl Asic {
     }
 }
 
+/// Whether the device has an APE: Linux's `tg3_init_one` maps BAR 2 and
+/// sets ENABLE_APE for exactly these device IDs. Every other Tigon3 has no
+/// APE window, so its APE locks, events and register space do not exist.
+pub const fn ape(device: u16) -> bool {
+    matches!(
+        device,
+        0x1680
+            | 0x1681
+            | 0x1688
+            | 0x1689
+            | 0x1655
+            | 0x1665
+            | 0x1656
+            | 0x1657
+            | 0x165f
+            | 0x1683
+            | 0x1642
+            | 0x1687
+            | 0x1643
+            | 0x16f3
+            | 0x1641
+    )
+}
+
 /// Source PCI table membership is only a probe candidate, never an attach grant.
 pub fn candidate(vendor: u16, device: u16, class: [u8; 3]) -> bool {
     vendor == 0x14e4
