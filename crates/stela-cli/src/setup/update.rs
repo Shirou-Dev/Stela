@@ -465,7 +465,12 @@ fn room_for_new_copy(
          continues it. Remove macOS {from}'s copy and continue?",
         directory.display()
     );
-    match (environment.ask)(&question) {
+    match environment
+        .ui
+        .interactive()
+        .then(|| environment.ui.confirm(&question))
+        .transpose()?
+    {
         Some(true) => Ok(Some(old)),
         Some(false) => bail!("macOS {from}'s copy was kept, and nothing was changed"),
         None => bail!(

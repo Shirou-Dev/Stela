@@ -376,7 +376,7 @@ fn environment(host: &FakeHost) -> Environment<'_> {
         image_caches: &*TEST_CACHES,
         image_size: &offline_image_size,
         fetch_image: &offline_fetch_image,
-        ask: &|_| None,
+        ui: &ui::NoTerminal,
         bundle_inputs: &fake_bundle_inputs,
         prepare_restore: &fake_prepare_restore,
         prepare_update: &fake_prepare_update,
@@ -2893,58 +2893,41 @@ fn os_update_with_room_for_one_copy_replaces_it_only_after_asking() {
     assert!(error.contains("on a terminal"), "{error}");
     assert!(error.contains("free"), "{error}");
     // A dry run says it would ask, and asks nothing.
-    let never = |_: &str| -> Option<bool> { panic!("a dry run asks nothing") };
+    let never = ui::tests::Scripted::new(&[]);
     let mut dry = os_update(&f, &newer);
     dry.dry_run = true;
     let plan = dry
         .dispatch(&Environment {
-            ask: &never,
+            ui: &never,
             ..environment(&f.host)
         })
         .unwrap();
+    assert!(never.shown.borrow().is_empty());
     assert!(plan.contains("remove first"), "{plan}");
     assert!(plan.contains(&old.display().to_string()), "{plan}");
     // A no keeps everything.
-    let asked = std::cell::RefCell::new(String::new());
-    let answer = |yes: bool| {
-        let asked = &asked;
-        let host = &f.host;
-        move |question: &str| {
-            *asked.borrow_mut() = question.to_owned();
-            if yes {
-                host.freed.set(old_bytes);
-            }
-            Some(yes)
-        }
-    };
-    let no = answer(false);
+    let no = ui::tests::Scripted::new(&["no"]);
     let error = os_update(&f, &newer)
         .dispatch(&Environment {
-            ask: &no,
+            ui: &no,
             ..environment(&f.host)
         })
         .unwrap_err()
         .to_string();
     assert!(error.contains("was kept"), "{error}");
-    assert!(
-        asked.borrow().contains("cannot install macOS"),
-        "{}",
-        asked.borrow()
-    );
-    assert!(
-        asked.borrow().contains("keeps starting"),
-        "{}",
-        asked.borrow()
-    );
+    let asked = no.transcript();
+    assert!(asked.contains("cannot install macOS"), "{asked}");
+    assert!(asked.contains("keeps starting"), "{asked}");
     assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
-    // A yes replaces the copy.
-    let yes = answer(true);
+    // A yes replaces the copy, whose removal frees its bytes.
+    let yes = ui::tests::Scripted::with_hook(&["yes"], |_| f.host.freed.set(old_bytes));
     os_update(&f, &newer)
         .dispatch(&Environment {
-            ask: &yes,
+            ui: &yes,
             ..environment(&f.host)
         })
         .unwrap();
+    assert!(yes.done());
     let updated = record(&f);
     assert_eq!(
         (updated.build.as_str(), updated.replacing.as_deref()),

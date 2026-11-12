@@ -22,9 +22,9 @@ const CORNER_TOP_RIGHT: &str = "╮";
 const CORNER_BOTTOM_RIGHT: &str = "╯";
 
 #[derive(Default)]
-pub(super) struct Stela;
+pub(crate) struct Stela;
 
-pub(super) fn accent() -> Style {
+pub(crate) fn accent() -> Style {
     Style::new().true_color(215, 135, 95)
 }
 
@@ -37,7 +37,7 @@ fn warning() -> Style {
 }
 
 /// The timeline's glyphs, for the progress phases that continue it.
-pub(super) fn rail() -> crate::progress::Rail {
+pub(crate) fn rail() -> crate::progress::Rail {
     crate::progress::Rail {
         active: accent().apply_to(STEP_ACTIVE).to_string(),
         done: selection().apply_to(STEP_SUBMIT).to_string(),
@@ -47,7 +47,7 @@ pub(super) fn rail() -> crate::progress::Rail {
 }
 
 impl Stela {
-    pub(super) fn bar(&self, state: &ThemeState) -> String {
+    pub(crate) fn bar(&self, state: &ThemeState) -> String {
         self.bar_color(state).apply_to(BAR).to_string()
     }
 

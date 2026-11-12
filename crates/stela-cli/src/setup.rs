@@ -76,6 +76,7 @@ mod record;
 mod sources;
 mod state;
 mod translations;
+mod ui;
 mod uninstall;
 mod update;
 mod wifi;
@@ -533,8 +534,6 @@ type ImageSizeOf<'a> = dyn Fn(&str, &str) -> Result<(u64, u64)> + 'a;
 /// BuildManifest wherever its bytes are.
 type InputsOf<'a> =
     dyn Fn(&mut zip::ZipArchive<&mut dyn restore::ImageSource>, &str) -> Result<Vec<String>> + 'a;
-/// Ask the user a yes-or-no question on the terminal; None without one.
-type AskOf<'a> = dyn Fn(&str) -> Option<bool> + 'a;
 type FetchImageOf<'a> = dyn Fn(&Path, &str, &str, sources::Need) -> Result<sources::Fetched> + 'a;
 
 /// Inputs that the command line fixes and tests replace.
@@ -564,7 +563,8 @@ struct Environment<'a> {
     image_caches: &'a [PathBuf],
     image_size: &'a ImageSizeOf<'a>,
     fetch_image: &'a FetchImageOf<'a>,
-    ask: &'a AskOf<'a>,
+    /// Where questions are asked: the terminal, or no one.
+    ui: &'a dyn ui::Ui,
     bundle_inputs: &'a InputsOf<'a>,
     /// The macOS builds setup prepares (`stela_formats::builds::SUPPORTED`);
     /// tests add their synthetic images' builds.
@@ -820,16 +820,7 @@ impl Request {
             host: &host::System,
             image_caches: &image_caches,
             bundle_inputs: &|archive, model| crate::boot::restore_inputs_in(archive, model),
-            ask: &|question| {
-                use std::io::IsTerminal;
-                if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
-                    return None;
-                }
-                eprint!("{question} [y/N] ");
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer).ok()?;
-                Some(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
-            },
+            ui: ui::Terminal::or_none(),
             image_size: &|build, model| {
                 let image = restore::select(&restore::catalog()?, Some(build), Some(model))?;
                 restore::inputs_size(&image, model)
@@ -1008,7 +999,7 @@ impl Request {
             Action::UpdateOs => self.update_os(environment, record),
             Action::NextBoot(next) => self.next_boot(environment, &record, next),
             Action::Configure => {
-                self.read_wifi_passphrase()?;
+                self.read_wifi_passphrase(environment.ui)?;
                 machines::configure(environment, &self)
             }
             Action::HostFirmwareInstall(source) => {
@@ -1066,7 +1057,7 @@ impl Request {
 
     /// Read `--wifi`'s passphrase: the wizard's, `--wifi-passphrase-file`'s,
     /// or one typed at a prompt, which a dry run skips.
-    fn read_wifi_passphrase(&mut self) -> Result<()> {
+    fn read_wifi_passphrase(&mut self, ui: &dyn ui::Ui) -> Result<()> {
         let Some(ssid) = &self.wifi else {
             return Ok(());
         };
@@ -1076,7 +1067,7 @@ impl Request {
         self.wifi_passphrase = match &self.wifi_passphrase_file {
             Some(file) => Some(wifi::read_passphrase(file)?),
             None if self.dry_run => None,
-            None => Some(wifi::ask_passphrase(ssid)?),
+            None => Some(wifi::ask_passphrase(ui, ssid)?),
         };
         Ok(())
     }

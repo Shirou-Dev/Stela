@@ -21,7 +21,6 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{
     fmt::Write as _,
     fs,
-    io::IsTerminal as _,
     path::{Path, PathBuf},
 };
 use stela_formats::builds;
@@ -968,7 +967,7 @@ pub(super) fn state_line(disk: &installed::InstalledDisk) -> String {
 pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Result<String> {
     let host = environment.host;
     // Before anything is erased.
-    command.read_wifi_passphrase()?;
+    command.read_wifi_passphrase(environment.ui)?;
     if command.fetch {
         builds::find_in(environment.builds, &command.build)?;
     }
@@ -1015,13 +1014,13 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
             .is_some_and(|typed| found.confirmed_by(typed));
         if !command.confirmed && !typed_back {
             ensure!(
-                std::io::stdin().is_terminal(),
+                environment.ui.interactive(),
                 "setup cannot ask before erasing {disk} ({}, {}) without a terminal; pass \
                  --confirm-disk with its model or size to erase it",
                 found.name,
                 host::size_text(found.bytes)
             );
-            confirm_erase(host, &found)?;
+            confirm_erase(environment, &found)?;
         }
         erase = Some((disk, found.name, found.bytes, identity));
     } else {
@@ -1267,23 +1266,22 @@ fn usb_capacity(host: &dyn Host, usb: &Path) -> Result<u64> {
 
 /// Ask before erasing `disk` at a terminal: a mistyped disk name would
 /// erase another removable disk.
-fn confirm_erase(host: &dyn Host, disk: &host::Disk) -> Result<()> {
-    let serial = host
+fn confirm_erase(environment: &Environment<'_>, disk: &host::Disk) -> Result<()> {
+    let serial = environment
+        .host
         .serial(&disk.identifier)
         .ok()
         .flatten()
         .map(|serial| format!(", serial {serial}"))
         .unwrap_or_default();
-    eprint!(
-        "Erase {} ({}, {}{serial})? Everything on it is deleted. [y/N] ",
+    let question = format!(
+        "Erase {} ({}, {}{serial})? Everything on it is deleted.",
         disk.identifier,
         disk.name,
         host::size_text(disk.bytes)
     );
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
     ensure!(
-        matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES"),
+        environment.ui.confirm(&question)?,
         "{} was not erased; setup stopped",
         disk.identifier
     );

@@ -14,8 +14,8 @@ use std::{
 
 mod catalog;
 mod choices;
-mod menu;
-mod theme;
+pub(super) mod menu;
+pub(super) mod theme;
 
 // Advertised USB capacity classes; preparation also checks exact image sizes.
 const NETWORK_MIN: u64 = 7 * 1024 * 1024 * 1024;
@@ -257,7 +257,8 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
                 if command.wifi.is_some() {
                     cliclack::log::warning("The passphrase is stored in plaintext on the USB.")?;
                     let ssid = command.wifi.clone().unwrap_or_default();
-                    command.wifi_passphrase = Some(wifi::ask_passphrase(&ssid)?);
+                    command.wifi_passphrase =
+                        Some(wifi::ask_passphrase(&super::ui::Terminal, &ssid)?);
                 }
                 return Ok(true);
             }
@@ -504,7 +505,7 @@ fn choose_wifi(command: &mut Request) -> Result<()> {
         index => networks[index].clone(),
     };
     cliclack::log::warning("The passphrase is stored in plaintext on the USB.")?;
-    command.wifi_passphrase = Some(wifi::ask_passphrase(&ssid)?);
+    command.wifi_passphrase = Some(wifi::ask_passphrase(&super::ui::Terminal, &ssid)?);
     command.wifi = Some(ssid);
     Ok(())
 }

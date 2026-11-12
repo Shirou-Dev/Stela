@@ -5,7 +5,7 @@ use console::{Key, Style, Term, truncate_str};
 use std::io;
 
 #[derive(Clone)]
-pub(super) struct Item {
+pub(crate) struct Item {
     pub value: usize,
     pub label: String,
     pub hint: String,
@@ -17,10 +17,10 @@ impl Drop for Cursor {
         let _ = self.0.show_cursor();
     }
 }
-pub(super) fn select(prompt: &str, items: &[Item], initial: usize) -> Result<usize> {
+pub(crate) fn select(prompt: &str, items: &[Item], initial: usize) -> Result<usize> {
     run(prompt, items, initial, false)
 }
-pub(super) fn submenu(prompt: &str, items: &[Item], initial: usize) -> Result<Option<usize>> {
+pub(crate) fn submenu(prompt: &str, items: &[Item], initial: usize) -> Result<Option<usize>> {
     let mut rows = items.to_vec();
     rows.push(Item {
         value: usize::MAX,

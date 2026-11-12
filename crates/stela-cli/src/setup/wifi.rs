@@ -59,16 +59,15 @@ pub(super) fn read_passphrase(file: &Path) -> Result<String> {
 }
 
 /// Ask for the passphrase without echoing it.
-pub(super) fn ask_passphrase(ssid: &str) -> Result<String> {
-    use std::io::IsTerminal;
+pub(super) fn ask_passphrase(ui: &dyn super::ui::Ui, ssid: &str) -> Result<String> {
     ensure!(
-        std::io::stdin().is_terminal(),
+        ui.interactive(),
         "--wifi needs the passphrase typed at a terminal, or --wifi-passphrase-file FILE"
     );
-    Ok(cliclack::password(format!("Passphrase for {ssid}"))
-        .mask('•')
-        .validate(|text: &String| check_passphrase(text))
-        .interact()?)
+    ui.password(
+        &format!("Passphrase for {ssid}"),
+        Box::new(|text: &str| check_passphrase(text)),
+    )
 }
 
 /// Write the key file onto the ESP at `esp`.
