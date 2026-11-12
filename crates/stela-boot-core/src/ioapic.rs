@@ -359,7 +359,15 @@ impl<R: Registers, P: Platform> Unit<R, P> {
         if low & (REMOTE_IRR | DELIVERY) != 0 {
             return Err(IrqError::Drain);
         }
-        if low & !CONFIG != 0 || high & 0x00ff_ffff != 0 {
+        // An Intel PCH keeps an Extended Destination ID in bits 55:48, and
+        // firmware leaves one in entries it masked. Such an entry delivers
+        // nothing, and a claim writes the whole high word.
+        let reserved = if low & MASK != 0 {
+            0x0000_ffff
+        } else {
+            0x00ff_ffff
+        };
+        if low & !CONFIG != 0 || high & reserved != 0 {
             return Err(IrqError::Unsupported);
         }
         let vector = low as u8;

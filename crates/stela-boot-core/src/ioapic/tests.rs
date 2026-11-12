@@ -1112,6 +1112,36 @@ fn amd_two_ioapic_cohort_masks_firmware_unmasked_legacy_pins_and_verifies_i8042_
     );
 }
 
+/// An Intel PCH's IOAPIC has an Extended Destination ID in bits 55:48 of a
+/// redirection entry, and firmware (ASUS B660, AMI) leaves one in masked
+/// entries. A masked entry with one is kept; an unmasked one, and the bits
+/// below it, are refused.
+#[test]
+fn firmware_containment_keeps_a_masked_entry_with_an_extended_destination_id() {
+    let (board, unit) = cohort_unit(24, 0, 0);
+    {
+        let mut hw = board.hw.lock().unwrap();
+        hw.regs[0x12] = MASK | 0x31;
+        hw.regs[0x13] = 0x00ab_0000;
+    }
+    // SAFETY: sole controller, CPU and original firmware route model.
+    assert!(unsafe { unit.firmware_routes() }.is_ok());
+    for (low, high) in [(0x31, 0x00ab_0000), (MASK | 0x31, 0x0000_0001)] {
+        let (board, unit) = cohort_unit(24, 0, 0);
+        {
+            let mut hw = board.hw.lock().unwrap();
+            hw.regs[0x12] = low;
+            hw.regs[0x13] = high;
+        }
+        // SAFETY: sole controller, CPU and original firmware route model.
+        let plan = unsafe { unit.firmware_routes() };
+        assert!(
+            matches!(plan, Err(IrqError::Unsupported)),
+            "{low:#x} {high:#x}"
+        );
+    }
+}
+
 #[test]
 fn firmware_containment_refuses_unmasked_smi_nmi_init_and_reserved_modes() {
     for mode in [2 << 8, 3 << 8, 4 << 8, 5 << 8, 6 << 8] {
