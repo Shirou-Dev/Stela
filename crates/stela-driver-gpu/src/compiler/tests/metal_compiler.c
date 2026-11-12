@@ -363,6 +363,46 @@ static const char *hoisted =
 static const char *mistyped =
    CONDITIONAL("br i1 %on, label %tinted, label %untinted\n", "int");
 
+/* A [[function_constant(splits)]] buffer of a ushort constant, which Metal
+ * tests against zero: its predicate is a ushort, as MPS's matrix kernels'
+ * are. The kernel adds the buffer's value when splits is not zero. */
+static const char *counted =
+   "@splits.init = linkonce_odr hidden addrspace(2) externally_initialized constant i16"
+   " undef, section \"air.fc_initializer\", align 2\n"
+   "@splits = internal unnamed_addr addrspace(2) global i16 undef, align 2\n"
+   "@split = internal addrspace(2) global i16 0, align 2\n"
+   "@llvm.global_ctors = appending global [1 x { i32, ptr, ptr }]"
+   " [{ i32, ptr, ptr } { i32 65535, ptr @init, ptr null }]\n"
+   "@llvm.compiler.used = appending global [1 x ptr] [ptr addrspacecast"
+   " (ptr addrspace(2) @split to ptr)], section \"llvm.metadata\"\n"
+   "declare i16 @air.normalize_function_constant_predicate.i16(i16)\n"
+   "define void @counted(ptr addrspace(1) %data, ptr addrspace(1) %extra) {\n"
+   "%u = load i16, ptr addrspace(2) @splits, align 2\n"
+   "%on = icmp ne i16 %u, 0\n"
+   "br i1 %on, label %added, label %done\n"
+   "added:\n%e = load i32, ptr addrspace(1) %extra, align 4\n"
+   "store i32 %e, ptr addrspace(1) %data, align 4\nret void\n"
+   "done:\nstore i32 7, ptr addrspace(1) %data, align 4\nret void\n}\n"
+   "define internal void @init() section \"air.static_init\" {\n"
+   "%v = load i16, ptr addrspace(2) @splits.init, align 2\n"
+   "store i16 %v, ptr addrspace(2) @splits, align 2\n"
+   "%t = call i16 @air.normalize_function_constant_predicate.i16(i16 %v)\n"
+   "store i16 %t, ptr addrspace(2) @split, align 2\n"
+   "ret void\n}\n"
+   "!air.kernel = !{!2}\n"
+   "!2 = !{ptr @counted, !3, !4}\n!3 = !{}\n!4 = !{!40, !41}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1,"
+   " !\"air.read_write\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4,"
+   " !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", !\"int\","
+   " !\"air.arg_name\", !\"data\"}\n"
+   "!41 = !{i32 1, !\"air.function_constant\", !43, !\"air.buffer\","
+   " !\"air.location_index\", i32 1, i32 1, !\"air.read\", !\"air.address_space\", i32 1,"
+   " !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4,"
+   " !\"air.arg_type_name\", !\"int\", !\"air.arg_name\", !\"extra\"}\n"
+   "!43 = !{ptr addrspace(2) @split, !\"ushort\", !\"splits\"}\n"
+   "!air.function_constants = !{!50}\n"
+   "!50 = !{ptr addrspace(2) @splits.init, !\"ushort\", !\"splits\", i32 0}\n";
+
 /* A fragment function that reads a [[function_constant(use_tint)]] buffer on
  * one side of a run-time test. With use_tint false that side cannot run, and
  * the test and its read go with it. */
@@ -1981,6 +2021,23 @@ function_constants_select_arguments(void)
    }
    assert(!reflect(mistyped, "conditional", &reflection, &error) &&
           error.kind == STELA_AIR_METADATA && strstr(error.detail, "predicate"));
+   /* A predicate of an integer constant holds when it is not zero. */
+   assert(reflect(counted, "counted", &reflection, &error));
+   assert(reflection.buffer_count == 1);
+   for (uint16_t splits = 0; splits < 3; splits++) {
+      const struct stela_air_constant_value value = {0, &splits, sizeof(splits)};
+      if (!reflect_specialized(counted, "counted", &value, 1, &reflection, &error))
+         fprintf(stderr, "counted: %u %s\n", error.kind, error.detail);
+      assert(reflection.buffer_count == (splits ? 2u : 1u));
+      assert(!splits || (reflection.buffers[1].index == 1 &&
+                         reflection.buffers[1].access == STELA_METAL_ACCESS_READ));
+      const struct stela_metal_specialization specialization = {
+         .workgroup_size = {64, 1, 1}, .constants = &value, .constant_count = 1,
+      };
+      nir_shader *shader = compile(counted, "counted", &specialization, &error);
+      assert(shader);
+      stela_metal_release(shader);
+   }
    /* A render stage drops the path that must reach an absent buffer. */
    for (uint8_t on = 0; on < 2; on++) {
       const struct stela_air_constant_value value = {0, &on, sizeof(on)};

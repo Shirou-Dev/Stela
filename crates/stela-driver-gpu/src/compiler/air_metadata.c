@@ -1796,10 +1796,30 @@ control_point_input(struct stela_air_metadata *m, struct stela_air_render *r,
    return true;
 }
 
+/* The bits of a [[function_constant]] argument's predicate of the named
+ * scalar type, or 0. */
+static unsigned
+predicate_bits(LLVMValueRef name)
+{
+   static const struct {
+      const char *name;
+      unsigned bits;
+   } types[] = {
+      {"bool", 8},  {"char", 8},  {"uchar", 8}, {"short", 16}, {"ushort", 16},
+      {"int", 32},  {"uint", 32}, {"long", 64}, {"ulong", 64},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(types); i++) {
+      if (stela_air_md_string(name, types[i].name))
+         return types[i].bits;
+   }
+   return 0;
+}
+
 /* A [[function_constant]] argument's predicate, {ptr addrspace(2)
- * @predicate, !"bool", !"name"}: an internal AS2 bool the module's
+ * @predicate, !"type", !"name"}: an internal AS2 integer of the constant's
+ * scalar type, a bool or one Metal tests against zero, that the module's
  * constructors store. Once specialization has constructed it, *known is set,
- * and *absent when it is false. */
+ * and *absent when it is zero. */
 static bool
 argument_predicate(struct stela_air_metadata *m, LLVMValueRef node, bool *known, bool *absent)
 {
@@ -1812,7 +1832,7 @@ argument_predicate(struct stela_air_metadata *m, LLVMValueRef node, bool *known,
    LLVMTypeRef type = value ? LLVMGlobalGetValueType(global) : NULL;
    if (!value || !LLVMIsAConstantInt(value) || LLVMGetPointerAddressSpace(LLVMTypeOf(global)) != 2 ||
        LLVMGetLinkage(global) != LLVMInternalLinkage || LLVMGetTypeKind(type) != LLVMIntegerTypeKind ||
-       LLVMGetIntTypeWidth(type) != 8 || !stela_air_md_string(fields[1], "bool") || !fields[2] ||
+       LLVMGetIntTypeWidth(type) != predicate_bits(fields[1]) || !fields[2] ||
        !LLVMIsAMDString(fields[2]))
       return fail(m, STELA_AIR_METADATA, "invalid function constant argument predicate");
    *known = LLVMIsGlobalConstant(global);
