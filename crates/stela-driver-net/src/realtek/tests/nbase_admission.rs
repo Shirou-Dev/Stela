@@ -139,3 +139,37 @@ fn nbase_polled_carrier_preserves_latch_low_an_restart_and_cache_expiry() {
         assert_eq!(model.state.borrow().writes.len(), writes);
     }
 }
+
+/// The constructor reads the identity through 256 bytes, or through the
+/// extended word where TxConfig names one, then maps the detected chip's
+/// whole aperture. An RTL8125 or RTL8126 start writes far past 256 bytes
+/// (0xa00 to 0xb00, 0x1880), and a window panics past its length, so
+/// every write of the reset and MAC start must lie inside the aperture.
+#[test]
+fn nbase_start_stays_inside_the_window_the_constructor_maps() {
+    assert_eq!(identity_aperture(0x641 << 20), 256);
+    assert_eq!(identity_aperture(0x7c8 << 20), EXTENDED_REGISTER_BYTES);
+    assert_eq!(identity_aperture(u32::MAX), 256);
+    for version in [61, 63, 64, 65, 66, 70] {
+        let time = Time::default();
+        let model = Model::nbase(&time);
+        let mut hw = Hardware::new(&model, &time, revision(version), 0);
+        hw.initialize_modern().unwrap();
+        hw.reset().unwrap();
+        hw.configure_mac(None).unwrap();
+        kick_transmit(&model, revision(version));
+        let aperture = register_aperture(revision(version)) as usize;
+        let s = model.state.borrow();
+        let furthest = s
+            .writes
+            .iter()
+            .map(|(offset, _, width)| offset + usize::from(*width))
+            .max()
+            .unwrap();
+        assert!(furthest > 256, "version {version} writes past 256 bytes");
+        assert!(
+            furthest <= aperture,
+            "version {version} reaches {furthest:#x}"
+        );
+    }
+}

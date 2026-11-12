@@ -306,9 +306,14 @@ impl Realtek {
         let device = map_registers(handoff, bar, 0, 256)?;
         function.enable_polled()?;
         let txconfig = device.read32(TX_CONFIG);
+        // A window panics on an access past its length, so each read goes
+        // through one that covers it: the extended identity word, then
+        // every register the detected revision's start and runtime reach.
+        let device = widen(handoff, bar, device, identity_aperture(txconfig))?;
         let revision = detect_revision(&device, txconfig, |bytes| {
             map_registers(handoff, bar, 0, bytes).map(|_| ())
         })?;
+        let device = widen(handoff, bar, device, register_aperture(revision))?;
         admit_revision(function.device, pcie_link_control, revision)?;
         if tbi_mode(revision, device.read8(PHY_STATUS)) {
             return Err(BlockError::Unsupported("Realtek TBI/fiber mode").into());
@@ -536,6 +541,31 @@ fn admit_revision(device: u16, pcie_control: Option<u16>, revision: Revision) ->
     Ok(())
 }
 
+/// The registers the identity reads span: the first 256 bytes, and through
+/// the extended word where TxConfig says the chip has one.
+fn identity_aperture(txconfig: u32) -> u64 {
+    if revision::needs_extended(txconfig) {
+        EXTENDED_REGISTER_BYTES
+    } else {
+        256
+    }
+}
+
+/// `device`, or a window of `bytes` over the same BAR when it is shorter.
+/// The BAR must cover and map the wider range.
+fn widen(
+    handoff: &Handoff,
+    bar: Option<pci::Bar>,
+    device: Mmio,
+    bytes: u64,
+) -> Result<Mmio, BlockError> {
+    if bytes <= device.len() as u64 {
+        return Ok(device);
+    }
+    map_registers(handoff, bar, 0, bytes)
+}
+
+/// The registers a revision's start and runtime span.
 fn register_aperture(revision: Revision) -> u64 {
     if revision.nbase() {
         NBASE_REGISTER_BYTES
