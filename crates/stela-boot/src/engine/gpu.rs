@@ -405,6 +405,7 @@ impl Host {
 
     fn report(&self, line: core::fmt::Arguments<'_>) {
         output::arguments(format_args!("LINUX {line}\n"));
+        output::flush_log();
     }
 }
 
@@ -1381,9 +1382,13 @@ struct Started {
 // the result, whose attachments remain owned for the boot.
 unsafe impl ManagedJob for Start {
     fn run(mut self: Pin<&mut Self>) {
+        output::arguments(format_args!("GPU start job running\n"));
+        output::flush_log();
         let claimed = core::mem::take(&mut *self.claimed);
         self.completed
             .set(Some(ManuallyDrop::new(start(self.kernel, claimed))));
+        output::arguments(format_args!("GPU start job completed\n"));
+        output::flush_log();
     }
 }
 
@@ -1811,7 +1816,11 @@ fn mount_and_start(
     // SAFETY: the ready original task broker keeps the callback and all
     // original owners until its genuine managed child has joined.
     let pending = unsafe { threads.submit(job) }.map_err(|refusal| Error::Submit(refusal.error))?;
+    output::arguments(format_args!("GPU mount_and_start waiting for child (deadline={START_SECONDS}s)\n"));
+    output::flush_log();
     wait_for_child(runtime, threads, time, deadline, || pending.status().joined)?;
+    output::arguments(format_args!("GPU mount_and_start child joined successfully\n"));
+    output::flush_log();
     // SAFETY: physical return on the same dispatcher with the joined status.
     let joined =
         unsafe { pending.try_join() }.map_err(|_| environment_error(WorkError::Pending))?;
