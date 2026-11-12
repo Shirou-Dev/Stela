@@ -369,10 +369,10 @@ impl<'a, B: CommandIo> Engine<'a, B> {
             }
             match event.get(2).copied() {
                 Some(6) if self.allow_secure && event.len() == 7 && !self.secure => {
-                    if event[3] != 0
-                        || u16::from_le_bytes([event[4], event[5]]) != SECURE_SEND
-                        || event[6] != 0
-                    {
+                    // Linux `btintel_secure_send_result` reads the result
+                    // byte alone; the opcode and status that follow it are
+                    // not checked, and controllers differ in them.
+                    if event[3] != 0 {
                         return Err(Error::Protocol(
                             "controller rejected secure image/signature",
                         ));

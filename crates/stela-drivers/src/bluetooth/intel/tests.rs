@@ -344,6 +344,18 @@ fn every_sfi_truncation_and_malformed_ddc_fails_before_upload() {
         assert_eq!(hci.state(), State::Closed);
     }
 }
+/// The secure send result is judged by its result byte alone, as Linux
+/// `btintel_secure_send_result` judges it: controllers differ in the opcode
+/// and status bytes that follow.
+#[test]
+fn a_secure_send_result_is_accepted_whatever_opcode_and_status_it_names() {
+    for byte in [10, 11, 12] {
+        let (device, catalog, mut script) = fixture();
+        script.steps[7].events[0].1[byte] ^= 1;
+        let mut hci = transport(device, script);
+        assert!(initialize(&mut hci, &catalog).is_ok(), "byte {byte}");
+    }
+}
 #[test]
 fn command_vendor_reset_identity_and_address_failures_never_report_ready() {
     for case in 0..16 {
@@ -360,7 +372,7 @@ fn command_vendor_reset_identity_and_address_failures_never_report_ready() {
             8 => script.steps[9].events[0].1[11] ^= 1, // build
             9 => script.steps[10].events[0].1[6] ^= 1, // address
             10 => script.steps[2].events[0].1[2] = 0, // zero credits
-            11 => script.steps[7].events[0].1[10] ^= 1, // secure result wrong opcode
+            11 => script.steps[7].events[0].1[9] = 0xff, // secure-result rejection, another code
             12 => script.steps[8].events[1].1[6] = 1, // boot DDC error
             13 => script.steps[2].events[0].1 = vec![0x0f, 4, 0, 1, 9, 0xfc], // Status is not Complete
             14 => {
