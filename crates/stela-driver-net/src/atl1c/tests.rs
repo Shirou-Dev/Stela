@@ -749,6 +749,63 @@ fn a_return_descriptor_naming_no_free_descriptor_reinitializes_the_queues() {
     assert_eq!(adapter.receive(), Ok(Some(frame)));
 }
 
+/// A dropped adapter stops: interrupts masked and queues off before the
+/// MAC, then the soft reset, within 50 ms of waits even when the MAC
+/// stays busy. A function that left the bus gets no write.
+#[test]
+fn dropping_an_adapter_stops_it_within_an_exit_and_a_lost_one_gets_no_write() {
+    for busy in [0, IDLE_STATUS_RXMAC_BUSY] {
+        let mut fixture = Fixture::new();
+        let (clock, elapsed) = crate::timing::counted_model(Clock {
+            ticks_per_microsecond: 1,
+        });
+        let adapter = Atl1c::bring_up(
+            Peer(fixture.model.clone()),
+            clock,
+            Fixture::chip(0x1063),
+            &mut fixture.dma,
+            2,
+            String::from("peer"),
+        )
+        .unwrap();
+        fixture.model.borrow_mut().busy = busy;
+        fixture.model.borrow_mut().writes.clear();
+        let before = elapsed.get();
+        drop(adapter);
+        assert!(
+            elapsed.get() - before < 50_000,
+            "{}",
+            elapsed.get() - before
+        );
+        let model = fixture.model.borrow();
+        let at = |found: &dyn Fn(usize, u32) -> bool| {
+            model
+                .writes
+                .iter()
+                .position(|&(offset, value)| found(offset, value))
+                .unwrap()
+        };
+        let masked = at(&|offset, value| offset == IMR && value == 0);
+        let receive = at(&|offset, value| offset == RXQ_CTRL && value & RXQ_CTRL_EN == 0);
+        let transmit = at(&|offset, value| offset == TXQ_CTRL && value & TXQ_CTRL_EN == 0);
+        let mac = at(&|offset, value| {
+            offset == MAC_CTRL && value & (MAC_CTRL_RX_EN | MAC_CTRL_TX_EN) == 0
+        });
+        let reset = at(&|offset, value| offset == MASTER_CTRL && value & MASTER_CTRL_SOFT_RST != 0);
+        assert!(masked < receive && receive < transmit && transmit < mac && mac < reset);
+    }
+    let mut fixture = Fixture::new();
+    let adapter = fixture.attach(0x1063).unwrap();
+    fixture
+        .model
+        .borrow_mut()
+        .registers
+        .insert(MASTER_CTRL, u32::MAX);
+    fixture.model.borrow_mut().writes.clear();
+    drop(adapter);
+    assert!(fixture.model.borrow().writes.is_empty());
+}
+
 #[test]
 fn stop_masks_interrupts_resets_the_mac_and_refuses_further_frames() {
     let mut fixture = Fixture::new();
