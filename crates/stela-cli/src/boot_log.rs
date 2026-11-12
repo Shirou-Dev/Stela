@@ -497,7 +497,7 @@ pub(crate) fn summary(log: &Log) -> String {
 
 /// End every device skip the USB's boot log at `path` holds (`pc::device_starts`):
 /// the functions an earlier boot did not finish starting, which later boots
-/// skip until `by` (`stela setup repair` or `update stela`) clears them.
+/// skip until `by` (`stela repair` or `stela update`) clears them.
 /// The functions it named, for the report; none when the log names none or
 /// cannot be read, which leaves nothing to clear. A dry run changes nothing.
 pub(crate) fn clear_device_skips(path: &Path, by: &str, dry_run: bool) -> Result<Vec<String>> {
@@ -748,7 +748,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// `stela setup repair` and `update stela` end every skip the USB's log
+    /// `stela repair` and `stela update` end every skip the USB's log
     /// holds, in place, and a dry run changes nothing.
     #[test]
     fn clearing_device_skips_ends_them_in_place() {
@@ -767,21 +767,21 @@ pub(crate) mod tests {
             device_starts::read(&log.stream)
         };
         assert_eq!(skips(&path).iter().count(), 1);
-        let named = clear_device_skips(&path, "stela setup repair", true).unwrap();
+        let named = clear_device_skips(&path, "stela repair", true).unwrap();
         assert_eq!(named, ["PCI 0000:07:00.0 10ec:8125"]);
         assert_eq!(skips(&path).iter().count(), 1);
-        let named = clear_device_skips(&path, "stela setup repair", false).unwrap();
+        let named = clear_device_skips(&path, "stela repair", false).unwrap();
         assert_eq!(named, ["PCI 0000:07:00.0 10ec:8125"]);
         assert!(skips(&path).is_empty());
         let log = boot_log::read(&std::fs::read(&path).unwrap()).unwrap();
         let text = String::from_utf8(log.stream).unwrap();
         assert!(
-            text.ends_with("HOST DEVICE SKIPS CLEARED by stela setup repair\n"),
+            text.ends_with("HOST DEVICE SKIPS CLEARED by stela repair\n"),
             "{text}"
         );
         // Nothing left to clear, and no log at all, write nothing.
         assert!(
-            clear_device_skips(&path, "stela setup update stela", false)
+            clear_device_skips(&path, "stela update", false)
                 .unwrap()
                 .is_empty()
         );

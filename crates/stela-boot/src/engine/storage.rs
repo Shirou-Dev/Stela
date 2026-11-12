@@ -809,8 +809,8 @@ struct Observer {
 }
 
 /// Why a skipped function is not driven, in the boot's account.
-const SKIPPED: &str = "skipped: it did not finish starting on an earlier boot. Run stela setup \
-                       repair to try it again";
+const SKIPPED: &str = "skipped: it did not finish starting on an earlier boot. Run stela repair \
+                       to try it again";
 
 impl Observer {
     fn new(

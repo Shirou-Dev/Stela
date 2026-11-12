@@ -790,7 +790,7 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     debug_assert!(record.replacing.is_none());
     let esp = record.esp.clone();
     let mut text = format!("Stela repair on {}:\n", esp.display());
-    text.push_str(&device_skips(&esp, "stela setup repair", command.dry_run)?);
+    text.push_str(&device_skips(&esp, "stela repair", command.dry_run)?);
     let Ok(tool) = fs::read(esp.join(LOADER_PATH)) else {
         bail!("{} has no stela.efi: {}", esp.display(), fix(usb, "update"));
     };

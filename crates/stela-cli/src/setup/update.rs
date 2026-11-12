@@ -180,11 +180,7 @@ pub(super) fn update_stela(
     let from = fs::read(esp.join(LOADER_PATH)).map_or("none".into(), |image| version_id(&image));
     let mut text = String::new();
     writeln!(text, "Stela update on {}:", esp.display())?;
-    text.push_str(&super::doctor::device_skips(
-        &esp,
-        "stela setup update stela",
-        dry_run,
-    )?);
+    text.push_str(&super::doctor::device_skips(&esp, "stela update", dry_run)?);
     text.push_str(&super::fdr::prepare(&record, true)?);
     // The firmware the last boot asked for and the USB lacks, which every
     // update that changes something adds.

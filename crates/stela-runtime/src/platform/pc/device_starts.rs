@@ -4,8 +4,8 @@
 //! and [`STARTED`] once every function's start has ended. A boot whose last
 //! [`START`] has no later [`STARTED`] stopped inside that start. A boot
 //! that skips such a function writes [`SKIPPED`] for it, so later boots go
-//! on skipping it while the same device is at that address; `stela setup
-//! repair` and `stela setup update stela` write [`CLEARED`].
+//! on skipping it while the same device is at that address; `stela
+//! repair` and `stela update` write [`CLEARED`].
 //!
 //! The markers name the function by its PCI address and vendor:device ID
 //! only: no serial, MAC or other identifier.
@@ -18,7 +18,7 @@ pub const START: &str = "HOST DEVICE START";
 pub const STARTED: &str = "HOST DEVICES STARTED";
 /// A function this boot skipped.
 pub const SKIPPED: &str = "HOST DEVICE SKIPPED";
-/// Every skip ends: `stela setup repair` or `update stela` wrote it.
+/// Every skip ends: `stela repair` or `stela update` wrote it.
 pub const CLEARED: &str = "HOST DEVICE SKIPS CLEARED";
 
 /// The most functions a boot skips; a stall record names at most one
@@ -168,7 +168,7 @@ pub fn decide(
 pub fn skipped_line(function: &Function) -> String {
     format!(
         "PCI {} {:04x}:{:04x} skipped: it did not finish starting on an earlier boot. \
-         Run stela setup repair to try it again.",
+         Run stela repair to try it again.",
         function.address, function.vendor, function.device
     )
 }
@@ -178,8 +178,8 @@ pub fn skipped_line(function: &Function) -> String {
 pub fn retried_line(function: &Function) -> String {
     format!(
         "PCI {} {:04x}:{:04x} did not finish starting on an earlier boot. The boot needs it, \
-         so it is started again. If the boot stops here, `stela setup boot-log --output \
-         log.txt` on another computer saves the USB's log; include that file in a report.",
+         so it is started again. If the boot stops here, `stela log --output log.txt` on \
+         another computer saves the USB's log; include that file in a report.",
         function.address, function.vendor, function.device
     )
 }
@@ -290,9 +290,9 @@ mod tests {
         // A boot that never reached the device start keeps the record.
         text.push_str("=== STELA BOOT 9 ===\nSTEP Reading Stela's settings\n");
         assert!(read(text.as_bytes()).holds(&lan));
-        // `stela setup repair` writes the clearing line into the newest boot.
+        // `stela repair` writes the clearing line into the newest boot.
         text.push_str(CLEARED);
-        text.push_str(" by stela setup repair\n");
+        text.push_str(" by stela repair\n");
         assert!(read(text.as_bytes()).is_empty());
         // A boot without a skip line, once the ID changed, ends it too.
         let mut changed = boot(&[lan.line(START)]);
@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(
             skipped_line(&lan),
             "PCI 0000:07:00.0 10ec:8125 skipped: it did not finish starting on an earlier \
-             boot. Run stela setup repair to try it again."
+             boot. Run stela repair to try it again."
         );
         assert!(retried_line(&nvme).contains("log.txt"));
     }
