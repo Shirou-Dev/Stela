@@ -1,4 +1,4 @@
-//! `stela setup`: prepare a USB to install macOS 27 onto
+//! `stela`: prepare a USB stick to install macOS 27 onto
 //! a disk of the PC and boot it, and keep it working over the installed
 //! system's life.
 //!
@@ -144,7 +144,7 @@ fn check_model(models: &[(&str, &str)], model: &str) -> Result<()> {
 const RECORD: &str = "EFI/stela/setup.json";
 /// A margin so no volume is filled to its last byte.
 pub(super) const MARGIN: u64 = 64 * 1024 * 1024;
-/// The boot loader `stela setup` installs: `stela.efi` itself.
+/// The boot loader `stela create` installs: `stela.efi` itself.
 pub(super) const LOADER_PATH: &str = efi::LOADER;
 /// The startup choices beside `stela.cfg`.
 const CHOICES_PATH: &str = "EFI/stela/choices.cfg";
@@ -155,18 +155,20 @@ const CHOOSER_SECONDS: u32 = 5;
 const INSTALL_CHOICE: &str = "Install macOS";
 /// The startup choice that updates a setup's one install in place.
 const UPDATE_CHOICE: &str = "Update macOS";
-/// `stela setup {words} --usb {usb}` in backticks, as a user types it: every
-/// maintenance command needs `--usb`.
+thread_local! {
+    /// Whether several plugged-in sticks hold Stela, so that a command a
+    /// message names must name its stick.
+    static SEVERAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `stela {words}` in backticks, as a user types it, with the stick at
+/// `usb` only when several sticks hold Stela: the shortest command that
+/// works.
 fn fix(usb: &Path, words: &str) -> String {
-    let words = if words.is_empty() {
-        String::new()
-    } else {
-        format!("{words} ")
-    };
-    format!(
-        "`stela setup {words}--usb {}`",
-        quoted(&usb.display().to_string())
-    )
+    match SEVERAL.get() {
+        true => format!("`stela {words} {}`", quoted(&usb.display().to_string())),
+        false => format!("`stela {words}`"),
+    }
 }
 
 /// `word` as a shell takes it as one argument.
@@ -604,7 +606,7 @@ fn read_efi(environment: &Environment<'_>, path: &Path) -> Result<Vec<u8>> {
 }
 
 /// Refuse to change a setup whose installed `stela.efi` reads another
-/// interface than this `stela` writes; `update stela` replaces it first.
+/// interface than this `stela` writes; `update` replaces it first.
 fn check_installed_efi(environment: &Environment<'_>, record: &Record) -> Result<()> {
     let tool = record.esp.join(LOADER_PATH);
     let image = fs::read(&tool).with_context(|| format!("cannot read {}", tool.display()))?;
@@ -615,14 +617,14 @@ fn check_installed_efi(environment: &Environment<'_>, record: &Record) -> Result
             "the stela.efi on {} does not read what this stela writes ({reason}); install this \
              stela's stela.efi first with {}, or use the stela that installed it",
             record.esp.display(),
-            fix(&record.esp, "update stela")
+            fix(&record.esp, "update")
         );
     }
     Ok(())
 }
 
 /// Refuse to prepare bundles for `record` when its active ones are of
-/// another revision than this `stela` prepares: `update stela` prepares
+/// another revision than this `stela` prepares: `update` prepares
 /// them all at this one.
 fn check_bundle_revision(environment: &Environment<'_>, record: &Record) -> Result<()> {
     match revision_mismatch(environment, record) {
@@ -642,7 +644,7 @@ fn revision_mismatch(environment: &Environment<'_>, record: &Record) -> Option<S
         format!(
             "this setup's boot bundles are revision {theirs}, and this stela prepares revision \
              {ours}: prepare them again with {}",
-            fix(&record.esp, "update stela")
+            fix(&record.esp, "update")
         )
     } else {
         format!(
@@ -721,8 +723,8 @@ fn choose_setup(host: &dyn Host) -> Result<PathBuf> {
             Ok(volume.clone())
         }
         [] => bail!(
-            "no mounted volume on this computer holds a Stela setup: plug in the USB, mount its \
-             STELA volume, or name it with --usb"
+            "no mounted volume on this computer holds Stela: plug in the stick and mount its \
+             STELA volume, or make an installer with `stela create`"
         ),
         several => {
             let list: String = several
@@ -730,10 +732,10 @@ fn choose_setup(host: &dyn Host) -> Result<PathBuf> {
                 .map(|(volume, disk)| format!("  {} on {disk}\n", volume.display()))
                 .collect();
             bail!(
-                "{} disks hold a Stela setup:\n{list}Name the one to use with --usb, such as \
-                 --usb {}",
+                "{} sticks hold Stela:\n{list}Name the one to use after the command, such as \
+                 `stela status {}`",
                 several.len(),
-                several[0].0.display()
+                quoted(&several[0].0.display().to_string())
             )
         }
     }
@@ -781,6 +783,7 @@ impl Request {
     }
 
     pub(crate) fn run(mut self) -> Result<()> {
+        SEVERAL.set(find_setups(&host::System).is_ok_and(|found| found.len() > 1));
         // Without STICK, a maintenance command acts on the one stick that
         // holds a setup; a whole disk named is read through its volume.
         if finds_usb(&self.action) {
@@ -791,7 +794,7 @@ impl Request {
         }
         // The rights to write disks, before anything is downloaded or
         // changed. A Windows relaunch opens its own window, which only the
-        // wizard and `boot-log`, whose raw disk reads need administrator
+        // wizard and `log`, whose raw disk reads need administrator
         // rights, want.
         let boot_log = matches!(self.action, Action::BootLog);
         let rights = elevation::rights(elevation::Situation {
@@ -1163,7 +1166,7 @@ impl Request {
             ensure!(
                 self.wifi.is_none(),
                 "--wifi goes with a new setup; {} changes an existing one's",
-                fix(&self.usb, "configure --wifi SSID")
+                fix(&self.usb, "settings --wifi SSID")
             );
             // Every install restores the active build, which `--fetch`
             // downloads.
@@ -1248,7 +1251,7 @@ fn host_firmware_mount(environment: &Environment<'_>, record: &Record) -> Result
     ensure!(
         stela_loader::host_firmware::supports_mount(&mount_image),
         "the installed stela.efi cannot load host firmware; run {} first",
-        fix(&record.esp, "update stela")
+        fix(&record.esp, "update")
     );
     Ok(mount_image)
 }
@@ -1279,8 +1282,8 @@ fn locate_esp(host: &dyn Host, usb: &Path) -> Result<PathBuf> {
             })?,
         },
         None => bail!(
-            "{} is on a disk without an EFI partition. Setup erases a USB into one when --usb \
-             names its whole disk (such as {}), which deletes everything on it.",
+            "{} is on a disk without an EFI partition. `stela create` erases a stick into one \
+             when given its whole disk (such as {}), which deletes everything on it.",
             usb.display(),
             host::DISK_EXAMPLE
         ),
@@ -1296,8 +1299,8 @@ fn locate_esp(host: &dyn Host, usb: &Path) -> Result<PathBuf> {
     {
         ensure!(
             disk.erasable(),
-            "{} is on {} ({}), an internal disk{}. Setup changes only a removable USB: \
-             connect one and name it with --usb.",
+            "{} is on {} ({}), an internal disk{}. Stela changes only a removable stick: \
+             plug one in and name it.",
             esp.display(),
             disk.identifier,
             disk.name,

@@ -28,7 +28,7 @@ pub(super) fn partition_number(identifier: &str) -> Result<(u32, u32)> {
         .with_context(|| format!("{identifier} is not a partition such as disk2p1"))
 }
 
-/// The whole disk `--usb` names, as `diskN`: `PhysicalDriveN`,
+/// The whole disk STICK names, as `diskN`: `PhysicalDriveN`,
 /// `\\.\PhysicalDriveN` or `diskN`, in any case.
 pub(super) fn whole_disk(name: &str) -> Option<String> {
     let name = name.to_ascii_lowercase();

@@ -550,7 +550,8 @@ fn setup_installs_from_the_usb_and_uninstall_restores_it() {
     );
 
     let report = setup(&environment(host), command(&f, &f.esp)).unwrap();
-    assert!(report.contains("stela setup uninstall"), "{report}");
+    assert!(report.contains("Check it with `stela status`"), "{report}");
+    assert!(!report.contains("uninstall"), "{report}");
     assert!(report.contains("pick the PC disk"), "{report}");
     let record = record(&f);
     let ecid = record.installs[0].ecid.unwrap();
@@ -589,12 +590,7 @@ fn setup_installs_from_the_usb_and_uninstall_restores_it() {
     assert_eq!(record.schema_version, RECORD_SCHEMA);
     // A second setup is refused until the first is undone.
     let again = setup(&environment(host), command(&f, &f.esp));
-    assert!(
-        again
-            .unwrap_err()
-            .to_string()
-            .contains("stela setup uninstall")
-    );
+    assert!(again.unwrap_err().to_string().contains("`stela uninstall`"));
     // The only install is not removed alone.
     let error = rerun(&f, |c| {
         c.action = Action::Configure;
@@ -692,7 +688,7 @@ fn usbs_setup_cannot_boot_from_are_explained_and_left_unchanged() {
     let error = setup(&environment(&host), command(&f, dir.path()))
         .unwrap_err()
         .to_string();
-    assert!(error.contains("names its whole disk"), "{error}");
+    assert!(error.contains("given its whole disk"), "{error}");
     let mut host = FakeHost::new(f.host.volumes.clone(), f.host.disks.clone());
     host.partitions = f.host.partitions.clone();
     // An unmounted EFI partition is mounted, or the error says why not.
@@ -1290,10 +1286,7 @@ fn install_and_repair_unmount_target_filesystems() {
         .to_string();
     assert!(error.contains("holds another file system"), "{error}");
     let report = rerun(&f, |c| c.action = Action::Repair).unwrap();
-    assert!(
-        report.contains("`stela setup repair --erase-target --usb"),
-        "{report}"
-    );
+    assert!(report.contains("`stela repair --erase-target`"), "{report}");
     assert!(!erased(&f));
     rerun(&f, |c| {
         c.action = Action::Repair;
@@ -1973,7 +1966,7 @@ fn status_notes_the_spare_the_first_boot_took_and_succeeds() {
         .find(|line| line.contains(&store.spare_repair()))
         .unwrap();
     assert!(note.trim_start().starts_with("note"), "{status}");
-    assert!(note.contains("`stela setup repair --usb"), "{status}");
+    assert!(note.contains("`stela repair`"), "{status}");
     // Repair prepares the next spare and keeps the pack.
     rerun(&f, |c| c.action = Action::Repair).unwrap();
     assert!(store.spare_ready() && pack.is_file());
@@ -2296,17 +2289,14 @@ fn revision_update_rebuilds_bundles() {
         "{status}"
     );
     assert!(!status.contains("--fetch"), "{status}");
-    assert!(status.contains("stela setup update stela"), "{status}");
+    assert!(status.contains("`stela update`"), "{status}");
     // Other changes that prepare bundles wait for the update.
     let repair = run(&|c| {
         c.action = Action::Repair;
         c.ipsw = Some(f.ipsw.clone());
     });
     assert!(
-        repair
-            .unwrap_err()
-            .to_string()
-            .contains("stela setup update stela"),
+        repair.unwrap_err().to_string().contains("`stela update`"),
         "the repair is refused"
     );
     let update = |ipsw: bool, dry_run: bool| {
@@ -2562,7 +2552,7 @@ fn repair_puts_a_damaged_bundle_back_from_the_usbs_own_image() {
     let problems = rerun(&f, |c| c.action = Action::Status)
         .unwrap_err()
         .to_string();
-    assert!(problems.contains("stela setup repair --usb"), "{problems}");
+    assert!(problems.contains("`stela repair`"), "{problems}");
     assert!(!problems.contains("--fetch"), "{problems}");
     // No image, no network: the USB holds the image.
     let plan = rerun(&f, |c| {
@@ -2620,16 +2610,13 @@ fn status_advises_update_stela_while_bundles_are_of_another_revision() {
     let mut status = update_request(&f, &f._dir.path().join("cache"));
     status.action = Action::Status;
     let problems = status.dispatch(&environment).unwrap_err().to_string();
-    assert!(
-        problems.contains("stela setup update stela --usb"),
-        "{problems}"
-    );
-    assert!(!problems.contains("repair --usb"), "{problems}");
+    assert!(problems.contains("`stela update`"), "{problems}");
+    assert!(!problems.contains("`stela repair`"), "{problems}");
     // Repair refuses before downloading anything (downloads panic here).
     let mut repair = update_request(&f, &f._dir.path().join("cache"));
     repair.action = Action::Repair;
     let error = repair.dispatch(&environment).unwrap_err().to_string();
-    assert!(error.contains("update stela"), "{error}");
+    assert!(error.contains("`stela update`"), "{error}");
 }
 
 #[test]
@@ -2785,7 +2772,7 @@ fn a_piece_an_install_found_damaged_is_named_by_status_and_put_right_by_repair()
         problems.contains("ipsw.000 failed its block check"),
         "{problems}"
     );
-    assert!(problems.contains("setup repair --usb"), "{problems}");
+    assert!(problems.contains("`stela repair`"), "{problems}");
     // Repair finds it by itself, and writes it again from the image.
     let done = repair(false, false);
     assert!(done.contains("ipsw.000 damaged: removed"), "{done}");
@@ -3636,11 +3623,11 @@ fn interrupted_disk_add_is_finished_by_repair_initialize_nor() {
     let problems = status().unwrap_err().to_string();
     assert!(problems.contains("never booted"), "{problems}");
     assert!(
-        problems.contains("stela setup repair --initialize-nor"),
+        problems.contains("`stela repair --initialize-nor`"),
         "{problems}"
     );
     assert!(!problems.contains("state restore"), "{problems}");
-    assert!(problems.contains("stela setup repair --usb"), "{problems}");
+    assert!(problems.contains("`stela repair`"), "{problems}");
     // Without the flag, repair names it and leaves the partition alone.
     let repair = |initialize: bool, dry_run: bool| {
         rerun(&f, |c| {
@@ -3651,7 +3638,10 @@ fn interrupted_disk_add_is_finished_by_repair_initialize_nor() {
         })
     };
     let report = repair(false, false).unwrap();
-    assert!(report.contains("repair --initialize-nor --usb"), "{report}");
+    assert!(
+        report.contains("`stela repair --initialize-nor`"),
+        "{report}"
+    );
     assert_eq!(state()[..], foreign[..]);
     let plan = repair(true, true).unwrap();
     assert!(plan.contains("a blank SEP area"), "{plan}");
@@ -3700,7 +3690,7 @@ fn records_with_the_retired_signing_opt_in_are_still_read() {
     let problems = rerun(&f, |c| c.action = Action::Status)
         .unwrap_err()
         .to_string();
-    assert!(problems.contains("stela setup repair --usb"), "{problems}");
+    assert!(problems.contains("`stela repair`"), "{problems}");
     rerun(&f, |c| {
         c.action = Action::Repair;
         c.ipsw = Some(f.ipsw.clone());
@@ -4901,12 +4891,41 @@ fn host_firmware_publication_preserves_guest_bundles() {
     assert_eq!(fs::read(published).unwrap(), active);
 }
 
-/// Every `stela setup` command `text` names in backticks names the USB.
+/// Every `stela` command `text` names in backticks is spelled as this
+/// stela takes it, and names the stick only when several hold Stela.
 fn assert_hints_name_the_usb(text: &str) {
-    for hint in text.split("`stela setup").skip(1) {
+    let several = SEVERAL.get();
+    let mut hints = 0;
+    for hint in text.split("`stela ").skip(1) {
         let hint = hint.split('`').next().unwrap();
-        assert!(hint.contains("--usb "), "`stela setup{hint}` in:\n{text}");
+        hints += 1;
+        assert!(
+            !hint.starts_with("setup") && !hint.contains("--usb"),
+            "`stela {hint}` in:\n{text}"
+        );
+        let first = hint.split(' ').next().unwrap();
+        assert!(
+            [
+                "create",
+                "update",
+                "repair",
+                "status",
+                "settings",
+                "log",
+                "uninstall",
+                "nvram",
+                "state"
+            ]
+            .contains(&first),
+            "`stela {hint}` in:\n{text}"
+        );
+        assert_eq!(
+            hint.contains("ESP"),
+            several && hint != "create",
+            "`stela {hint}` in:\n{text}"
+        );
     }
+    assert!(hints > 0, "no command in:\n{text}");
 }
 
 #[test]
@@ -4974,7 +4993,7 @@ fn every_maintenance_hint_names_the_usb() {
     let problems = rerun(&f, |c| c.action = Action::Status)
         .unwrap_err()
         .to_string();
-    assert!(problems.contains("stela setup repair --usb"), "{problems}");
+    assert!(problems.contains("`stela repair`"), "{problems}");
     assert_hints_name_the_usb(&problems);
     let report = rerun(&f, |c| {
         c.action = Action::Repair;
@@ -4983,6 +5002,19 @@ fn every_maintenance_hint_names_the_usb() {
     .unwrap();
     assert!(report.contains("--initialize-nor"), "{report}");
     assert_hints_name_the_usb(&report);
+    // With several sticks that hold Stela, each command names its stick.
+    SEVERAL.set(true);
+    let problems = rerun(&f, |c| c.action = Action::Status)
+        .unwrap_err()
+        .to_string();
+    SEVERAL.set(false);
+    assert!(
+        problems.contains(&format!("`stela repair {}`", f.esp.display())),
+        "{problems}"
+    );
+    SEVERAL.set(true);
+    assert_hints_name_the_usb(&problems);
+    SEVERAL.set(false);
 }
 
 /// Move the partition `from` to `to` on disk `disk`, as a PC that numbers
@@ -5229,7 +5261,7 @@ fn status_and_repair_name_the_firmware_the_last_boot_asked_for() {
         error.contains("asked for firmware rtl_nic/rtl8168d-1.fw (realtek 10ec:8168 xid-281)"),
         "{error}"
     );
-    assert!(error.contains("repair --usb"), "{error}");
+    assert!(error.contains("`stela repair`"), "{error}");
     let before = snapshot(&f.esp);
     let report = rerun(&f, |c| {
         c.action = Action::Repair;
@@ -5649,7 +5681,7 @@ fn without_usb_the_one_disk_holding_a_setup_is_used_and_two_are_never_guessed() 
         .unwrap_err()
         .to_string();
     assert!(error.contains("no mounted volume"), "{error}");
-    assert!(error.contains("--usb"), "{error}");
+    assert!(error.contains("`stela create`"), "{error}");
     // One: its EFI partition, which holds the record, over its data volume.
     let one = host(vec![
         disk("disk0", &[("Linux", Some(&system))]),
@@ -5671,10 +5703,10 @@ fn without_usb_the_one_disk_holding_a_setup_is_used_and_two_are_never_guessed() 
         disk("disk6", &[("Microsoft Basic Data", Some(&other))]),
     ]);
     let error = choose_setup(&two).unwrap_err().to_string();
-    assert!(error.starts_with("2 disks hold a Stela setup"), "{error}");
+    assert!(error.starts_with("2 sticks hold Stela"), "{error}");
     assert!(error.contains(&esp.display().to_string()), "{error}");
     assert!(error.contains(&other.display().to_string()), "{error}");
-    assert!(error.contains("Name the one to use with --usb"), "{error}");
+    assert!(error.contains("such as `stela status "), "{error}");
 }
 
 #[test]

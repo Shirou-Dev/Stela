@@ -199,7 +199,7 @@ pub(crate) fn hold_window(success: bool) {
     let prompt = if success {
         "Press any key to close this window."
     } else {
-        "Setup did not finish. Press any key to close this window."
+        "Stela stopped with an error. Press any key to close this window."
     };
     eprintln!("\n{}", console::style(prompt).for_stderr().dim());
     let _ = console::Term::stderr().read_key();

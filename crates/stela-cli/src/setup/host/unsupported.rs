@@ -9,7 +9,7 @@ pub(crate) const ADMIN: &str = "administrator rights";
 pub(crate) const DISK_PREFIX: &str = "";
 pub(crate) const DISK_EXAMPLE: &str = "a whole disk";
 
-/// The computer `stela setup` runs on.
+/// The computer `stela` runs on.
 pub(crate) struct System;
 
 fn unsupported<T>(what: &str) -> Result<T> {

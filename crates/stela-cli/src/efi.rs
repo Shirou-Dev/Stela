@@ -229,7 +229,7 @@ pub fn install(command: &Install) -> Result<serde_json::Value> {
 }
 
 /// Copy the ARM source when given and the options, then the loader, over
-/// whatever loader is there: callers check it first. `stela setup` uses this
+/// whatever loader is there: callers check it first. `stela create` uses this
 /// without a source: install mode runs none.
 pub(crate) fn add_mount(
     esp: &Path,

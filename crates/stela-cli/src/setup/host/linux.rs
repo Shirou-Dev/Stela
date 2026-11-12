@@ -21,7 +21,7 @@ mod system_disks;
 
 /// How setup gets the rights its raw reads and writes need.
 pub(crate) const ADMIN: &str = "sudo";
-/// A whole disk as `--usb` names it.
+/// A whole disk as STICK names it.
 /// What a disk identifier is preceded by where a user types it.
 pub(crate) const DISK_PREFIX: &str = "/dev/";
 pub(crate) const DISK_EXAMPLE: &str = "/dev/sdb";
@@ -57,7 +57,7 @@ const SYSTEM_MOUNTS: [&str; 17] = [
 /// The `BLKRRPART` ioctl: reread the partition table.
 const BLKRRPART: u64 = 0x125f;
 
-/// The computer `stela setup` runs on.
+/// The computer `stela` runs on.
 pub(crate) struct System;
 
 #[derive(Deserialize)]

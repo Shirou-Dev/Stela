@@ -484,7 +484,7 @@ fn remove_superseded(esp: &Path, volume: &Path, files: &[(&Artifact, &Artifact)]
     Ok(())
 }
 
-/// What `setup status` says of the bundle on `volume`.
+/// What `stela status` says of the bundle on `volume`.
 pub(super) fn bundle_status(volume: &Path) -> std::result::Result<String, String> {
     let path = volume.join(bundle::MANIFEST);
     let Ok(bytes) = fs::read(&path) else {

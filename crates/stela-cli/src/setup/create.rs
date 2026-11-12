@@ -639,8 +639,8 @@ pub(super) fn plan(
                 "{} is already set up ({}). Update it with {} or {}, or remove it with {} first",
                 esp.display(),
                 esp.join(RECORD).display(),
-                super::fix(&command.usb, "update stela"),
-                super::fix(&command.usb, "update os"),
+                super::fix(&command.usb, "update"),
+                super::fix(&command.usb, "update --macos VERSION"),
                 super::fix(&command.usb, "uninstall")
             ),
         },
@@ -1219,9 +1219,8 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
     writeln!(
         report,
         "Done. Eject the USB before you unplug it. Boot the PC from this USB (the firmware's \
-         boot menu lists it as a UEFI USB device): {start}.\nCheck it with {}\nUndo it with {}",
-        super::fix(&command.usb, "status"),
-        super::fix(&command.usb, "uninstall")
+         boot menu lists it as a UEFI USB device): {start}.\nCheck it with {}",
+        super::fix(&command.usb, "status")
     )?;
     Ok(report)
 }

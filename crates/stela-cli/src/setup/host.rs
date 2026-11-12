@@ -1,4 +1,4 @@
-//! What `stela setup` reads from the computer it runs on: each volume's file
+//! What `stela` reads from the computer it runs on: each volume's file
 //! system and free space, the disks with their partitions and serial
 //! numbers, and, for a disk the PC boots itself, its memory and CPU. Each
 //! operating system answers through its own backend: macOS through

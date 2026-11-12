@@ -1,4 +1,4 @@
-//! `stela setup uninstall`: remove everything the setup record names.
+//! `stela uninstall`: remove everything the setup record names.
 use super::{
     CHOICES_PATH, Environment, RECORD, bundle, locate_esp,
     record::{Record, read_any_record},

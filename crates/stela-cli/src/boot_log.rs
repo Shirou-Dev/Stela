@@ -1,4 +1,4 @@
-//! `stela boot-log`: the boot logs `stela.efi` keeps. Every boot writes the
+//! `stela log`: the boot logs `stela.efi` keeps. Every boot writes the
 //! USB's own log, [`crate::efi::BOOT_LOG`] on the USB's EFI partition, from
 //! its first line; an install keeps another on its machine-state partition
 //! (`stela_runtime::pc::boot_log`), at the partition's start, or in the tail
@@ -11,7 +11,7 @@
 //! hold no log, the system disks too. FILE is a whole-disk image or device,
 //! a raw partition, or a copy of the `boot.log` file itself. The hidden
 //! `--partition`, `--offset` and `--in-target` name one machine-state place
-//! instead. `stela setup boot-log` reads the same places of a setup.
+//! instead. `stela log STICK` reads the same places of a stick.
 use crate::setup::host::{self, Disk, Host};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::{

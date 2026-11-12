@@ -197,7 +197,7 @@ fn efi_status(environment: &Environment<'_>, record: &Record, report: &mut Repor
                         .unwrap_or_default()
                 ),
             );
-            let fix = report.fix("update stela");
+            let fix = report.fix("update");
             if record.stela_version.as_deref() != Some(id.as_str()) {
                 report.problem(format!(
                     "{} is not the version setup installed ({}): {fix}",
@@ -213,7 +213,7 @@ fn efi_status(environment: &Environment<'_>, record: &Record, report: &mut Repor
             }
         }
         Err(_) => {
-            let fix = report.fix("update stela");
+            let fix = report.fix("update");
             report.problem(format!("{} is missing: {fix}", tool.display()))
         }
     }
@@ -291,7 +291,7 @@ fn firmware_status(record: &Record, report: &mut Report) {
 /// revision than this stela prepares, which repair refuses to mix.
 fn image_fix(environment: &Environment<'_>, record: &Record, report: &Report) -> String {
     match revision_mismatch(environment, record) {
-        Some(_) => report.fix("update stela"),
+        Some(_) => report.fix("update"),
         None => report.fix("repair"),
     }
 }
@@ -786,18 +786,14 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     let mut text = format!("Stela repair on {}:\n", esp.display());
     text.push_str(&device_skips(&esp, "stela setup repair", command.dry_run)?);
     let Ok(tool) = fs::read(esp.join(LOADER_PATH)) else {
-        bail!(
-            "{} has no stela.efi: {}",
-            esp.display(),
-            fix(usb, "update stela")
-        );
+        bail!("{} has no stela.efi: {}", esp.display(), fix(usb, "update"));
     };
     if let Some(reason) =
         mount_interface::mismatch(environment.interface, mount_interface::find(&tool))
     {
         bail!(
             "the setup's stela.efi does not read what this stela writes ({reason}): run {} first",
-            fix(usb, "update stela")
+            fix(usb, "update")
         );
     }
     update::check_firmware_support(&esp, &tool)?;

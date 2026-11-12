@@ -62,7 +62,7 @@ use windows_sys::{
 
 /// How setup gets the rights its raw reads and writes need.
 pub(crate) const ADMIN: &str = "a terminal run as administrator";
-/// A whole disk as `--usb` names it.
+/// A whole disk as STICK names it.
 /// What a disk identifier is preceded by where a user types it.
 pub(crate) const DISK_PREFIX: &str = "";
 pub(crate) const DISK_EXAMPLE: &str = "PhysicalDrive2";
@@ -72,7 +72,7 @@ const ESP: GUID = GUID::from_u128(0xc12a7328_f81f_11d2_ba4b_00a0c93ec93b);
 /// Physical drive numbers setup looks for.
 const DRIVES: u32 = 128;
 
-/// The computer `stela setup` runs on.
+/// The computer `stela` runs on.
 pub(crate) struct System;
 
 /// `text` as a NUL-terminated wide string.

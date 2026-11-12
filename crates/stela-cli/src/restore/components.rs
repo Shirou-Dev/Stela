@@ -1,6 +1,6 @@
 //! Which BuildManifest identities and components a build and profile need:
 //! the one definition `stela-dev boot prepare`, the restore inventory and
-//! `stela setup` share.
+//! `stela` share.
 //!
 //! A profile is a Mac the engine presents, by its `Ap,ProductType`. The
 //! profile registry ([`BOARDS`], the 26A434 IPSW's boards) gives its
