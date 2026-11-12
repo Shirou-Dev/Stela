@@ -872,8 +872,8 @@ fn show_reset(otherwise: &str, action: &str, hold: u64) {
     output::flush_log();
     if output::usb_log_kept() {
         crate::status::info(
-            "Its full log is on this USB: on another computer, `stela setup boot-log --output \
-             log.txt` saves it.",
+            "Its full log is on this USB: on another computer, plug in this USB and run `stela \
+             log`, which saves it to log.txt.",
         );
     }
     crate::status::countdown(action, hold);

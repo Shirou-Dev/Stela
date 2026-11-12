@@ -672,12 +672,12 @@ fn translation_store(
             crate::status::warn(&format!("this PC's memory has no room for it; {stays}"))
         }
         PackRead::Whole(bytes) => crate::status::warn(&format!(
-            "{} MB; {stays}: `stela setup repair` prepares the file",
+            "{} MB; {stays}: `stela repair` on another computer prepares the file",
             mb(bytes)
         )),
-        PackRead::None => {
-            crate::status::warn(&format!("{stays}: `stela setup repair` prepares the file"))
-        }
+        PackRead::None => crate::status::warn(&format!(
+            "{stays}: `stela repair` on another computer prepares the file"
+        )),
     }
     if files.len() < MAX_FILES {
         files.push((

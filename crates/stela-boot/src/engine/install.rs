@@ -47,8 +47,8 @@ impl ReadAt for Medium {
             self.reported = true;
             output::arguments(format_args!("{DAMAGED_LOG_LINE}{member}\n"));
             crate::status::info(
-                "The macOS install files on the USB are damaged: run `stela setup repair` on \
-                 this USB on another computer, then install again.",
+                "The macOS install files on the USB are damaged: on another computer, plug in \
+                 this USB and run `stela repair`, then install again.",
             );
             output::flush_log();
         }
@@ -94,7 +94,7 @@ pub fn check_pieces(
     }
     if !complete {
         return Err(refuse!(
-            "the install medium is incomplete; run stela setup again to finish it"
+            "the install medium is incomplete; run `stela repair` on another computer to finish it"
         ));
     }
     output::arguments(format_args!(

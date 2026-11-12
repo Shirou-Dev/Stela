@@ -909,7 +909,7 @@ fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, Ser
     }
     if !available {
         output::arguments(format_args!(
-            "GPU {name}: the USB's firmware bundle lacks this chip's files; `stela setup repair` \
+            "GPU {name}: the USB's firmware bundle lacks this chip's files; `stela repair` \
              completes it\n"
         ));
         return Err(ServiceError::Refused(NO_FIRMWARE));

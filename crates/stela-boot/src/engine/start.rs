@@ -2105,7 +2105,8 @@ fn prepare_restore(
     let signer = options.install.is_some().then(|| {
         let ecid = boot_ecid.unwrap_or_else(|| {
             output::fatal(
-                "install: the bundle names no machine ECID; run stela setup repair --fetch",
+                "install: the bundle names no machine ECID; on another computer, plug in this \
+                 USB and run `stela repair`",
             )
         });
         stela_runtime::restore::tss::Signer {

@@ -39,7 +39,7 @@ pub const RELAY_BUFFER: usize = 1 << 20;
 /// No adapter a native driver runs: what to connect, as the screen says it.
 const NO_ADAPTER: &str = "No supported network adapter. Connect wired Ethernet: most Intel and Realtek adapters, Aquantia adapters, Broadcom's BCM5720, BCM5761 and BCM5762, or a Realtek or ASIX USB adapter.";
 /// What the screen says when DHCP gives the first adapter no lease.
-const NO_LEASE: &str = "No automatic network address. Connect Ethernet to a network with DHCPv4 or IPv6 router advertisements, or set an address with `stela setup configure --ipv4 ADDRESS/PREFIX --usb USB` on another computer. Stateful DHCPv6 is unsupported.";
+const NO_LEASE: &str = "No automatic network address. Connect Ethernet to a network with DHCPv4 or IPv6 router advertisements, or set an address with `stela settings --ipv4 ADDRESS/PREFIX` on another computer. Stateful DHCPv6 is unsupported.";
 
 /// The host's network adapters and the loader root they are reached in.
 /// Adapters left in it are dropped in that root.

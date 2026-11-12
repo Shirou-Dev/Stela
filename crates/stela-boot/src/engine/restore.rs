@@ -284,7 +284,7 @@ fn check_staged(
     } else {
         output::fatal(format_args!(
             "The USB's signing answers do not match this macOS install ({}), and there is no network. \
-             Run `stela setup repair --fetch` on another computer, or connect Ethernet and start again. \
+             On another computer, plug in this USB and run `stela`, or connect Ethernet and start again. \
              The install did not start and the disk is unchanged.",
             kind.name()
         ));

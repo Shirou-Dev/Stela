@@ -72,8 +72,8 @@ pub fn read() -> Option<Region> {
         let path = format!("{}\\{NAME}", translations::DIRECTORY);
         let Some(mut file) = translations::open(&mut root, &path, FileMode::Read) else {
             output::arguments(format_args!(
-                "PIPELINES no {path}: compiled pipelines compile every boot; `stela setup \
-                 repair` prepares the file\n"
+                "PIPELINES no {path}: compiled pipelines compile every boot; `stela repair` \
+                 prepares the file\n"
             ));
             return None;
         };

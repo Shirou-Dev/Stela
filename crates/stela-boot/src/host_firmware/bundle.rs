@@ -135,7 +135,7 @@ fn load_from(
         else {
             lacking += 1;
             output::arguments(format_args!(
-                "HOST FIRMWARE BUNDLE LACKS {} for {why}: `stela setup repair` adds it\n",
+                "HOST FIRMWARE BUNDLE LACKS {} for {why}: `stela repair` adds it\n",
                 artifact.member
             ));
             continue;
