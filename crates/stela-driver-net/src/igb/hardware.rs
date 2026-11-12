@@ -79,6 +79,37 @@ impl<'a, R: RegisterIo, T: Timer> Hardware<'a, R, T> {
         config: &mut impl ConfigSpace,
         capabilities: PciCapabilities,
     ) -> Result<(), BlockError> {
+        self.disable_master()?;
+        if self.chip.old_reset() {
+            self.completion_timeout(config, capabilities)?;
+        }
+        self.reset_mac()
+    }
+
+    /// Linux igb_down's register sequence: stop receive and transmit, give
+    /// in-flight frames 10 ms, then igb_reset's bus master drain and MAC
+    /// reset. Only a completed reset proves the controller writes no ring.
+    /// The 82575/82576 completion timeout igb_reset_hw_82575 sets again is
+    /// left as the start set it, as nothing runs on the stopped function.
+    pub(super) fn stop(&mut self) -> Result<(), BlockError> {
+        self.io.write(RCTL, self.io.read(RCTL) & !RCTL_EN);
+        self.io.write(TCTL, self.io.read(TCTL) & !TCTL_EN);
+        self.io.read(STATUS);
+        self.clock.delay(10_000)?;
+        self.disable_master()?;
+        self.reset_mac()
+    }
+
+    /// igb_release_hw_control: hand the controller back to manageability
+    /// firmware once the driver no longer owns it.
+    pub(super) fn release_control(&self) {
+        self.io
+            .write(CTRL_EXT, self.io.read(CTRL_EXT) & !CTRL_EXT_DRIVER);
+    }
+
+    /// Mask interrupts, stop both engines and wait for the bus master to
+    /// drain (igb_disable_pcie_master).
+    fn disable_master(&self) -> Result<(), BlockError> {
         self.io.write(IMC, u32::MAX);
         self.io.write(EIMC, u32::MAX);
         self.io.write(GPIE, 0);
@@ -92,9 +123,11 @@ impl<'a, R: RegisterIo, T: Timer> Hardware<'a, R, T> {
         {
             return Err(BlockError::Timeout);
         }
-        if self.chip.old_reset() {
-            self.completion_timeout(config, capabilities)?;
-        }
+        Ok(())
+    }
+
+    /// The function's MAC reset and what igb_reset clears after it.
+    fn reset_mac(&mut self) -> Result<(), BlockError> {
         self.io.read(STATUS);
         self.clock.delay(10_000)?;
         // Reset this function, not DEV_RST: other copper ports are separate

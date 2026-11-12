@@ -473,6 +473,59 @@ fn unknown_phy_and_media_do_not_start_a_link() {
 }
 
 #[test]
+fn a_stop_drains_the_bus_master_resets_the_mac_and_hands_control_back() {
+    for (chip, phy, flash) in [
+        (Chip::I82575, PHY_IGP3, true),
+        (Chip::I350, PHY_I350, true),
+        (Chip::I211, PHY_I210, false),
+    ] {
+        let io = Model::new(chip, phy, flash);
+        io.lock_after.set(1);
+        initialize(&io, chip).unwrap_or_else(|error| panic!("{error:?}"));
+        assert_ne!(io.get(CTRL_EXT) & CTRL_EXT_DRIVER, 0);
+        io.set(RCTL, RCTL_EN | RCTL_BAM);
+        io.set(TCTL, TCTL_EN | TCTL_PSP);
+        io.writes.borrow_mut().clear();
+        let clock = ModelClock::default();
+        let mut hardware = Hardware::new(io.as_ref(), &clock, chip);
+        hardware.stop().unwrap();
+        hardware.release_control();
+        let writes = io.writes.borrow();
+        let at = |found: &dyn Fn(usize, u32) -> bool| {
+            writes
+                .iter()
+                .position(|&(offset, value)| found(offset, value))
+                .unwrap()
+        };
+        // igb_down: receive, then transmit, off before igb_reset drains the
+        // bus master and resets the MAC.
+        let receive = at(&|offset, value| offset == RCTL && value == RCTL_BAM);
+        let transmit = at(&|offset, value| offset == TCTL && value == TCTL_PSP);
+        let master = at(&|offset, value| offset == CTRL && value & CTRL_MASTER_DISABLE != 0);
+        let reset = at(&|offset, value| offset == CTRL && value & CTRL_RST != 0);
+        assert!(receive < transmit && transmit < master && master < reset);
+        // igb_release_hw_control.
+        assert_eq!(io.get(CTRL_EXT) & CTRL_EXT_DRIVER, 0);
+    }
+    // A bus master that never drains fails the stop before any reset, so
+    // the owner keeps the rings.
+    let io = Model::new(Chip::I350, PHY_I350, true);
+    io.lock_after.set(1);
+    initialize(&io, Chip::I350).unwrap();
+    io.fault.set(Fault::Master);
+    io.writes.borrow_mut().clear();
+    let clock = ModelClock::default();
+    let mut hardware = Hardware::new(io.as_ref(), &clock, Chip::I350);
+    assert_eq!(hardware.stop(), Err(BlockError::Timeout));
+    assert!(
+        !io.writes
+            .borrow()
+            .iter()
+            .any(|&(offset, value)| offset == CTRL && value & CTRL_RST != 0)
+    );
+}
+
+#[test]
 fn a_wake_configuration_left_armed_is_cleared_by_the_reset() {
     for (chip, phy, flash) in [
         (Chip::I82576, PHY_IGP3, true),
@@ -750,8 +803,9 @@ impl DmaFixture {
             device: unsafe {
                 Mmio::new(registers.as_mut_ptr() as u64, size_of_val(&registers[..]))
             },
-            receive: Ring::new(&mut dma).unwrap(),
-            transmit: Ring::new(&mut dma).unwrap(),
+            chip: Chip::I210,
+            receive: ManuallyDrop::new(Ring::new(&mut dma).unwrap()),
+            transmit: ManuallyDrop::new(Ring::new(&mut dma).unwrap()),
             dropping: false,
             faulted: false,
             mac: Model::MAC,

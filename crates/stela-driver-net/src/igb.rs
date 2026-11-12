@@ -11,7 +11,8 @@
 //! One polled advanced-descriptor queue, ordinary Ethernet frames, no
 //! offloads, SR-IOV, timestamping, EEE, fiber, SerDes or SGMII. Matching a
 //! copper PCI ID still requires a supported PHY and valid programmed NVM.
-//! DMA remains allocated until reboot, including after errors or drop.
+//! Drop stops the controller and hands it back to manageability firmware;
+//! DMA stays allocated until reboot when the stop is not observed.
 use super::{
     HEADER, Link, LinkError, MAX_FRAME, MIN_FRAME, Mac,
     advanced::{
@@ -32,7 +33,10 @@ use crate::{
     registers as mapped_registers,
 };
 use alloc::{format, string::String, vec::Vec};
-use core::sync::atomic::{Ordering, fence};
+use core::{
+    mem::ManuallyDrop,
+    sync::atomic::{Ordering, fence},
+};
 
 mod hardware;
 mod nvm;
@@ -174,8 +178,9 @@ impl Timer for crate::timing::Timing {
 
 pub struct Igb {
     device: Mmio,
-    receive: Ring,
-    transmit: Ring,
+    chip: Chip,
+    receive: ManuallyDrop<Ring>,
+    transmit: ManuallyDrop<Ring>,
     dropping: bool,
     /// Register reads return all ones: the function is gone.
     faulted: bool,
@@ -238,8 +243,9 @@ impl Igb {
         let (mac, warnings) = hardware.initialize(function.config(), capabilities)?;
         let mut net = Self {
             device,
-            receive: Ring::new(dma)?,
-            transmit: Ring::new(dma)?,
+            chip,
+            receive: ManuallyDrop::new(Ring::new(dma)?),
+            transmit: ManuallyDrop::new(Ring::new(dma)?),
             dropping: false,
             faulted: false,
             mac,
@@ -275,6 +281,29 @@ impl Igb {
                 self.location
             ))),
             false => Ok(status & STATUS_LU != 0),
+        }
+    }
+}
+
+impl Drop for Igb {
+    /// Linux igb_down then igb_release_hw_control. The rings are freed only
+    /// once the controller verifiably stopped; otherwise they stay allocated.
+    ///
+    /// This drives the controller's registers, so the owner drops it where
+    /// its MMIO window is mapped; anywhere else the first read faults.
+    fn drop(&mut self) {
+        if self.faulted || self.device.read32(STATUS) == u32::MAX {
+            return;
+        }
+        let mut hardware = Hardware::new(&self.device, &self.clock, self.chip);
+        if hardware.stop().is_ok() {
+            hardware.release_control();
+            // SAFETY: the completed MAC reset stopped every descriptor and
+            // buffer access, and neither ring is used after this.
+            unsafe {
+                ManuallyDrop::drop(&mut self.receive);
+                ManuallyDrop::drop(&mut self.transmit);
+            }
         }
     }
 }
