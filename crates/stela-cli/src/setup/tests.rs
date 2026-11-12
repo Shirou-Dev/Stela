@@ -2730,7 +2730,7 @@ fn a_piece_an_install_found_damaged_is_named_by_status_and_put_right_by_repair()
     let offline = || {
         let mut request = update_request(&f, &f._dir.path().join("empty"));
         request.action = Action::Repair;
-        request.verify = true;
+        request.full = true;
         request
     };
     let error = format!(
