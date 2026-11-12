@@ -244,12 +244,28 @@ pub fn explain(error: &BlockError) -> String {
         17 => "parameter error",
         19 => "context state error",
         20 => "no ping response",
+        21 => "event ring full",
         22 => "incompatible device",
         26 => "stopped",
         36 => "split transaction error",
         _ => "error",
     };
     format!("{name} (xHCI completion code {status})")
+}
+
+/// The log line for a device or unit at `location` that did not start with
+/// `error`. A reader with no card or disc in it has not failed.
+pub fn failure_line(location: &str, error: &BlockError) -> String {
+    use crate::block::Sense;
+    match error {
+        BlockError::Sense(sense)
+            if matches!(sense.key, Sense::NOT_READY | Sense::UNIT_ATTENTION)
+                && sense.asc == Sense::MEDIUM_NOT_PRESENT =>
+        {
+            format!("USB EMPTY {location}: no card or disc in the reader\n")
+        }
+        _ => format!("USB FAILED {location}: {}\n", explain(error)),
+    }
 }
 
 /// Port speed IDs (the default Protocol Speed IDs, xHCI 7.2.2.1.1).
@@ -1342,6 +1358,22 @@ mod tests {
     use super::model::*;
     use super::*;
     use crate::bus::dma::TestRegion;
+
+    #[test]
+    fn an_empty_reader_is_not_logged_as_a_failure() {
+        let sense = |key, asc| BlockError::Sense(crate::block::Sense { key, asc, ascq: 0 });
+        assert_eq!(
+            failure_line("port 3 LUN 0", &sense(2, 0x3a)),
+            "USB EMPTY port 3 LUN 0: no card or disc in the reader\n"
+        );
+        assert!(
+            failure_line("port 3 LUN 0", &sense(2, 4)).starts_with("USB FAILED port 3 LUN 0: ")
+        );
+        assert_eq!(
+            failure_line("port 3", &BlockError::Device { status: 21 }),
+            "USB FAILED port 3: event ring full (xHCI completion code 21)\n"
+        );
+    }
 
     #[test]
     fn quiet_drains_read_usbsts_only_every_64th_or_with_events_like_xhci_irq() {

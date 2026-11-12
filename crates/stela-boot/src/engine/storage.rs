@@ -1707,8 +1707,8 @@ pub unsafe fn open(
     }
     for (location, error) in &devices.usb_failures {
         output::arguments(format_args!(
-            "USB FAILED {location}: {}\n",
-            stela_drivers::usb::xhci::explain(error)
+            "{}",
+            stela_drivers::usb::xhci::failure_line(location, error)
         ));
     }
     for (location, why) in &devices.usb_unused {

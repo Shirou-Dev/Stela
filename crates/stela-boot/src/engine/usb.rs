@@ -254,10 +254,7 @@ impl HostUsb {
             }
             let added = &mut changes.added;
             for (location, error) in &added.failures {
-                output::arguments(format_args!(
-                    "USB FAILED {location}: {}\n",
-                    xhci::explain(error)
-                ));
+                output::arguments(format_args!("{}", xhci::failure_line(location, error)));
             }
             for (location, why) in &added.unused {
                 output::arguments(format_args!("USB UNUSED {location}: {why}\n"));
