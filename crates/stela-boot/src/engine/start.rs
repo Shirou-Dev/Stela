@@ -2946,7 +2946,15 @@ fn start_devices(
                 services,
                 medium,
                 preboot,
-                options.input.then(|| input::HostInput::new(inputs)),
+                if options.input {
+                    Some(input::HostInput::new(inputs))
+                } else {
+                    // Unused devices are released where their registers and
+                    // DMA pages are mapped, as the adapters are.
+                    let root = inputs.root;
+                    network::in_loader_root(root, || drop(inputs));
+                    None
+                },
                 network,
                 usb_disks,
                 guest_network,
