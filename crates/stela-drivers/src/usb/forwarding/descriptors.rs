@@ -29,7 +29,6 @@ pub(super) fn inventory(device: &xhci::Device) -> Result<Vec<Configuration>, Blo
             || bytes.len() > 4096
             || total > 65536
             || bytes[5] == 0
-            || configurations.iter().any(|c| c.value == bytes[5])
         {
             return Err(invalid());
         }
@@ -148,6 +147,19 @@ mod tests {
             vec![0x81, 2]
         );
         assert_eq!(d.configurations[0], composite());
+    }
+    /// A device that answers two indices with one configuration value is
+    /// kept, as Linux keeps it; the value selects the first.
+    #[test]
+    fn keeps_two_configurations_with_one_value() {
+        let mut second = composite();
+        second[8] = 100;
+        let mut d = device(vec![composite(), second]);
+        d.descriptor[17] = 2;
+        let inventory = inventory(&d).unwrap();
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory.iter().position(|c| c.value == 19), Some(0));
+        assert_eq!(d.configurations[1][8], 100);
     }
     #[test]
     fn rejects_malformed_inventory_without_sanitizing_guest_bytes() {

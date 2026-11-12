@@ -783,15 +783,8 @@ impl Controller {
                     )),
                 );
             }
-            if configurations
-                .iter()
-                .any(|previous: &Vec<u8>| previous[5] == bytes[5])
-            {
-                return during(
-                    format!("slot {slot} configuration {index}"),
-                    Err(BlockError::Unsupported("duplicate USB configuration value")),
-                );
-            }
+            // A device may answer two indices with one configuration value.
+            // Linux keeps both and a value selects the first; so does this.
             configurations.push(bytes);
         }
         self.current_descriptions(slot, &configurations)
