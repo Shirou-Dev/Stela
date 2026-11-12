@@ -67,13 +67,15 @@ fn boot_volume() -> Option<(FileSystem, Directory)> {
     Some((FileSystem::new(protocol), root))
 }
 
-/// Connect every controller to its drivers, recursively, as a boot manager
-/// does before it lists boot options (`stela_boot_core::firmware_connect`).
-/// A firmware that boots fast connects only the path to the boot loader,
-/// and the bundle, the install medium and the host disks lie on other
-/// partitions and devices. Each connection that takes a second or more is
-/// named in the boot log and on the screen.
-pub(crate) fn connect_all() -> firmware_connect::Summary {
+/// Connect the firmware's drivers to what the boot needs: storage, USB, the
+/// display and the console's devices, with their children, but no network
+/// controller, whose firmware drivers nothing before boot services end
+/// uses (`stela_boot_core::firmware_connect`). A firmware that boots fast
+/// connects only the path to the boot loader, and the bundle, the install
+/// medium and the host disks lie on other partitions and devices. Each
+/// connection that takes a second or more is named in the boot log and on
+/// the screen.
+pub(crate) fn connect_needed() -> firmware_connect::Summary {
     // Root bridges appear only with the firmware's own drivers, all before
     // the mount starts, so the first list of them holds.
     firmware_connect::connect(&mut Connector {
@@ -81,7 +83,7 @@ pub(crate) fn connect_all() -> firmware_connect::Summary {
     })
 }
 
-/// The firmware calls of [`connect_all`].
+/// The firmware calls of [`connect_needed`].
 struct Connector {
     root_bridges: Vec<Handle>,
 }

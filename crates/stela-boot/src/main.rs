@@ -249,11 +249,11 @@ fn main() -> Status {
             "HOST hypervisor present: stop codes also go to its exit port\n"
         ));
     }
-    status::begin("Connecting the firmware's drivers to every device");
-    let connected = firmware::connect_all();
+    status::begin("Connecting the firmware's drivers to the boot's devices");
+    let connected = firmware::connect_needed();
     output::arguments(format_args!(
-        "FIRMWARE connected {} handles, {} slow\n",
-        connected.handles, connected.slow
+        "FIRMWARE connected {} of {} handles, left {} network controllers to Stela's drivers, {} slow\n",
+        connected.connected, connected.handles, connected.network, connected.slow
     ));
     status::done("");
     status::begin("Reading Stela's settings");
