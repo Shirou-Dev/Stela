@@ -213,6 +213,11 @@ fn boot_skips(boot: &str) -> Option<Skips> {
     let mut skips = Skips::default();
     let mut pending = None;
     for line in boot.lines() {
+        // The log stamps each line it keeps with `[  12.345] ` (`output::stamp`).
+        let line = line
+            .strip_prefix('[')
+            .and_then(|stamped| stamped.split_once("] "))
+            .map_or(line, |(_, rest)| rest);
         if let Some(function) = Function::parse(line, START) {
             pending = Some(function);
         } else if line.starts_with(STARTED) {
@@ -352,6 +357,26 @@ mod tests {
         older.push_str(&text);
         assert_eq!(read(older.as_bytes()), read(text.as_bytes()));
         assert!(read(text.as_bytes()).holds(&lan));
+    }
+
+    #[test]
+    fn stamped_lines_as_the_log_keeps_them_are_read() {
+        // A v0.3.1 boot that stalled in its RTL8126's start, as its log has it.
+        let text = "=== STELA BOOT 1 ===\n\
+                    [   46.686] HOST DEVICE START pci=0000:0a:0d.0 id=1022:43f5\n\
+                    [   46.693] HOST DEVICE PCI 0000:0d:00.0 start\n\
+                    [   46.693] HOST DEVICE START pci=0000:0d:00.0 id=10ec:8126\n";
+        let lan = Function {
+            address: Address::parse("0000:0d:00.0").unwrap(),
+            vendor: 0x10ec,
+            device: 0x8126,
+        };
+        assert!(settled(text.as_bytes()));
+        let skips = read(text.as_bytes());
+        assert!(skips.holds(&lan));
+        assert_eq!(skips.iter().count(), 1);
+        let finished = format!("{text}[   47.000] {STARTED}\n");
+        assert!(read(finished.as_bytes()).is_empty());
     }
 
     #[test]
