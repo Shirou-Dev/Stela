@@ -353,16 +353,27 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
                 "A create stopped part way: {}.",
                 record.resume_summary()
             ))?;
-            let rows = super::ui::rows(&[
-                (
-                    "Finish it",
-                    "Keeps what is written, checks it, and writes the rest",
+            let finish = match super::resume_bytes(environment, record, None, None) {
+                Some(bytes) if bytes > 0 => format!(
+                    "Keeps what is written, checks it, and downloads the rest ({})",
+                    host::size_text(bytes)
                 ),
+                _ => "Keeps what is written, checks it, and writes the rest".into(),
+            };
+            let rows = super::ui::rows(&[
+                ("Finish it", &finish),
                 ("Start over", "Erases the stick"),
                 ("Quit", ""),
             ]);
             match ui.select("Finish the create?", &rows, 0)? {
-                0 => perform(environment, maintenance(Action::Repair)),
+                // The choice named what it downloads.
+                0 => perform(
+                    environment,
+                    Request {
+                        yes: true,
+                        ..maintenance(Action::Repair)
+                    },
+                ),
                 1 => create(environment, request, &stick),
                 _ => quit(ui),
             }

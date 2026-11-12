@@ -217,6 +217,27 @@ fn consent_download(
     )
 }
 
+/// What finishing `record`'s interrupted create downloads, in bytes, when
+/// its source can be found now.
+fn resume_bytes(
+    environment: &Environment<'_>,
+    record: &Record,
+    ipsw: Option<&Path>,
+    download_dir: Option<&Path>,
+) -> Option<u64> {
+    let lookup = sources::Lookup {
+        need: sources::need(record, &record.build, true)?,
+        build: &record.build,
+        model: &record.model,
+        ipsw,
+        download_dir,
+        medium: record.medium_of(&record.build),
+    };
+    sources::locate(environment, &lookup)
+        .ok()
+        .map(|source| sources::download_bytes(&source))
+}
+
 /// Before an effect a terminal run asks about (`question`): accept it with
 /// `--yes` (`yes`), ask on a terminal, and otherwise refuse with `refusal`,
 /// naming `--yes`. Declining changes nothing. Erasing a disk never comes
@@ -1149,6 +1170,22 @@ impl Request {
         let key = esp.join(wifi::KEY_PATH);
         if self.wifi.is_some() && self.wifi_passphrase_file.is_none() && key.is_file() {
             self.wifi_passphrase = Some(wifi::read_passphrase(&key)?);
+        }
+        if !self.dry_run
+            && let Some(bytes) = resume_bytes(
+                environment,
+                record,
+                self.ipsw.as_deref(),
+                self.download_dir.as_deref(),
+            )
+        {
+            consent_download(
+                environment,
+                self.yes,
+                false,
+                bytes,
+                &format!("the rest of macOS {}", record.build),
+            )?;
         }
         self.action = Action::Create;
         self.create(environment)

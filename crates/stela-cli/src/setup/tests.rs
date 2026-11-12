@@ -5977,6 +5977,66 @@ fn repair_asks_before_downloading_more_than_a_gigabyte_and_a_no_changes_nothing(
     assert!(error.contains("asked for Pieces"), "{error}");
 }
 
+#[test]
+fn finishing_a_create_asks_before_downloading_more_than_a_gigabyte() {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    interrupt_setup(&f);
+    // Apple's image is 3 GB: most of it is missing from the stick.
+    let size = |_: &str, _: &str| -> Result<(u64, u64)> { Ok((1_000_000, 3_000_000_000)) };
+    let fetch = |_: &Path, _: &str, _: &str, need: sources::Need| -> Result<sources::Fetched> {
+        anyhow::bail!("asked for {need:?}")
+    };
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    let finish = |ui: &dyn ui::Ui, yes: bool| {
+        let mut request = update_request(&f, &f._dir.path().join("cache"));
+        request.action = Action::Repair;
+        request.yes = yes;
+        request.dispatch(&Environment {
+            image_size: &size,
+            fetch_image: &fetch,
+            ui,
+            ..environment(&f.host)
+        })
+    };
+    let error = finish(&ui::NoTerminal, false).unwrap_err().to_string();
+    assert!(
+        error.contains("this downloads") && error.contains("Add --yes"),
+        "{error}"
+    );
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+    let no = ui::tests::Scripted::new(&["no"]);
+    assert_eq!(
+        finish(&no, false).unwrap_err().to_string(),
+        "nothing was changed"
+    );
+    assert!(
+        no.transcript().contains("the rest of macOS"),
+        "{}",
+        no.transcript()
+    );
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+    let error = finish(&ui::NoTerminal, true).unwrap_err().to_string();
+    // --yes goes on past the question to the download.
+    assert!(!error.contains("this downloads"), "{error}");
+    // Plain stela names the size in its Finish it choice.
+    let person = ui::tests::Scripted::new(&["Quit"]);
+    let environment = Environment {
+        image_size: &size,
+        fetch_image: &fetch,
+        ui: &person,
+        ..environment(&f.host)
+    };
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(command::Global::default())
+    };
+    home::run(&environment, request).unwrap();
+    let shown = person.transcript();
+    assert!(shown.contains("downloads the rest (3.0 GB)"), "{shown}");
+}
+
 /// Plain `stela` on `f`'s computer, answered by `answers`; what it showed
 /// and how it ended. `networks` are the Wi-Fi networks this computer sees.
 fn plain_stela(f: &Fixture, answers: &[&str], networks: &[&str]) -> (String, Result<()>, bool) {
