@@ -1,5 +1,5 @@
 //! The UEFI mount's firmware-independent logic, built for the host (its
-//! tests and `stela setup`) and for `x86_64-unknown-uefi` (`stela.efi`).
+//! tests and `stela`) and for `x86_64-unknown-uefi` (`stela.efi`).
 //! `stela-boot` keeps the firmware calls and the code that needs its
 //! allocator, page tables or console.
 #![cfg_attr(not(test), no_std)]

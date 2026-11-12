@@ -25,18 +25,19 @@ pub(super) struct Situation {
     /// Root on Unix, an elevated administrator on Windows.
     pub(super) administrator: bool,
     pub(super) dry_run: bool,
-    /// The wizard and `boot-log`, whose output a new window may carry.
+    /// The wizard, plain `stela` and `log`, whose output a new window may
+    /// carry.
     pub(super) own_window: bool,
-    /// It may write to a disk, as every command but `status` and
-    /// `boot-log` does.
+    /// It may write to a disk, as every command but `status` and `log`
+    /// does.
     pub(super) writes_disks: bool,
 }
 
 /// A command's way to the rights it needs. A dry run changes nothing and
 /// needs none. On Unix, `sudo` runs the same command in the same terminal.
 /// On Windows, a relaunch opens a new window, which loses a scripted
-/// command's output and exit status, so only the wizard and `boot-log` are
-/// relaunched; any other command that writes a disk stops before it
+/// command's output and exit status, so only the wizard, plain `stela` and
+/// `log` are relaunched; any other command that writes a disk stops before it
 /// downloads or changes anything.
 pub(super) fn rights(situation: Situation) -> Rights {
     let Situation {
@@ -89,10 +90,10 @@ pub(super) fn relaunch() -> Result<()> {
         .arg(std::env::current_exe()?)
         .args(std::env::args_os().skip(1))
         .exec();
-    Err(error).context("setup writes disks as root, and sudo could not start")
+    Err(error).context("stela writes disks as root, and sudo could not start")
 }
 
-/// The proxy settings that setup's downloads need behind a proxy, as
+/// The proxy settings that stela's downloads need behind a proxy, as
 /// `NAME=value` words for sudo, which otherwise clears them from the
 /// environment of the command it runs.
 #[cfg(not(windows))]
@@ -283,7 +284,7 @@ mod tests {
     #[test]
     fn elevation_preserves_argument_quoting() {
         let arguments = [
-            "setup",
+            "create",
             "--ipsw",
             "C:\\my images\\mac.ipsw",
             "a\"b",
@@ -293,7 +294,7 @@ mod tests {
         let quoted = parameters(arguments.into_iter().map(Into::into));
         assert_eq!(
             String::from_utf16(&quoted[..quoted.len() - 1]).unwrap(),
-            "\"setup\" \"--ipsw\" \"C:\\my images\\mac.ipsw\" \"a\\\"b\" \"C:\\tail\\\\\" \"--profile\""
+            "\"create\" \"--ipsw\" \"C:\\my images\\mac.ipsw\" \"a\\\"b\" \"C:\\tail\\\\\" \"--profile\""
         );
     }
 }

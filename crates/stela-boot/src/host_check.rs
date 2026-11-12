@@ -13,7 +13,7 @@
 //!   size.
 //! - `log`: with `--nor-file`, the persistent boot log in a preallocated
 //!   file on a USB disk's FAT32 volume, laid out as a machine-state
-//!   partition (`pc::boot_log`); `stela boot-log FILE --offset 0` reads it.
+//!   partition (`pc::boot_log`); `stela log FILE --offset 0` reads it.
 //!   Only that file's blocks are written, and only on a USB disk.
 //! - `apic`, `interrupts`: the local APIC timer measured against the TSC,
 //!   then one one-shot and 100 ms of periodic interrupts through the IDT's

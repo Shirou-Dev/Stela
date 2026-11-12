@@ -1,6 +1,6 @@
 //! The install medium (`--install MANIFEST --install-source GUID`): the
 //! IPSW as `ipsw.NNN` pieces on a FAT32 partition of the USB, beside its
-//! `payload.json`, which `stela setup` writes.
+//! `payload.json`, which `stela` writes.
 //!
 //! Before boot services end, [`check_pieces`] confirms through the
 //! firmware's own FAT driver that every piece is there with its size. After
@@ -8,7 +8,7 @@
 //! on the partition the storage drivers opened by its GUID, and joins them
 //! into one IPSW whose every block is checked against the piece hashes the
 //! manifest names. A block that fails its check is named once in the boot
-//! log ([`DAMAGED_LOG_LINE`]), which `stela setup status` reads to send the
+//! log ([`DAMAGED_LOG_LINE`]), which `stela status` reads to send the
 //! user to `repair`.
 use super::bundle::{self, Bytes};
 use crate::Result;

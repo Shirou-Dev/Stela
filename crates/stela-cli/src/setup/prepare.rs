@@ -283,7 +283,7 @@ pub(super) fn shortfall(directory: &Path, what: &str, need: u64, free: u64) -> O
     })
 }
 
-/// Download `--build`'s image, or reuse a complete earlier download: the
+/// Download the request's build's image, or reuse a complete earlier download: the
 /// whole IPSW for a full install medium, else its boot files, which
 /// prepare the boot bundles.
 pub(super) fn fetch(command: &Request) -> Result<PathBuf> {

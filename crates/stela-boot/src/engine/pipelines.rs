@@ -1,4 +1,4 @@
-//! The Metal device's pipeline store: `stela/store/pipeline.bin`, a file `stela setup`
+//! The Metal device's pipeline store: `stela/store/pipeline.bin`, a file `stela`
 //! preallocates beside the translation packs.
 //!
 //! The file is a journal (`stela_formats::journal`) of the driver's pipeline

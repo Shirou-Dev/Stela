@@ -11,7 +11,7 @@
 //!   the SHA-256 of what it holds.
 //! - `state restore FILE` writes such a file back to the machine it came
 //!   from, and to no other.
-//! - `boot-log` prints the boot log `stela.efi` keeps after the SEP's area
+//! - `log` prints the boot log `stela.efi` keeps after the SEP's area
 //!   on a partition of at least `boot_log::PARTITION_BYTES`
 //!   (`stela_runtime::pc::boot_log`), and writes nothing.
 //!
@@ -191,7 +191,7 @@ pub(super) fn reset_nvram(
     Ok(text)
 }
 
-/// `boot-log`: the boot log `stela.efi` keeps after the SEP's area, when
+/// `log`: the boot log `stela.efi` keeps after the SEP's area, when
 /// the partition holds one.
 /// The USB's own log (`mount_interface::BOOT_LOG_FILE`), which every boot
 /// writes from its first line, then the install's on its machine-state
@@ -264,7 +264,7 @@ fn usb_disk(host: &dyn Host, usb: &Path) -> Option<Disk> {
         .find(|disk| disk.identifier == identifier)
 }
 
-/// `boot-log` for a USB whose setup record cannot be read (`why`): every
+/// `log` for a USB whose setup record cannot be read (`why`): every
 /// log on its disk, read directly, which needs neither the record nor a
 /// mounted EFI partition.
 pub(super) fn raw_boot_log(host: &dyn Host, usb: &Path, why: &anyhow::Error) -> Result<String> {

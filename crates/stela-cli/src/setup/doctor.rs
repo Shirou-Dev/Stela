@@ -15,13 +15,13 @@
 //! command.
 //!
 //! Repair puts back what the record says: `stela.cfg` and the startup
-//! choices, and, from the active build's restore image (`--ipsw` or
-//! `--fetch`), every damaged or missing restore bundle and a damaged install
+//! choices, and, from the active build's restore image (`--ipsw` or a
+//! download), every damaged or missing restore bundle and a damaged install
 //! medium; with an image it prepares every restore bundle of the active
 //! build again, with each machine's own ECID, and gives an install without
 //! one its ECID (`machines::machine_ecid`). It removes the bundles and media
 //! of other builds and generations that an interrupted update left. A
-//! missing or foreign `stela.efi` is `update stela`'s to replace: no copy of
+//! missing or foreign `stela.efi` is `update`'s to replace: no copy of
 //! it is kept. With `--initialize-nor` it replaces machine state `stela.efi`
 //! would refuse (`installed::reinitialize`), blanking a foreign SEP area
 //! only for a machine that never booted. It adds the pinned firmware the
@@ -423,7 +423,7 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
                     (false, _) => "DAMAGED",
                     (true, true) => "intact",
                     // Its bytes are read only by an install, or by
-                    // `repair --verify`.
+                    // `repair --full`.
                     (true, false) => "complete; every block is checked as the install reads it",
                 }
             ),
@@ -524,7 +524,7 @@ fn install_status(
     match install.ecid {
         Some(ecid) => report.line("ECID", ecid),
         None => {
-            let fix = report.fix("repair --fetch");
+            let fix = report.fix("repair");
             report.problem(format!(
                 "install \"{}\" has no ECID (an older setup made it): {fix}, with --ecid or \
                  --new-ecid when its SEP state is provisioned",

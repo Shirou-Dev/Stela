@@ -1022,7 +1022,7 @@ impl Request {
             }
             Err(error) => return Err(error),
         };
-        // A maintenance `--fetch` downloads the image of the model the setup
+        // A maintenance download fetches the image of the model the setup
         // presents.
         self.model.get_or_insert_with(|| record.model.clone());
         // A USB that holds the whole macOS image keeps holding it: its
@@ -1200,7 +1200,7 @@ impl Request {
         if let Some(model) = &self.model {
             check_model(environment.models, model)?;
         }
-        // A first setup that was interrupted is resumed by `setup`, not
+        // A first setup that was interrupted is finished by `repair`, not
         // added to.
         let configured = locate_esp(environment.host, &self.usb).is_ok_and(|esp| {
             esp.join(RECORD).is_file()
@@ -1212,8 +1212,8 @@ impl Request {
                 "--wifi goes with a new setup; {} changes an existing one's",
                 fix(&self.usb, "settings --wifi SSID")
             );
-            // Every install restores the active build, which `--fetch`
-            // downloads.
+            // Every install restores the active build, which is
+            // downloaded when no --ipsw names it.
             if let Ok(record) = read_record(environment, &self.usb) {
                 self.build = record.build;
             }
@@ -1283,7 +1283,7 @@ impl Request {
                 )
             }
             (None, true) => fetch(self),
-            _ => bail!("pass --ipsw IPSW, or --fetch to download macOS 27 from Apple"),
+            _ => bail!("pass --ipsw FILE"),
         }
     }
 }

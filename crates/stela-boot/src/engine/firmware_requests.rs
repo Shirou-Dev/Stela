@@ -2,7 +2,7 @@
 //! USB lacks, the boot log names each such file once and then holds the
 //! boot's complete request inventory on one line
 //! (`stela_loader::host_firmware::requirements::LOG_LINE`), which
-//! `stela setup repair` and `update stela` read to add the pinned files.
+//! `stela repair` and `stela update` read to add the pinned files.
 //! The device that needed the file stays off, as its driver reports.
 use crate::output;
 use alloc::boxed::Box;

@@ -3448,7 +3448,7 @@ fn medium_pieces(f: &Fixture) -> Vec<PathBuf> {
     pieces
 }
 
-/// Run the interrupted setup again as `stela setup` run again does: no
+/// Run the interrupted setup again as `stela repair` does: no
 /// installer choice, which comes from the record.
 fn resume_setup(f: &Fixture) -> String {
     let mut again = installed_command(f);
@@ -3867,6 +3867,8 @@ fn repair_restores_recorded_state() {
     write_record(&f.esp, &old).unwrap();
     let error = status().unwrap_err().to_string();
     assert!(error.contains("has no ECID"), "{error}");
+    assert!(error.contains("`stela repair`"), "{error}");
+    assert!(!error.contains("--fetch"), "{error}");
     rerun(&f, |c| {
         c.action = Action::Repair;
         c.ipsw = Some(f.ipsw.clone());

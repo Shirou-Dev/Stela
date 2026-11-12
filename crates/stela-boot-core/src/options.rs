@@ -1,6 +1,6 @@
 //! `stela.cfg`'s system-mode options: one typed record, the one parser
 //! `stela.efi`'s loader and engine read it with, and the one serializer
-//! `stela setup` writes it with. The option line is whitespace-separated
+//! `stela` writes it with. The option line is whitespace-separated
 //! words starting with `--system`; each option is a flag or a flag and one
 //! value. The spellings are part of the setup/mount contract
 //! (`stela_loader::mount_interface::OPTIONS_REVISION`).
@@ -723,7 +723,7 @@ impl fmt::Display for Hex {
     }
 }
 
-/// An ECID as 16 hexadecimal digits, as `stela setup` prints it.
+/// An ECID as 16 hexadecimal digits, as `stela` prints it.
 struct Ecid(u64);
 
 impl fmt::Display for Ecid {

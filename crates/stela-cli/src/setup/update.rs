@@ -12,7 +12,7 @@
 //!   (`stela_loader::boot_bundle::REVISION`) than theirs, the update prepares
 //!   the active build's restore bundles for every machine again (while the
 //!   setup has the build's install medium) at the new schema and revision,
-//!   from `--ipsw` or `--fetch`; this makes it an update even with the same
+//!   from `--ipsw` or a download; this makes it an update even with the same
 //!   `stela.efi`. The cache store's spare is prepared before activating it:
 //!   its new translator takes that spare. Repeating an already-installed
 //!   update replenishes a consumed spare without replacing EFI or boot
@@ -102,7 +102,7 @@ pub(super) fn ready(record: &Record, usb: &Path) -> Result<()> {
 
 /// Image sources and write policy for a Stela update.
 pub(super) struct UpdateOptions<'a> {
-    /// The USB, as `--usb` named it.
+    /// The stick, as STICK named it.
     pub(super) usb: &'a Path,
     pub(super) image_path: &'a Path,
     pub(super) ipsw: Option<&'a Path>,
@@ -493,7 +493,7 @@ pub(super) struct OsOptions<'a> {
     pub(super) usb: &'a Path,
     /// The new build's image; its build is the new one.
     pub(super) ipsw: Option<&'a Path>,
-    /// The new build without `ipsw` (`--build`).
+    /// The new build without `ipsw` (`--macos`).
     pub(super) build: &'a str,
     pub(super) download_dir: Option<&'a Path>,
     pub(super) dry_run: bool,

@@ -203,7 +203,7 @@ impl core::fmt::Write for EarlyText {
     }
 }
 
-/// What this build reads, for `stela setup` to check before installing it
+/// What this build reads, for `stela` to check before installing it
 /// (`stela_loader::mount_interface`).
 #[used]
 static MOUNT_INTERFACE: [u8; stela_loader::mount_interface::MARKER_BYTES] =

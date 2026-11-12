@@ -4,7 +4,7 @@
 //! file, beside `\EFI\stela\stela.cfg` (the mount options) and
 //! `\EFI\stela\source.bin` (the system-mode guest image, when the run has
 //! one), and boots it with QEMU's edk2 firmware, as a PC's firmware boots the
-//! USB `stela setup` prepares. By default the guest is Stela's system-mode
+//! USB `stela create` prepares. By default the guest is Stela's system-mode
 //! test kernel.
 //!
 //! `--payload` runs install mode on a synthetic IPSW (no Apple bytes) split
@@ -190,7 +190,7 @@ pub struct Run {
     /// Have the restore host refuse a payload without recorded block
     /// hashes, which it would read whole before StartRestore: adds the
     /// mount's `--verify-on-read`. A USB image carries it in its install
-    /// entry (`stela setup --verify-on-read`).
+    /// entry (`stela create --verify-on-read`).
     #[arg(long, requires = "bundle")]
     verify_on_read: bool,
     /// Use QEMU's directory-backed FAT16 for a bundle that fits its
@@ -800,7 +800,7 @@ fn launch(arguments: Run) -> Result<ExitCode> {
             output: &paths.output,
         },
     )?;
-    // A USB image carries the boot bundle that `stela setup` wrote.
+    // A USB image carries the boot bundle that `stela` wrote.
     let bundle = arguments.bundle.is_some() || preboot.is_some() || arguments.usb_image.is_some();
     // QEMU numbers PCI devices in the order they are given, so the parts
     // attach theirs in a fixed order.

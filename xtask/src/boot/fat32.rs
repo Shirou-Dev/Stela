@@ -2,7 +2,7 @@
 //! directly so every host can make the boot volume of a large bundle.
 //!
 //! The volume's layout, boot sector and FSInfo are the shared encoder's
-//! (`stela_runtime::pc::fat32::format`), as `stela setup` writes them. The
+//! (`stela_runtime::pc::fat32::format`), as `stela` writes them. The
 //! root directory takes the first clusters; every directory and file then
 //! gets one contiguous chain, in tree order. Names that are not upper-case
 //! 8.3 carry long-name entries.

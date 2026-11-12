@@ -1,4 +1,4 @@
-//! `stela.efi`'s persistent translation store: the pack file `stela setup`
+//! `stela.efi`'s persistent translation store: the pack file `stela`
 //! makes room for in `stela/store` on the boot USB's FAT32 data partition.
 //!
 //! The file is a journal (`stela_formats::journal`) of pack segments and of
@@ -63,7 +63,7 @@ use uefi::{
 /// The handoff file holding the store's placement and what was read of its
 /// pack file.
 pub const FILE: &str = "translations";
-/// The store's directory on its volume, and `stela setup`'s bound there.
+/// The store's directory on its volume, and `stela`'s bound there.
 pub(super) const DIRECTORY: &str = "stela\\store";
 const CONFIG: &str = "store.cfg";
 const BYTES_KEY: &str = "bytes";
@@ -72,7 +72,7 @@ const CONFIG_LIMIT: usize = 256;
 /// name the FAT32 reader finds.
 const NAME_BYTES: usize = 4;
 const PACK_EXTENSION: &str = "pak";
-/// A blank, preallocated pack file `stela setup` keeps beside the packs: a
+/// A blank, preallocated pack file `stela` keeps beside the packs: a
 /// new translator's pack takes it by rename. The boot never grows a file,
 /// which the firmware does by writing every byte.
 const SPARE: &str = "spare.bin";
@@ -224,7 +224,7 @@ pub fn read(budget: u64) -> Option<Opened> {
         let Ok(mut root) = volume.open_volume() else {
             continue;
         };
-        // The file's size, which `stela setup` allocated.
+        // The file's size, which `stela` allocated.
         let Some(bound) = bound(&mut root) else {
             continue;
         };

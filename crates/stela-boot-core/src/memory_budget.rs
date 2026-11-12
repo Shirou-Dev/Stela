@@ -5,7 +5,7 @@ const MIB: u64 = 1024 * 1024;
 const MINIMUM: u64 = 16 * MIB;
 const MAXIMUM: u64 = 384 * MIB;
 
-/// The persistent translation pack file `stela setup` allocates by default:
+/// The persistent translation pack file `stela` allocates by default:
 /// the store's room on the USB. The boot reads and writes at most what the
 /// PC's RAM leaves it (`host_memory::pack_budget`), which may be less.
 pub const DEFAULT_TRANSLATION_PACK_BYTES: u64 = 1024 * MIB;
