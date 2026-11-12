@@ -818,7 +818,7 @@ fn older_setups_are_still_read_and_undone() {
         .to_string();
     assert!(error.contains("schema 7 setup"), "{error}");
     assert!(error.contains("recoveryOS bundle"), "{error}");
-    assert!(error.contains("stela setup uninstall"), "{error}");
+    assert!(error.contains("Start over with `stela create`"), "{error}");
     let error = rerun(&f, |c| c.action = Action::Status)
         .unwrap_err()
         .to_string();
@@ -2954,17 +2954,13 @@ fn an_interrupted_copy_replacement_is_named_and_finished_by_the_same_update() {
         .to_string();
     assert!(status.contains("cannot install macOS"), "{status}");
     assert!(
-        status.contains("update os --build STELA2 --usb"),
+        status.contains(&format!("{} finishes it", fix(&f.esp, "repair"))),
         "{status}"
     );
-    assert!(!status.contains("repair --usb"), "{status}");
-    let repair = rerun(&f, |c| c.action = Action::Repair)
-        .unwrap_err()
-        .to_string();
-    assert!(repair.contains("update os --build STELA2"), "{repair}");
-    os_update(&f, &newer)
-        .dispatch(&environment(&f.host))
-        .unwrap();
+    // Repair goes on with the switch, asking nothing: the old copy is gone.
+    let mut repair = os_update(&f, &newer);
+    repair.action = Action::Repair;
+    repair.dispatch(&environment(&f.host)).unwrap();
     let finished = record(&f);
     assert_eq!(
         (finished.build.as_str(), finished.replacing.as_deref()),
@@ -3275,10 +3271,10 @@ fn interrupted_first_setup_resumes_keeping_intact_files() {
     let status = rerun(&f, |c| c.action = Action::Status)
         .unwrap_err()
         .to_string();
-    assert!(status.contains("was interrupted. To finish it"), "{status}");
+    assert!(status.contains("was interrupted: "), "{status}");
     // The parts it had not written are named as its, not as other fixes.
     assert!(status.contains("1 problem:"), "{status}");
-    assert!(!status.contains("setup repair"), "{status}");
+    assert_eq!(status.matches("repair").count(), 1, "{status}");
     // The same command resumes it: a dry run changes nothing.
     let mut dry = installed_command(&f);
     dry.dry_run = true;
@@ -3328,7 +3324,7 @@ fn interrupted_first_setup_of_another_build_or_target_is_refused() {
     );
     assert!(error.contains("this one STELA2"), "{error}");
     assert!(error.contains("target"), "{error}");
-    assert!(error.contains("stela setup uninstall"), "{error}");
+    assert!(error.contains("start over with `stela create`"), "{error}");
     let mut renamed = installed_command(&f);
     renamed.install = Some("Other".into());
     let error = setup(&environment(&f.host), renamed)
@@ -4932,31 +4928,29 @@ fn interrupted_first_setup_status_names_the_command_that_finishes_it() {
         "{}",
         reported.summary
     );
-    let usb = f.esp.display();
-    assert!(
-        reported
-            .report
-            .contains("To finish it, run it again: `stela setup --build STELA1 ")
-            && reported
-                .report
-                .contains(&format!("--target {REGION} --nor {NOR} --usb {usb}`")),
-        "{}",
-        reported.report
-    );
+    let finish = format!("{} finishes it", fix(&f.esp, "repair"));
+    assert!(reported.report.contains(&finish), "{}", reported.report);
     assert!(!reported.report.contains("then set up again"));
     assert_hints_name_the_usb(&reported.report);
     let (report, result) = split_report(Err(error));
     assert!(report.contains("was interrupted"), "{report}");
     let summary = result.unwrap_err().to_string();
     assert!(!summary.contains("was interrupted"), "{summary}");
-    // Update and configure name the same fix.
-    for action in [(|| Action::UpdateStela) as fn() -> Action, || {
-        Action::Repair
-    }] {
-        let refusal = rerun(&f, |c| c.action = action()).unwrap_err().to_string();
-        assert!(refusal.contains("To finish it, run it again"), "{refusal}");
-        assert_hints_name_the_usb(&refusal);
-    }
+    // Update names the same fix, and repair finishes the setup as it
+    // began: its build, model, target and machine state partition.
+    let refusal = rerun(&f, |c| c.action = Action::UpdateStela)
+        .unwrap_err()
+        .to_string();
+    assert!(refusal.contains(&finish), "{refusal}");
+    rerun(&f, |c| {
+        c.action = Action::Repair;
+        c.ipsw = Some(f.ipsw.clone());
+    })
+    .unwrap();
+    let finished = record(&f);
+    assert!(finished.complete);
+    assert_eq!(finished.installs[0].disk.apple_region, REGION);
+    rerun(&f, |c| c.action = Action::Status).unwrap();
 }
 
 #[test]
@@ -5170,7 +5164,7 @@ fn the_wizard_resumes_an_interrupted_setup_on_the_chosen_usb() {
     let mut command = command(&f, Path::new("disk5"));
     command.ipsw = None;
     command.install_image = Some(InstallImage::Network);
-    wizard::resume(&mut command, esp, &found);
+    command.resume_from(esp, &found);
     assert_eq!(command.usb, f.esp);
     assert!(command.fetch);
     // The full installer it was making goes on.
@@ -5636,7 +5630,7 @@ fn setup_boot_log_reads_the_usb_raw_when_its_folder_cannot_be_read() {
         "{:#}",
         rerun(&f, |c| c.action = Action::BootLog).unwrap_err()
     );
-    assert!(error.contains("has no setup"), "{error}");
+    assert!(error.contains("holds no Stela setup"), "{error}");
     assert!(error.contains("nor does Disk disk5"), "{error}");
 }
 
@@ -5813,4 +5807,43 @@ fn an_older_stela_asks_before_it_changes_a_newer_stick_and_a_no_changes_nothing(
     })
     .unwrap();
     assert_eq!(record(&f).release.as_deref(), Some(release::CURRENT));
+}
+
+#[test]
+fn repair_finishes_an_interrupted_create_with_its_wifi_and_asks_nothing() {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    let passphrase = f._dir.path().join("passphrase");
+    fs::write(&passphrase, "correct horse").unwrap();
+    let mut online = command(&f, &f.esp);
+    online.install_image = Some(InstallImage::Network);
+    online.wifi = Some("Home".into());
+    online.wifi_passphrase_file = Some(passphrase);
+    setup(&environment(&f.host), online).unwrap();
+    let mut stopped = record(&f);
+    stopped.complete = false;
+    write_record(&f.esp, &stopped).unwrap();
+    for path in [efi::LOADER, efi::OPTIONS, CHOICES_PATH] {
+        fs::remove_file(f.esp.join(path)).unwrap();
+    }
+    // No terminal and no passphrase file: the key the create wrote serves.
+    let report = rerun(&f, |c| {
+        c.action = Action::Repair;
+        c.ipsw = Some(f.ipsw.clone());
+    })
+    .unwrap();
+    assert!(
+        report.contains("continuing the Online installer"),
+        "{report}"
+    );
+    let finished = record(&f);
+    assert!(finished.complete);
+    assert_eq!(finished.wifi.unwrap().ssid, "Home");
+    assert_eq!(
+        fs::read_to_string(f.esp.join(wifi::KEY_PATH))
+            .unwrap()
+            .trim(),
+        "correct horse"
+    );
+    rerun(&f, |c| c.action = Action::Status).unwrap();
 }

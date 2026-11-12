@@ -476,11 +476,10 @@ impl Resume {
         if !differences.is_empty() {
             bail!(
                 "{} holds an interrupted setup that differs from this one: {}. Finish it with {}, \
-                 or remove it with {} first",
+                 or start over with `stela create` on the stick's whole disk, which erases it",
                 previous.esp.display(),
                 differences.join(", "),
-                super::rerun(previous, &command.usb),
-                super::fix(&command.usb, "uninstall")
+                super::fix(&command.usb, "repair")
             );
         }
         // Every restore bundle intact and current, or all prepared again.

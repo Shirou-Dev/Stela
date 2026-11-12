@@ -359,7 +359,7 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
         report.problem(format!(
             "the update to macOS {next} stopped before its copy was complete, so this USB cannot \
              install macOS until it is: {} finishes it",
-            report.fix(&format!("update os --build {next}"))
+            report.fix("repair")
         ));
     } else if record.installs_media() && record.active_medium().is_none() {
         report.problem(format!(
@@ -779,7 +779,7 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     if let Some(next) = &record.replacing {
         bail!(
             "the update to macOS {next} stopped before its copy was complete: {} finishes it",
-            fix(usb, &format!("update os --build {next}"))
+            fix(usb, &format!("update --macos {next}"))
         );
     }
     let esp = record.esp.clone();

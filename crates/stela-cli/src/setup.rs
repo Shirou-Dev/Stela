@@ -182,64 +182,13 @@ fn quoted(word: &str) -> String {
     }
 }
 
-/// The command that finishes the interrupted first setup `record` describes:
-/// the same setup run again resumes it (`create::plan`).
-fn rerun(record: &Record, usb: &Path) -> String {
-    let mut words = String::new();
-    if record.build != builds::DEFAULT.build {
-        let _ = write!(words, " --build {}", record.build);
-    }
-    if record.model != PINNED_MODEL {
-        let _ = write!(words, " --model {}", record.model);
-    }
-    if let [install] = &record.installs[..] {
-        let disk = &install.disk;
-        if !disk.is_chosen() && !disk.external_disks {
-            let _ = write!(words, " --target {}", disk.apple_region);
-            if disk.machine_state_offset.is_none() {
-                let _ = write!(words, " --nor {}", disk.nor);
-            }
-        }
-        if install.name != machines::FIRST_NAME {
-            let _ = write!(words, " --install {}", quoted(&install.name));
-        }
-    }
-    if let Some(network) = &record.wifi {
-        let _ = write!(words, " --wifi {}", quoted(&network.ssid));
-        if let Some(country) = &network.country {
-            let _ = write!(words, " --wifi-country {country}");
-        }
-    }
-    if let Some(ipv4) = record.addresses.ipv4 {
-        let _ = write!(words, " --ipv4 {}/{}", ipv4.address, ipv4.prefix);
-        if let Some(gateway) = ipv4.gateway {
-            let _ = write!(words, " --ipv4-gateway {gateway}");
-        }
-    }
-    if !record.addresses.dns.is_empty() {
-        let servers: Vec<String> = record.addresses.dns.iter().map(|s| s.to_string()).collect();
-        let _ = write!(words, " --dns {}", servers.join(","));
-    }
-    for device in &record.usb4_approved {
-        let _ = write!(words, " --usb4-approve {device}");
-    }
-    if record.profile {
-        words.push_str(" --profile");
-    }
-    if record.verify_on_read {
-        words.push_str(" --verify-on-read");
-    }
-    fix(usb, words.trim_start())
-}
-
 /// What to do about an interrupted first setup on `usb`.
 fn interrupted_text(record: &Record, usb: &Path) -> String {
     format!(
-        "the first setup on {} was interrupted. To finish it, run it again: {} (add --ipsw FILE \
-         to use a local image). To start over: {}",
+        "the first setup on {} was interrupted: {} finishes it (add --ipsw FILE to use a local \
+         image). To start over, make a new installer on the stick with `stela create`",
         record.esp.display(),
-        rerun(record, usb),
-        fix(usb, "uninstall")
+        fix(usb, "repair")
     )
 }
 
@@ -977,6 +926,17 @@ impl Request {
             self.build = record.build.clone();
         }
         match action {
+            // An interrupted first setup is finished as it began.
+            Action::Repair if !record.complete => self.finish_create(environment, &record),
+            // A macOS switch that removed the old copy for room goes on.
+            Action::Repair if record.replacing.is_some() => Request {
+                action: Action::UpdateOs,
+                build: record.replacing.clone().unwrap_or_default(),
+                // The old copy is gone already: nothing is left to ask about.
+                yes: true,
+                ..self
+            }
+            .dispatch(environment),
             Action::Repair => doctor::repair(environment, &self),
             Action::ResetNvram => state::reset_nvram(environment, &record, &self),
             Action::BackupState(path) => state::backup(environment, &record, &self, &path),
@@ -1043,6 +1003,63 @@ impl Request {
                 unreachable!("these run without the setup record")
             }
         }
+    }
+
+    /// Finish the interrupted first setup `record` describes, as it began:
+    /// its build, model, installer, disk and network, and the pieces and
+    /// bundles it wrote that are intact (`create::plan`).
+    fn finish_create(mut self, environment: &Environment<'_>, record: &Record) -> Result<String> {
+        let esp = record.esp.clone();
+        self.resume_from(esp.clone(), record);
+        // The passphrase an interrupted setup wrote already, or else the
+        // one a file or the terminal gives.
+        let key = esp.join(wifi::KEY_PATH);
+        if self.wifi.is_some() && self.wifi_passphrase_file.is_none() && key.is_file() {
+            self.wifi_passphrase = Some(wifi::read_passphrase(&key)?);
+        }
+        self.action = Action::Create;
+        self.create(environment)
+    }
+
+    /// Make this request the interrupted setup `record` describes, on its
+    /// EFI partition `esp`, so it resumes instead of erasing the stick
+    /// again. A local IPSW given stays; otherwise the recorded build is
+    /// downloaded.
+    fn resume_from(&mut self, esp: PathBuf, record: &Record) {
+        self.usb = esp;
+        self.build = record.build.clone();
+        self.model = Some(record.model.clone());
+        // The installer the stopped setup was making: a full one goes on
+        // from the pieces already on the stick.
+        self.install_image = Some(record.install_kind());
+        self.fetch = self.ipsw.is_none();
+        if let [install] = &record.installs[..] {
+            self.install = Some(install.name.clone());
+            let disk = &install.disk;
+            if !disk.is_chosen() && !disk.external_disks {
+                self.target = Some(disk.apple_region.clone());
+                if disk.machine_state_offset.is_none() {
+                    self.nor = Some(disk.nor.clone());
+                }
+            }
+        }
+        self.wifi = record.wifi.as_ref().map(|network| network.ssid.clone());
+        self.wifi_country = record
+            .wifi
+            .as_ref()
+            .and_then(|network| network.country.clone());
+        self.ipv4 = record
+            .addresses
+            .ipv4
+            .map(|ipv4| stela_boot_core::options::StaticIpv4 {
+                address: ipv4.address,
+                prefix: ipv4.prefix,
+            });
+        self.ipv4_gateway = record.addresses.ipv4.and_then(|ipv4| ipv4.gateway);
+        self.dns = (!record.addresses.dns.is_empty()).then(|| record.addresses.dns.clone());
+        self.usb4_approve = record.usb4_approved.clone();
+        self.profile = record.profile;
+        self.verify_on_read = record.verify_on_read;
     }
 
     /// Create a setup, or add an install (`--target`) to an existing one.

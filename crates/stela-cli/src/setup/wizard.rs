@@ -144,39 +144,6 @@ pub(super) fn interrupted(host: &dyn Host, usb: &Disk) -> Option<(PathBuf, Recor
     Some((esp, record))
 }
 
-/// Make `command` the interrupted setup `record` describes, on its EFI
-/// partition `esp`, so it resumes instead of erasing the USB again. A local
-/// IPSW given on the command line stays; otherwise setup downloads the
-/// recorded build.
-pub(super) fn resume(command: &mut Request, esp: PathBuf, record: &Record) {
-    command.usb = esp;
-    command.build = record.build.clone();
-    command.model = Some(record.model.clone());
-    // The installer the stopped setup was making: a full one goes on from
-    // the pieces already on the USB (`stela setup` run again does the same).
-    command.install_image = Some(record.install_kind());
-    if command.ipsw.is_none() {
-        command.fetch = true;
-    }
-    command.install = record.installs.first().map(|install| install.name.clone());
-    command.wifi = record.wifi.as_ref().map(|network| network.ssid.clone());
-    command.wifi_country = record
-        .wifi
-        .as_ref()
-        .and_then(|network| network.country.clone());
-    command.ipv4 = record
-        .addresses
-        .ipv4
-        .map(|ipv4| stela_boot_core::options::StaticIpv4 {
-            address: ipv4.address,
-            prefix: ipv4.prefix,
-        });
-    command.ipv4_gateway = record.addresses.ipv4.and_then(|ipv4| ipv4.gateway);
-    command.dns = (!record.addresses.dns.is_empty()).then(|| record.addresses.dns.clone());
-    command.usb4_approve = record.usb4_approved.clone();
-    command.profile = record.profile;
-}
-
 fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
     cliclack::set_theme(theme::Stela);
     crate::progress::follow(theme::rail());
@@ -253,7 +220,7 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
                 .initial_value(0)
                 .interact()?;
             if choice == 0 {
-                resume(command, esp, &record);
+                command.resume_from(esp, &record);
                 if command.wifi.is_some() {
                     cliclack::log::warning("The passphrase is stored in plaintext on the USB.")?;
                     let ssid = command.wifi.clone().unwrap_or_default();
