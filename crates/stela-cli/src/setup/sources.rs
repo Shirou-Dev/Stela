@@ -109,6 +109,14 @@ impl Source {
     }
 }
 
+/// The bytes `source` downloads from Apple: none from a file.
+pub(super) fn download_bytes(source: &Source) -> u64 {
+    match source {
+        Source::Remote { boot, pieces, .. } => boot + pieces,
+        _ => 0,
+    }
+}
+
 /// Refuse, before anything is downloaded, a USB without room for the whole
 /// image of `build` from `source` as an install medium beside what it
 /// keeps.

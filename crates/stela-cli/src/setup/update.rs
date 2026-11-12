@@ -436,7 +436,7 @@ fn room_for_new_copy(
     record: &Record,
     build: &str,
     source: &super::sources::Source,
-    dry_run: bool,
+    (dry_run, yes): (bool, bool),
     text: &mut String,
 ) -> Result<Option<super::medium::Medium>> {
     let Err(error) = super::sources::check_room(environment, record, build, source) else {
@@ -470,25 +470,22 @@ fn room_for_new_copy(
         return Ok(Some(old));
     }
     let question = format!(
-        "This USB has room for one copy of macOS only. Updating to macOS {build} first removes \
-         macOS {from}'s copy ({}, {size}). Until the new copy is complete, this USB cannot \
-         install macOS; a macOS already installed keeps starting, and running this update again \
-         continues it. Remove macOS {from}'s copy and continue?",
+        "This stick has room for one copy of macOS only. Switching to macOS {build} first removes \
+         macOS {from}'s copy ({}, {size}). Until the new copy is complete, this stick cannot \
+         install macOS; a macOS already installed keeps starting, and `stela repair` continues \
+         the switch. Remove macOS {from}'s copy and continue?",
         directory.display()
     );
-    match environment
-        .ui
-        .interactive()
-        .then(|| environment.ui.confirm(&question))
-        .transpose()?
-    {
-        Some(true) => Ok(Some(old)),
-        Some(false) => bail!("macOS {from}'s copy was kept, and nothing was changed"),
-        None => bail!(
-            "{error:#} Or run this on a terminal: it offers to remove macOS {from}'s copy ({size}) \
-             first, which makes room."
+    super::consent(
+        environment,
+        yes,
+        &question,
+        &format!(
+            "{error:#} The stick has room for one copy of macOS: switching to macOS {build} first \
+             removes macOS {from}'s copy ({size})"
         ),
-    }
+    )?;
+    Ok(Some(old))
 }
 
 /// Image source and write policy for a macOS update.
@@ -500,6 +497,8 @@ pub(super) struct OsOptions<'a> {
     pub(super) build: &'a str,
     pub(super) download_dir: Option<&'a Path>,
     pub(super) dry_run: bool,
+    /// `--yes`: remove the old copy for room without asking.
+    pub(super) yes: bool,
 }
 
 /// Add the new build's install medium and every machine's restore bundles,
@@ -515,6 +514,7 @@ pub(super) fn update_os(
         build,
         download_dir,
         dry_run,
+        yes,
     } = options;
     // Everything that can refuse the update comes before any download.
     check_bundle_revision(environment, &record)?;
@@ -588,11 +588,26 @@ pub(super) fn update_os(
     // the user agrees: it cannot install macOS until the new copy is
     // complete.
     let replace = match need {
-        super::sources::Need::WholeImage | super::sources::Need::Pieces => {
-            room_for_new_copy(environment, &record, &build, &source, dry_run, &mut text)?
-        }
+        super::sources::Need::WholeImage | super::sources::Need::Pieces => room_for_new_copy(
+            environment,
+            &record,
+            &build,
+            &source,
+            (dry_run, yes),
+            &mut text,
+        )?,
         super::sources::Need::BootFiles => None,
     };
+    // `--macos` names the download, so only a terminal run asks first.
+    if !dry_run {
+        super::consent_download(
+            environment,
+            yes,
+            true,
+            super::sources::download_bytes(&source),
+            &format!("macOS {build}"),
+        )?;
+    }
     // A dry run reads and downloads nothing to prepare its plan, and plans
     // no copy that needs the old one's room.
     let obtained = match dry_run && (!source.is_local() || replace.is_some()) {

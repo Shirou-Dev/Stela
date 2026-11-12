@@ -192,6 +192,33 @@ fn interrupted_text(record: &Record, usb: &Path) -> String {
     )
 }
 
+/// The download above which a run asks first: the macOS image or its
+/// pieces ask, boot files and firmware do not.
+const LARGE_DOWNLOAD: u64 = 1_000_000_000;
+
+/// Before downloading `bytes` (`what`): ask on a terminal when it is more
+/// than [`LARGE_DOWNLOAD`]. Without a terminal, a command that names the
+/// download (`named`, such as `update --macos`) has consented by naming
+/// it; any other needs `--yes`.
+fn consent_download(
+    environment: &Environment<'_>,
+    yes: bool,
+    named: bool,
+    bytes: u64,
+    what: &str,
+) -> Result<()> {
+    if bytes <= LARGE_DOWNLOAD || (named && !environment.ui.interactive()) {
+        return Ok(());
+    }
+    let size = host::size_text(bytes);
+    consent(
+        environment,
+        yes,
+        &format!("This downloads {size} from Apple: {what}. Download it?"),
+        &format!("this downloads {size} from Apple: {what}"),
+    )
+}
+
 /// Before an effect a terminal run asks about (`question`): accept it with
 /// `--yes` (`yes`), ask on a terminal, and otherwise refuse with `refusal`,
 /// naming `--yes`. Declining changes nothing. Erasing a disk never comes
@@ -891,6 +918,7 @@ impl Request {
                 build: &self.build,
                 download_dir: self.download_dir.as_deref(),
                 dry_run: self.dry_run,
+                yes: self.yes,
             },
         )
     }

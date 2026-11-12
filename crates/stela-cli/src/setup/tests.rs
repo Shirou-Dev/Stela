@@ -2890,8 +2890,8 @@ fn os_update_with_room_for_one_copy_replaces_it_only_after_asking() {
             .dispatch(&environment(&f.host))
             .unwrap_err()
     );
-    assert!(error.contains("on a terminal"), "{error}");
-    assert!(error.contains("free"), "{error}");
+    assert!(error.contains("Add --yes"), "{error}");
+    assert!(error.contains("room for one copy"), "{error}");
     // A dry run says it would ask, and asks nothing.
     let never = ui::tests::Scripted::new(&[]);
     let mut dry = os_update(&f, &newer);
@@ -2914,7 +2914,7 @@ fn os_update_with_room_for_one_copy_replaces_it_only_after_asking() {
         })
         .unwrap_err()
         .to_string();
-    assert!(error.contains("was kept"), "{error}");
+    assert_eq!(error, "nothing was changed");
     let asked = no.transcript();
     assert!(asked.contains("cannot install macOS"), "{asked}");
     assert!(asked.contains("keeps starting"), "{asked}");
@@ -5846,4 +5846,57 @@ fn repair_finishes_an_interrupted_create_with_its_wifi_and_asks_nothing() {
         "correct horse"
     );
     rerun(&f, |c| c.action = Action::Status).unwrap();
+}
+
+#[test]
+fn repair_asks_before_downloading_more_than_a_gigabyte_and_a_no_changes_nothing() {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    let medium = record(&f).active_medium().cloned().unwrap();
+    let first = medium
+        .directory()
+        .join(stela_formats::payload::piece_name(0));
+    let piece = fs::read(&first).unwrap();
+    fs::write(&first, &piece[1..]).unwrap();
+    // Apple's image is 3 GB: most of it is missing from the stick.
+    let size = |_: &str, _: &str| -> Result<(u64, u64)> { Ok((1_000_000, 3_000_000_000)) };
+    let fetch = |_: &Path, _: &str, _: &str, need: sources::Need| -> Result<sources::Fetched> {
+        anyhow::bail!("asked for {need:?}")
+    };
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    let repair = |ui: &dyn ui::Ui, yes: bool| {
+        let mut request = update_request(&f, &f._dir.path().join("cache"));
+        request.action = Action::Repair;
+        request.yes = yes;
+        request.dispatch(&Environment {
+            image_size: &size,
+            fetch_image: &fetch,
+            ui,
+            ..environment(&f.host)
+        })
+    };
+    // Without a terminal: refused before anything changes, naming --yes.
+    let error = repair(&ui::NoTerminal, false).unwrap_err().to_string();
+    assert!(
+        error.contains("this downloads") && error.contains("Add --yes"),
+        "{error}"
+    );
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+    // Asked on a terminal, saying the size; a no changes nothing.
+    let no = ui::tests::Scripted::new(&["no"]);
+    let error = repair(&no, false).unwrap_err().to_string();
+    assert_eq!(error, "nothing was changed");
+    assert!(
+        no.transcript().contains("from Apple"),
+        "{}",
+        no.transcript()
+    );
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+    // A yes, or --yes, goes on to the download.
+    let yes = ui::tests::Scripted::new(&["yes"]);
+    let error = repair(&yes, false).unwrap_err().to_string();
+    assert!(error.contains("asked for Pieces"), "{error}");
+    let error = repair(&ui::NoTerminal, true).unwrap_err().to_string();
+    assert!(error.contains("asked for Pieces"), "{error}");
 }

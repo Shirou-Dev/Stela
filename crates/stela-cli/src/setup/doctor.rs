@@ -897,6 +897,15 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
             if need.whole() {
                 sources::check_room(environment, &record, &build, &source)?;
             }
+            if !command.dry_run {
+                super::consent_download(
+                    environment,
+                    command.yes,
+                    false,
+                    sources::download_bytes(&source),
+                    &format!("what this stick lacks of macOS {build}"),
+                )?;
+            }
             Some(source)
         }
     };
