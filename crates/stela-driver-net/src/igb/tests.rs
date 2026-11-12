@@ -882,7 +882,7 @@ fn full_transmit_ring_refuses_overwrite_and_recovers_only_completed_slots() {
     let buffers: Vec<Vec<u8>> = (0..DESCRIPTORS)
         .map(|index| fixture.net.transmit.buffer(index).to_vec())
         .collect();
-    assert!(fixture.net.transmit(&[8; 60]).is_err());
+    assert_eq!(fixture.net.transmit(&[8; 60]), Err(LinkError::Busy));
     assert_eq!(fixture.net.transmit.descriptors.bytes(), descriptors);
     for (index, buffer) in buffers.iter().enumerate() {
         assert_eq!(fixture.net.transmit.buffer(index), &buffer[..]);

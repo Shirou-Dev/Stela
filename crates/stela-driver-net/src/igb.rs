@@ -343,11 +343,8 @@ impl Link for Igb {
         if !self.watchdog()? {
             return Err(LinkError::NoCarrier);
         }
-        if !self.transmit.free(self.clock.nominal(), transmitted) {
-            return Err(LinkError::Adapter(format!(
-                "{} transmit ring stalled",
-                self.location
-            )));
+        if !self.transmit.free(transmitted) {
+            return Err(LinkError::Busy);
         }
         advanced::queue_frame(&mut self.transmit, frame, frame.len().max(MIN_FRAME));
         self.device.write32(TDT, self.transmit.next as u32);

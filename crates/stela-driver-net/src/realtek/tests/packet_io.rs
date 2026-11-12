@@ -87,6 +87,22 @@ fn transmit_without_carrier_is_refused_and_leaves_the_ring_untouched() {
     assert_eq!(registers[TX_POLL / 4], 0);
 }
 
+/// A descriptor the controller still owns makes the next send busy at once,
+/// and the ring is left as it was.
+#[test]
+fn a_descriptor_the_controller_still_owns_makes_a_send_busy() {
+    let mut registers = vec![0u32; 64];
+    let mut memory = vec![0u64; 262_144];
+    let mut net = modelled(&mut registers, &mut memory, false);
+    net.transmit.initialize(false);
+    net.transmit.transmit(&[1; 60]).unwrap();
+    let owned = net.transmit.descriptors.read::<u32>(0);
+    net.transmit.descriptors.write(DESCRIPTOR, owned); // the next slot, after the one sent
+    let descriptors = net.transmit.descriptors.bytes().to_vec();
+    assert_eq!(net.transmit.transmit(&[2; 60]), Err(LinkError::Busy));
+    assert_eq!(net.transmit.descriptors.bytes(), descriptors);
+}
+
 /// A dropped adapter closes its receive and asks for the MAC reset, as
 /// `rtl8169_down` does; one whose function left the bus reads all ones and
 /// gets no write.

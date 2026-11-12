@@ -31,15 +31,24 @@ pub enum Error {
     PciCapability(crate::bus::pci::CapabilityError),
     Pci(crate::block::BlockError),
     Unsupported(&'static str),
-    Timeout { register: usize },
+    Timeout {
+        register: usize,
+    },
     Removed,
-    Firmware { status: u32 },
+    Firmware {
+        status: u32,
+    },
     Dma(DmaError),
     Memory(MemoryError),
     Mapping(owned::Error),
-    Readback { register: usize, observed: u32 },
+    Readback {
+        register: usize,
+        observed: u32,
+    },
     RingHead(u32),
     Stopped,
+    /// The transmit ring is full; the frame was not taken.
+    Busy,
 }
 
 /// A plain account for the boot log and screen.
@@ -69,6 +78,7 @@ impl core::fmt::Display for Error {
             }
             Self::RingHead(_) => f.write_str("a descriptor ring head is out of range"),
             Self::Stopped => f.write_str("it is stopped"),
+            Self::Busy => f.write_str("its transmit ring is full"),
         }
     }
 }
@@ -538,17 +548,8 @@ impl<R: Registers, T: Timer, C: ConfigSpace> Aqtion<R, T, C> {
     fn send(&mut self, frame: &[u8]) -> Result<()> {
         self.tx_reap()?;
         let next = (self.tx_tail + 1) % COUNT;
-        for _ in 0..2000 {
-            if next != self.tx_head {
-                break;
-            }
-            self.hw().delay(100)?;
-            self.tx_reap()?;
-        }
         if next == self.tx_head {
-            return Err(Error::Timeout {
-                register: registers::TX_HEAD.address,
-            });
+            return Err(Error::Busy);
         }
         self.memory
             .as_mut()
@@ -605,7 +606,11 @@ impl<R: Registers, T: Timer, C: ConfigSpace> Link for Aqtion<R, T, C> {
             return Err(LinkError::NoCarrier);
         }
         self.send(frame)
-            .inspect_err(|_| self.state = State::Faulted)
+            .inspect_err(|error| {
+                if *error != Error::Busy {
+                    self.state = State::Faulted;
+                }
+            })
             .map_err(adapter)
     }
     fn receive(&mut self) -> core::result::Result<Option<Vec<u8>>, LinkError> {
@@ -628,6 +633,7 @@ fn adapter(error: Error) -> LinkError {
             LinkError::Pci(crate::block::BlockError::PciCapability(error))
         }
         Error::Pci(error) => LinkError::Pci(error),
+        Error::Busy => LinkError::Busy,
         error => LinkError::Adapter(format!("AQtion: {error:?}")),
     }
 }

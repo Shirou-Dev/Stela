@@ -1872,6 +1872,30 @@ fn firmware4_reset_store_uncertainty_and_flb_post_first_reset_abort_keep_ownersh
     assert_eq!(peer.reset_count.get(), 1);
 }
 #[test]
+fn a_full_transmit_ring_is_busy_at_once_and_keeps_the_adapter_running() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    for id in [0x07b1, 0x04c0] {
+        let (mut net, peer, _domain, _dropped) = setup(id);
+        net.start().unwrap();
+        if peer.profile.generation == Generation::Atlantic {
+            peer.set(0x370, 0x100);
+        } else {
+            peer.set(0x13014, 0x830);
+        }
+        peer.tx_delay.set(true);
+        for _ in 0..COUNT - 1 {
+            net.transmit(&[3; 60]).unwrap();
+        }
+        let waited = peer.elapsed.get();
+        assert_eq!(net.transmit(&[4; 60]), Err(LinkError::Busy));
+        assert_eq!(peer.elapsed.get(), waited);
+        assert_eq!(net.state(), State::Running);
+        assert!(net.carrier());
+    }
+}
+#[test]
 fn restart_after_delayed_traffic_drains_each_epoch_and_rebuilds_device_heads() {
     if crate::test_process::isolate_model() {
         return;

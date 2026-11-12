@@ -727,19 +727,8 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Link for Ethernet<R, D> {
             // waits for a link, as `e1000_watchdog_task` waits.
             return Err(LinkError::NoCarrier);
         }
-        let mut space = self.reclaim();
-        for _ in 0..1000 {
-            if space {
-                break;
-            }
-            self.controller
-                .phy
-                .wait_minimum(100)
-                .map_err(|fault| self.error(Error::from(fault)))?;
-            space = self.reclaim();
-        }
-        if !space {
-            return Err(self.error(Error::QueueStalled));
+        if !self.reclaim() {
+            return Err(LinkError::Busy);
         }
         let index = self.next_tx;
         let length = frame.len().max(MIN_FRAME);

@@ -3,7 +3,6 @@
 //! each, the next descriptor the driver fills and, for transmit, the oldest
 //! one the controller still owns.
 use crate::{
-    Clock,
     block::BlockError,
     bus::dma::{DmaAllocator, DmaBuffer},
 };
@@ -16,8 +15,6 @@ pub(crate) const DESCRIPTORS: usize = 256;
 pub(crate) const DESCRIPTOR: usize = 16;
 pub(crate) const BUFFER: usize = 2048;
 const PAGE: usize = 4096;
-/// How long a transmit waits for the controller to hand a descriptor back.
-const TRANSMIT_WAIT_US: u64 = 100_000;
 /// Receive descriptors handed back per tail write, as Linux's
 /// `E1000_RX_BUFFER_WRITE`: the tail is an MMIO write a hypervisor traps.
 pub(crate) const RECEIVE_BATCH: usize = 16;
@@ -134,9 +131,10 @@ impl Ring {
         (self.next + 1) % self.count != self.clean
     }
 
-    /// Wait up to the transmit bound for a free descriptor.
-    pub(crate) fn free(&mut self, clock: Clock, done: impl Fn(&DmaBuffer, usize) -> bool) -> bool {
-        self.reclaim(&done) || clock.wait(TRANSMIT_WAIT_US, || self.reclaim(&done))
+    /// Whether a descriptor is free once those the controller handed back
+    /// are taken; nothing waits for more.
+    pub(crate) fn free(&mut self, done: impl Fn(&DmaBuffer, usize) -> bool) -> bool {
+        self.reclaim(&done)
     }
 
     /// Receive descriptor `index` went back to the controller: the tail to

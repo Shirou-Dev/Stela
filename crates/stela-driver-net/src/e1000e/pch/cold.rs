@@ -117,7 +117,6 @@ pub enum Error {
     BlockedAfterReset,
     DescriptorFlushRequired,
     Dma(crate::block::BlockError),
-    QueueStalled,
     Stopped,
     Poisoned,
 }
@@ -184,7 +183,6 @@ impl core::fmt::Display for Error {
                 f.write_str("the firmware left its rings needing a flush")
             }
             Self::Dma(error) => write!(f, "its DMA memory failed ({error})"),
-            Self::QueueStalled => f.write_str("a queue stalled"),
             Self::Stopped => f.write_str("it is stopped"),
             Self::Poisoned => f.write_str("an earlier failure left it unusable"),
         }

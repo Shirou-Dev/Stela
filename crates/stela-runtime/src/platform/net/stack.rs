@@ -98,8 +98,13 @@ impl<L: Link> phy::TxToken for Tx<'_, L> {
                 return result;
             }
         }
-        if let Err(error) = self.link.transmit(frame) {
-            self.fault.get_or_insert(error);
+        // A full ring drops the frame, as a full queue would; the protocol
+        // retransmits it. Anything else is the link's fault.
+        match self.link.transmit(frame) {
+            Ok(()) | Err(LinkError::Busy) => {}
+            Err(error) => {
+                self.fault.get_or_insert(error);
+            }
         }
         result
     }

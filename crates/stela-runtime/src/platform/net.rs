@@ -163,6 +163,7 @@ impl From<LinkError> for NetError {
             LinkError::Adapter(why) => Self::Link(why),
             LinkError::Invalid(why) => Self::Invalid(why),
             LinkError::NoCarrier => Self::NoCarrier,
+            LinkError::Busy => Self::Link("transmit ring full".into()),
         }
     }
 }
@@ -246,6 +247,8 @@ mod pci_error_tests {
         assert!(adapter.retryable());
         assert_eq!(NetError::from(LinkError::NoCarrier), NetError::NoCarrier);
         assert!(NetError::NoCarrier.retryable());
+        // A full transmit ring is transient.
+        assert!(NetError::from(LinkError::Busy).retryable());
         assert_eq!(
             NetError::from(LinkError::Invalid("frame")),
             NetError::Invalid("frame")

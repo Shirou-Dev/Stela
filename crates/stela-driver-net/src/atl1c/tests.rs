@@ -646,7 +646,7 @@ fn transmit_fills_one_descriptor_per_frame_and_pads_short_frames() {
 }
 
 #[test]
-fn a_full_ring_waits_for_the_consumer_and_then_reports_a_stall() {
+fn a_full_ring_is_busy_until_the_consumer_frees_a_descriptor() {
     let mut fixture = Fixture::new();
     let mut adapter = fixture.attach(0x1063).unwrap();
     fixture.link(Some(GIGABIT_FULL));
@@ -654,10 +654,8 @@ fn a_full_ring_waits_for_the_consumer_and_then_reports_a_stall() {
     for _ in 0..TX_RING - 1 {
         adapter.transmit(&[1; 60]).unwrap();
     }
-    assert!(matches!(
-        adapter.transmit(&[1; 60]),
-        Err(LinkError::Adapter(_))
-    ));
+    assert_eq!(adapter.transmit(&[1; 60]), Err(LinkError::Busy));
+    assert_eq!(adapter.transmit(&[1; 60]), Err(LinkError::Busy));
     fixture
         .model
         .borrow_mut()

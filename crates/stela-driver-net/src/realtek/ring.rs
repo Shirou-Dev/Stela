@@ -61,7 +61,7 @@ impl Ring {
             return Err(LinkError::Invalid("frame length is outside 14..=1514"));
         }
         if !self.available() {
-            return Err(LinkError::Adapter("Realtek transmit ring stalled".into()));
+            return Err(LinkError::Busy);
         }
         fence(Ordering::Acquire);
         let length = frame.len().max(MIN_FRAME);

@@ -332,7 +332,7 @@ impl Service {
             // The host adapter's sends and receives wait outside the
             // devices' lock, which every PE's device accesses take.
             let (frames, status, room) = devices.with(|devices| {
-                let frames = network::GuestNetwork::queued(devices);
+                let frames = network.queued(devices);
                 (frames, devices.network_status(), devices.network_room())
             });
             network.status(status);

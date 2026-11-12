@@ -72,7 +72,6 @@ const REGISTER_BYTES: u64 = 0x2000;
 const LINK_POLL_US: u64 = 10_000;
 /// `ALX_RX_ALLOC_THRESH`: cleaned receive slots handed back at once.
 const RX_ALLOC_THRESH: usize = 32;
-const TRANSMIT_WAIT_US: u64 = 100_000;
 const DESCRIPTOR: usize = 16;
 const RFD: usize = 8;
 const FCS: usize = 4;
@@ -445,17 +444,7 @@ impl<R: Registers> Link for Alx<R> {
         }
         self.reclaim();
         if self.queues.transmit_available() == 0 {
-            let clock = self.hardware.timer.nominal();
-            let waited = clock.wait(TRANSMIT_WAIT_US, || {
-                self.reclaim();
-                self.queues.transmit_available() != 0
-            });
-            if !waited {
-                return Err(LinkError::Adapter(format!(
-                    "{} transmit ring stalled",
-                    self.location
-                )));
-            }
+            return Err(LinkError::Busy);
         }
         let index = self.queues.tx_write;
         let length = frame.len().max(MIN_FRAME);

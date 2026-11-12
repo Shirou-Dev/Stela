@@ -540,7 +540,12 @@ impl Igc {
         let held = now.saturating_sub(since);
         if status == u32::MAX {
             self.faulted = true;
-        } else if status & STATUS_TXOFF == 0 && held >= TRANSMIT_HANG_US * factor {
+            return LinkError::Adapter(format!(
+                "Intel I225/I226 {} lost register access; reinitialization required",
+                self.location
+            ));
+        }
+        if status & STATUS_TXOFF == 0 && held >= TRANSMIT_HANG_US * factor {
             let reset = self.reinitialize();
             if let Some(Err(error)) = &reset
                 && matches!(error, BlockError::PciPower(_))
@@ -557,15 +562,9 @@ impl Igc {
                 }
             ));
         }
-        LinkError::Adapter(format!(
-            "Intel I225/I226 {} transmit ring full{}",
-            self.location,
-            if status & STATUS_TXOFF != 0 && status != u32::MAX {
-                " while paused by flow control"
-            } else {
-                ""
-            }
-        ))
+        // Full, held off by PAUSE frames or not yet past the hang timeout:
+        // the caller tries again later.
+        LinkError::Busy
     }
 }
 
@@ -604,7 +603,7 @@ impl Link for Igc {
         if !self.watchdog()? {
             return Err(LinkError::NoCarrier);
         }
-        if !self.transmit.free(self.clock.nominal(), transmitted) {
+        if !self.transmit.free(transmitted) {
             return Err(self.transmit_stalled());
         }
         self.stalled = None;
@@ -783,7 +782,19 @@ mod tests {
     #[test]
     fn a_held_ring_resets_only_after_the_hang_timeout_and_never_while_paused() {
         let _clock = crate::test_clock::virtualize();
-        let error = |fixture: &mut Fixture| match fixture.net.transmit(&[2; 60]) {
+        // A full ring never waits: each refused send costs no time, and the
+        // hang timeout runs on the clock between sends.
+        let nominal = Clock {
+            ticks_per_microsecond: 1,
+        };
+        let send = |fixture: &mut Fixture| {
+            let before = nominal.now_us();
+            let result = fixture.net.transmit(&[2; 60]);
+            assert!(nominal.now_us() - before < 1_000);
+            crate::test_clock::advance(nominal, 100_000);
+            result
+        };
+        let error = |fixture: &mut Fixture| match send(fixture) {
             Err(LinkError::Adapter(message)) => message,
             other => panic!("{other:?}"),
         };
@@ -800,12 +811,13 @@ mod tests {
         let mut attempts = 0;
         let message = loop {
             attempts += 1;
-            let message = error(&mut fixture);
-            if !message.ends_with("transmit ring full") {
-                break message;
+            match send(&mut fixture) {
+                Err(LinkError::Busy) => {}
+                Err(LinkError::Adapter(message)) => break message,
+                other => panic!("{other:?}"),
             }
         };
-        assert!(attempts > 1);
+        assert!(attempts > 5);
         assert!(message.ends_with("transmit hang; controller reset failed"));
         assert!(fixture.net.faulted);
         assert!(error(&mut fixture).ends_with("reinitialization required"));
@@ -815,9 +827,7 @@ mod tests {
         let mut fixture = full();
         fixture.registers[STATUS / 4] = STATUS_TXOFF;
         for _ in 0..attempts * 2 {
-            assert!(
-                error(&mut fixture).ends_with("transmit ring full while paused by flow control")
-            );
+            assert_eq!(send(&mut fixture), Err(LinkError::Busy));
         }
         assert!(!fixture.net.faulted);
         fixture.registers[STATUS / 4] = 0;

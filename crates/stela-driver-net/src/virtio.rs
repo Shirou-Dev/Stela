@@ -49,7 +49,6 @@ const BUFFER: usize = 2048;
 /// (Linux `receive_small` drops others as length errors).
 const SHORTEST_RECEIVE: usize = HEADER + ETHERNET_HEADER;
 const LONGEST_RECEIVE: usize = HEADER + MAX_FRAME;
-const TRANSMIT_WAIT_US: u64 = 100_000;
 
 pub fn matches(function: &Function) -> bool {
     matches_identity(&function.identity())
@@ -303,20 +302,7 @@ impl Link for VirtioNet {
         self.usable()?;
         let reclaimed = self.reclaim();
         self.break_on(reclaimed)?;
-        if self.free.is_empty() {
-            let deadline = self.clock.deadline(TRANSMIT_WAIT_US);
-            while self.free.is_empty() && !deadline.passed() {
-                let reclaimed = self.reclaim();
-                self.break_on(reclaimed)?;
-                crate::waiting();
-            }
-        }
-        let id = self.free.pop().ok_or_else(|| {
-            LinkError::Adapter(format!(
-                "virtio-net {} transmit queue stalled",
-                self.location
-            ))
-        })?;
+        let id = self.free.pop().ok_or(LinkError::Busy)?;
         let buffer = self.transmit.buffer(id);
         buffer[..HEADER].fill(0);
         buffer[HEADER..HEADER + frame.len()].copy_from_slice(frame);
@@ -482,6 +468,25 @@ mod tests {
                 if kick { 0 } else { u16::MAX }
             );
         }
+    }
+
+    /// With every transmit descriptor still the device's, a send is busy
+    /// at once and offers nothing; one the device returns is used next.
+    #[test]
+    fn a_full_transmit_queue_is_busy_until_the_device_returns_a_descriptor() {
+        let mut fixture = Fixture::new();
+        let net = &mut fixture.net;
+        for byte in 0..ENTRIES {
+            net.transmit(&[byte as u8; 60]).unwrap();
+        }
+        let available = net.transmit.ring.read::<u16>(AVAIL + 2);
+        assert_eq!(net.transmit(&[9; 60]), Err(LinkError::Busy));
+        assert_eq!(net.transmit(&[9; 60]), Err(LinkError::Busy));
+        assert_eq!(net.transmit.ring.read::<u16>(AVAIL + 2), available);
+        let mut produced = 0;
+        give_back(&mut net.transmit, &mut produced, 1, 0);
+        net.transmit(&[9; 60]).unwrap();
+        assert_eq!(net.transmit.ring.read::<u16>(AVAIL + 2), available + 1);
     }
 
     #[test]

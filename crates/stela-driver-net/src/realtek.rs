@@ -834,12 +834,8 @@ impl Link for Realtek {
         if !self.update_link()? {
             return Err(LinkError::NoCarrier);
         }
-        let clock = &self.clock;
-        if !clock.wait(100_000, || self.transmit.available()) {
-            return Err(LinkError::Adapter(format!(
-                "{} transmit ring stalled",
-                self.location
-            )));
+        if !self.transmit.available() {
+            return Err(LinkError::Busy);
         }
         self.transmit.transmit(frame)?;
         fence(Ordering::SeqCst);

@@ -353,26 +353,25 @@ fn link_reconnect_and_speed_changes_apply_82579_workarounds() {
     assert!(net.carrier());
     assert!(!net.controller.is_poisoned());
 }
+/// A full ring refuses the frame as busy at once, without waiting, and
+/// overwrites no descriptor the controller still holds; the adapter stays
+/// usable, as Linux's `NETDEV_TX_BUSY` leaves it.
 #[test]
-fn unretired_tx_cannot_be_overwritten_and_stall_poison_keeps_owner() {
+fn a_full_ring_is_busy_at_once_and_overwrites_nothing() {
     let mut memory = Memory::new();
-    let (state, released, controller) = setup();
+    let (state, _released, controller) = setup();
     let mut net = open(controller, &mut memory);
     for _ in 0..DESCRIPTORS - 1 {
         net.transmit(&[0x55; 60]).unwrap();
     }
     let before = net.transmit.descriptors.bytes().to_vec();
     let time = state.borrow().time;
-    assert!(net.transmit(&[0x99; 60]).is_err());
-    assert_eq!(state.borrow().time - time, 100_000);
+    assert_eq!(net.transmit(&[0x99; 60]), Err(LinkError::Busy));
+    assert_eq!(state.borrow().time, time);
     assert_eq!(net.transmit.descriptors.bytes(), before);
-    assert_eq!(net.failure(), Some(&Error::QueueStalled));
-    let accesses = state.borrow().accesses;
-    assert!(net.receive().is_err());
-    assert!(net.shutdown().is_err());
-    assert_eq!(state.borrow().accesses, accesses);
-    drop(net);
-    assert_eq!(released.load(Ordering::SeqCst), 0);
+    assert_eq!(net.failure(), None);
+    assert!(!net.controller.is_poisoned());
+    assert!(net.receive().is_ok());
 }
 #[test]
 fn uncertain_tx_rx_doorbells_and_stop_drain_never_release_owner() {

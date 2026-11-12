@@ -384,7 +384,7 @@ fn dma_rings_use_legacy_descriptors_and_a_single_empty_slot() {
         fixture.net.transmit(&[7; 60]).unwrap();
     }
     let before = fixture.net.transmit.descriptors.bytes().to_vec();
-    assert!(fixture.net.transmit(&[8; 60]).is_err());
+    assert_eq!(fixture.net.transmit(&[8; 60]), Err(LinkError::Busy));
     assert_eq!(fixture.net.transmit.descriptors.bytes(), before);
     assert_eq!(fixture.net.transmit.next, DESCRIPTORS - 1);
     // Completion of the oldest descriptor permits only that buffer to be reused.

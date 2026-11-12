@@ -765,11 +765,8 @@ impl Link for E1000e {
         if !self.watchdog()? {
             return Err(LinkError::NoCarrier);
         }
-        if !self.transmit.free(self.clock.nominal(), transmitted) {
-            return Err(LinkError::Adapter(format!(
-                "{} transmit ring stalled",
-                self.location
-            )));
+        if !self.transmit.free(transmitted) {
+            return Err(LinkError::Busy);
         }
         let index = self.transmit.advance();
         let length = frame.len().max(MIN_FRAME);

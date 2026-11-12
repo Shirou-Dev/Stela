@@ -558,6 +558,10 @@ pub struct GuestNetwork {
     /// Frames read from the host adapter that the guest's receive queue
     /// had no room for yet, delivered first at the next turn.
     received: alloc::collections::VecDeque<Vec<u8>>,
+    /// Frames the guest sent that found the host adapter's transmit ring
+    /// full, sent first at the next turn; the guest's own queue holds the
+    /// rest meanwhile.
+    unsent: alloc::collections::VecDeque<Vec<u8>>,
 }
 
 /// Frames read from the host adapter in one service turn at most, outside
@@ -588,6 +592,7 @@ impl GuestNetwork {
             counters: Default::default(),
             refused: false,
             received: alloc::collections::VecDeque::new(),
+            unsent: alloc::collections::VecDeque::new(),
         })
     }
 
@@ -666,19 +671,28 @@ impl GuestNetwork {
     }
 
     /// The frames the guest queued, taken from its devices, for
-    /// [`Self::transmit`] to send without them.
-    pub fn queued(devices: &mut AppleDevices) -> Vec<Vec<u8>> {
+    /// [`Self::transmit`] to send without them. None while frames a full
+    /// host ring refused still wait: the guest's queue holds the rest.
+    pub fn queued(&self, devices: &mut AppleDevices) -> Vec<Vec<u8>> {
+        if !self.unsent.is_empty() {
+            return Vec::new();
+        }
         core::iter::from_fn(|| devices.network_take()).collect()
     }
 
-    /// Send in queue order and return the last frame's reusable storage.
+    /// Send in queue order and return the last sent frame's reusable
+    /// storage. A full host ring keeps that frame and the ones after it for
+    /// the next turn, as Linux requeues a `NETDEV_TX_BUSY` frame.
     pub fn transmit(&mut self, frames: Vec<Vec<u8>>) -> Option<Vec<u8>> {
+        self.unsent.extend(frames);
         let mut reusable = None;
-        for frame in frames {
-            if let Err(error) = self.link.transmit(&frame) {
-                self.refuse(error.into());
+        while let Some(frame) = self.unsent.front() {
+            match self.link.transmit(frame) {
+                Ok(()) => {}
+                Err(LinkError::Busy) => break,
+                Err(error) => self.refuse(error.into()),
             }
-            reusable = Some(frame);
+            reusable = self.unsent.pop_front();
         }
         reusable
     }

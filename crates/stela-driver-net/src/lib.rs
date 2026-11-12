@@ -15,7 +15,7 @@ mod test_process;
 
 #[cfg(test)]
 use stela_driver_base::test_clock;
-use stela_driver_base::{Clock, Deadline, Handoff, block, bus, registers, waiting};
+use stela_driver_base::{Clock, Deadline, Handoff, block, bus, registers};
 use stela_driver_core::{bytes, firmware};
 
 use alloc::{string::String, vec::Vec};
@@ -106,6 +106,10 @@ pub enum LinkError {
     /// The link is down: no frame can leave until it comes back. Frames the
     /// adapter held when it went down are discarded, as Linux does.
     NoCarrier,
+    /// The transmit ring is full: the frame was not taken. The caller keeps
+    /// it and tries again on a later poll, as Linux's stack requeues a
+    /// `NETDEV_TX_BUSY` frame; no send waits for the controller.
+    Busy,
 }
 
 /// How long a wired link may take from its start to carrier: copper
