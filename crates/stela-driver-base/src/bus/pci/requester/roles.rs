@@ -220,7 +220,7 @@ fn function(
             offset: 0x100,
         })?;
     let mut sriov = None;
-    if first != u32::MAX {
+    if first != u32::MAX && first != 0 {
         let transport = Transport(|offset: u16, bytes: u8| {
             let value = read32(address, offset & !3)
                 .map_err(|error| CapabilityError::Config { offset, error })?
@@ -232,10 +232,18 @@ fn function(
             })
         });
         for entry in ExtendedCapabilities::new(transport) {
-            let entry = entry.map_err(|error| match error {
-                CapabilityError::Config { error, .. } => Issue::Config { address, error },
-                error => Issue::Capability { address, error },
-            })?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(CapabilityError::Config { error, .. }) => {
+                    return Err(Issue::Config { address, error });
+                }
+                Err(_) => {
+                    // Conventional PCI devices (such as Intel PCH SMBus) or devices with
+                    // unaligned/unsupported extended capability registers do not implement
+                    // SR-IOV. Stop walking without failing the whole segment's role inventory.
+                    break;
+                }
+            };
             if entry.id == SRIOV && (entry.version != 1 || sriov.replace(entry.offset).is_some()) {
                 return Err(Issue::Sriov(address));
             }
@@ -456,6 +464,12 @@ mod tests {
         conventional[0x100 / 4] = u32::MAX;
         assert_eq!(
             capture(&BTreeMap::from([(PF, conventional)])).role(PF),
+            FunctionRole::Physical
+        );
+        let mut smbus = plain();
+        smbus[0x100 / 4] = 0x00000a32;
+        assert_eq!(
+            capture(&BTreeMap::from([(PF, smbus)])).role(PF),
             FunctionRole::Physical
         );
     }
