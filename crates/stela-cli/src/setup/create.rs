@@ -772,7 +772,10 @@ pub(super) fn plan(
         translations: None,
         wifi: command.wifi.clone().map(|ssid| wifi::Network {
             ssid,
-            country: command.wifi_country.clone(),
+            country: command
+                .wifi_country
+                .clone()
+                .or_else(environment.wifi_country),
         }),
         usb4_approved: command.usb4_approve.clone(),
         addresses: super::addresses::Addresses::requested(command)?,

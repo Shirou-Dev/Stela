@@ -48,6 +48,77 @@ pub(super) fn country(code: &str) -> Result<String, String> {
     }
 }
 
+/// The country whose radio rules this computer follows: on Linux its
+/// wireless regulatory domain, else its locale's region; on macOS and
+/// Windows the region the user chose. `None` when it names none, and the
+/// install then keeps to the rules every country allows.
+pub(super) fn host_country() -> Option<String> {
+    host_region().and_then(|code| country(&code).ok())
+}
+
+#[cfg(target_os = "linux")]
+fn host_region() -> Option<String> {
+    std::process::Command::new("iw")
+        .args(["reg", "get"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| regulatory_domain(&String::from_utf8_lossy(&output.stdout)))
+        .or_else(|| {
+            ["LC_ALL", "LC_CTYPE", "LANG"]
+                .iter()
+                .filter_map(|name| std::env::var(name).ok())
+                .find(|value| !value.is_empty())
+                .and_then(|locale| locale_region(&locale))
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn host_region() -> Option<String> {
+    let output = std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleLocale"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    locale_region(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+#[cfg(windows)]
+fn host_region() -> Option<String> {
+    use windows_sys::Win32::Globalization::GetUserDefaultGeoName;
+    let mut name = [0u16; 16];
+    // SAFETY: writes at most `name.len()` UTF-16 units into the local buffer.
+    let length = unsafe { GetUserDefaultGeoName(name.as_mut_ptr(), name.len() as i32) };
+    let length = usize::try_from(length).ok()?.checked_sub(1)?;
+    Some(String::from_utf16_lossy(&name[..length]))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn host_region() -> Option<String> {
+    None
+}
+
+/// `iw reg get`: the first `country XX:` that names a country; `00` is the
+/// world domain, which names none.
+#[cfg(any(test, target_os = "linux"))]
+fn regulatory_domain(text: &str) -> Option<String> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("country ")?.split(':').next())
+        .find(|code| *code != "00" && country(code).is_ok())
+        .map(str::to_owned)
+}
+
+/// A locale's region: `DE` of `de_DE.UTF-8`, of `en_US@rg=dezzzz` (macOS's
+/// separate region) `DE`.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn locale_region(locale: &str) -> Option<String> {
+    if let Some((_, region)) = locale.split_once("@rg=") {
+        return region.get(..2).map(str::to_owned);
+    }
+    let region = locale.split(['.', '@']).next()?.split_once('_')?.1;
+    (region.len() == 2).then(|| region.to_owned())
+}
+
 /// The passphrase in `file`, without its line ending.
 pub(super) fn read_passphrase(file: &Path) -> Result<String> {
     let text = fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
@@ -212,6 +283,16 @@ mod tests {
     #[test]
     fn countries_are_two_letters_in_capitals() {
         assert_eq!(country("de").unwrap(), "DE");
+        assert_eq!(
+            regulatory_domain("global\ncountry 00: DFS-UNSET\n\nphy#0\ncountry DE: DFS-ETSI\n"),
+            Some("DE".into())
+        );
+        assert_eq!(regulatory_domain("global\ncountry 00: DFS-UNSET\n"), None);
+        assert_eq!(locale_region("de_DE.UTF-8").as_deref(), Some("DE"));
+        assert_eq!(locale_region("en_US@rg=gbzzzz").as_deref(), Some("gb"));
+        assert_eq!(locale_region("en_US").as_deref(), Some("US"));
+        assert_eq!(locale_region("C.UTF-8"), None);
+        assert_eq!(locale_region("POSIX"), None);
         for refused in ["USA", "1A", "", "D"] {
             assert!(country(refused).is_err(), "{refused:?}");
         }

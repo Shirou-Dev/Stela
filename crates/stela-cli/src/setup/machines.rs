@@ -429,7 +429,10 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
     if let Some(ssid) = &command.wifi {
         let network = super::wifi::Network {
             ssid: ssid.clone(),
-            country: command.wifi_country.clone(),
+            country: command
+                .wifi_country
+                .clone()
+                .or_else(environment.wifi_country),
         };
         writeln!(text, "  {}", super::wifi::describe(&network, &record.esp))?;
         record.wifi = Some(network);

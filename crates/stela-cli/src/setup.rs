@@ -565,6 +565,9 @@ struct Environment<'a> {
     ui: &'a dyn ui::Ui,
     /// The Wi-Fi networks this computer sees or knows (`wifi::host_networks`).
     wifi_networks: &'a dyn Fn() -> Vec<String>,
+    /// The country whose Wi-Fi rules this computer follows
+    /// (`wifi::host_country`), for a network named without `--wifi-country`.
+    wifi_country: &'a dyn Fn() -> Option<String>,
     bundle_inputs: &'a InputsOf<'a>,
     /// The macOS builds setup prepares (`stela_formats::builds::SUPPORTED`);
     /// tests add their synthetic images' builds.
@@ -856,6 +859,7 @@ impl Request {
             bundle_inputs: &|archive, model| crate::boot::restore_inputs_in(archive, model),
             ui: ui::Terminal::or_none(),
             wifi_networks: &wifi::host_networks,
+            wifi_country: &wifi::host_country,
             image_size: &|build, model| {
                 let image = restore::select(&restore::catalog()?, Some(build), Some(model))?;
                 restore::inputs_size(&image, model)

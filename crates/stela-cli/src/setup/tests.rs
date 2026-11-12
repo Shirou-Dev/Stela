@@ -378,6 +378,7 @@ fn environment(host: &FakeHost) -> Environment<'_> {
         fetch_image: &offline_fetch_image,
         ui: &ui::NoTerminal,
         wifi_networks: &Vec::new,
+        wifi_country: &|| None,
         bundle_inputs: &fake_bundle_inputs,
         prepare_restore: &fake_prepare_restore,
         prepare_update: &fake_prepare_update,

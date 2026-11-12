@@ -176,6 +176,7 @@ struct Wifi {
     wifi_passphrase_file: Option<PathBuf>,
     /// The country whose Wi-Fi rules apply, as an ISO 3166 code such as US
     /// or DE: this computer's by default.
+    /// (this computer's region by default)
     #[arg(long, value_name = "CODE", value_parser = wifi::country, hide = true)]
     wifi_country: Option<String>,
 }
