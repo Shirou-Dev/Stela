@@ -4632,6 +4632,20 @@ static const char *descriptor_copy =
    " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\","
    " i32 4, !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"out\"}\n";
 
+/* A threadgroup array of bfloat, as MPS's quantized matrix kernels stage
+ * their tiles: 2.5 and 1.5 stored at its first and last elements. */
+static const char *bfloat_tile =
+   "@tile = internal addrspace(3) global [4 x bfloat] undef, align 2\n"
+   "define void @tiled(ptr addrspace(1) %out) {\n"
+   "store bfloat 0xR4020, ptr addrspace(3) @tile, align 2\n"
+   "%p = getelementptr [4 x bfloat], ptr addrspace(3) @tile, i64 0, i64 3\n"
+   "store bfloat 0xR3FC0, ptr addrspace(3) %p, align 2\n"
+   "store i32 1, ptr addrspace(1) %out, align 4\nret void\n}\n"
+   "!air.kernel = !{!2}\n!2 = !{ptr @tiled, !3, !4}\n!3 = !{}\n!4 = !{!40}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\","
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\","
+   " i32 4, !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"out\"}\n";
+
 /* Constant data of the thread address space holds its initializer's
  * values, copied or read in place. */
 static void
@@ -4644,6 +4658,41 @@ thread_constants_are_constant_data(void)
       fprintf(stderr, "copied: %u %s\n", error.kind, error.detail);
    assert(shader);
    assert(run_summed(shader) == 32 + 5);
+   stela_metal_release(shader);
+}
+
+/* A threadgroup bfloat array holds the bfloat bits stored to it. */
+static void
+threadgroup_globals_hold_bfloat(void)
+{
+   struct stela_air_error error;
+   const struct stela_metal_specialization specialization = {.workgroup_size = {64, 1, 1}};
+   nir_shader *shader = compile(bfloat_tile, "tiled", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "tiled: %u %s\n", error.kind, error.detail);
+   assert(shader && shader->info.shared_size >= 8);
+   static uint8_t memory[0x900];
+   uint8_t push[STELA_METAL_PUSH_BYTES] = {0};
+   memset(memory, 0, sizeof(memory));
+   put64(push + STELA_METAL_PUSH_TABLES, BASE + TABLE);
+   put64(memory + TABLE + STELA_METAL_TABLE_BUFFER_ADDRESSES, BASE + OUT);
+   const struct air_effect_environment environment = {
+      .base = BASE, .bytes = memory, .size = sizeof(memory), .push = push,
+      .push_size = sizeof(push),
+   };
+   struct air_effect_store trace[4];
+   struct air_effect_run run = air_effect_execute_in(shader, 100000, trace, ARRAY_SIZE(trace),
+                                                     &environment);
+   if (run.status != AIR_EFFECT_COMPLETE)
+      fprintf(stderr, "tiled: %s\n", run.detail);
+   assert(run.status == AIR_EFFECT_COMPLETE && run.stores == 3);
+   const uint16_t bits[] = {0x4020, 0x3fc0};
+   for (unsigned i = 0; i < 2; i++) {
+      assert(trace[i].shared && trace[i].bits == 16 && trace[i].components == 1);
+      assert(trace[i].values[0].u16 == bits[i]);
+   }
+   assert(trace[1].address == trace[0].address + 6);
+   expect_store(&trace[2], false, BASE + OUT, (const uint32_t[]){1}, 1);
    stela_metal_release(shader);
 }
 
@@ -4734,6 +4783,7 @@ main(void)
    dynamic_kernels_take_their_dispatch_shape();
    untyped_threadgroup_buffers_take_their_dispatch_lengths();
    thread_constants_are_constant_data();
+   threadgroup_globals_hold_bfloat();
    render_stages_compile_at_their_linked_locations();
    patch_functions_compile_behind_their_tessellation_stages();
    kernels_compile_with_their_stage_in();

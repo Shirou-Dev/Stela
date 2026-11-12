@@ -147,6 +147,7 @@ storage_size(struct stela_air_metadata *t, LLVMTypeRef type, unsigned depth, uns
       break;
    }
    case LLVMHalfTypeKind:
+   case LLVMBFloatTypeKind:
    case LLVMFloatTypeKind:
       valid = true;
       break;
