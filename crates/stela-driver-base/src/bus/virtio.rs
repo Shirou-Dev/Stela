@@ -7,7 +7,7 @@ use super::{
     mmio::Mmio,
     pci::{self, CAPABILITY_VENDOR, ConfigSpace, Function},
 };
-use crate::{Handoff, block::BlockError, registers};
+use crate::{Clock, Handoff, block::BlockError, registers};
 use core::cell::Cell;
 
 pub const VENDOR: u16 = 0x1af4;
@@ -51,6 +51,41 @@ pub const AVAIL: usize = 0x100;
 pub const USED: usize = 0x200;
 /// How long a device may take to reset or to complete a request.
 pub const TIMEOUT_US: u64 = 10_000_000;
+
+/// How long a reset at teardown waits for the device to read back zero.
+/// The reset can run inside a processor's exit, which must end well inside
+/// half a second.
+pub const STOP_RESET_US: u64 = 100_000;
+
+/// A modern function's device status register, which resets the device.
+#[derive(Clone, Copy)]
+pub struct DeviceStatus(Mmio);
+
+impl DeviceStatus {
+    /// The status register of the common configuration region `common`.
+    pub fn new(common: Mmio) -> Self {
+        Self(common)
+    }
+
+    /// Write zero and wait up to `microseconds` for a read of zero (virtio
+    /// 1.2 section 4.1.4.3.2, Linux `vp_reset`): the device then uses no
+    /// queue memory. A function that left the bus reads all ones and gets
+    /// no write; a clock that cannot time the wait fails it.
+    pub fn reset(&self, clock: &Clock, microseconds: u64) -> Result<(), BlockError> {
+        let common = self.0;
+        if common.read8(DEVICE_STATUS) == u8::MAX {
+            return Err(BlockError::Device { status: 0xff });
+        }
+        common.write8(DEVICE_STATUS, 0);
+        if common.read8(DEVICE_STATUS) == 0 {
+            return Ok(());
+        }
+        match clock.try_wait(microseconds, || common.read8(DEVICE_STATUS) == 0) {
+            Ok(true) => Ok(()),
+            _ => Err(BlockError::Timeout),
+        }
+    }
+}
 
 /// A modern virtio PCI function's register regions, reset and acknowledged
 /// (virtio 1.2 section 4.1.4 and 3.1.1).
@@ -252,6 +287,11 @@ impl Modern {
         Ok((entries, notify))
     }
 
+    /// The device status register, for a reset at teardown.
+    pub fn status(&self) -> DeviceStatus {
+        DeviceStatus(self.common)
+    }
+
     pub fn ready(&self) {
         self.common.write8(
             DEVICE_STATUS,
@@ -280,6 +320,34 @@ mod tests {
             signalled: 0,
             refused: Cell::new(false),
         }
+    }
+
+    /// A reset writes zero to the status and sees it read back; a function
+    /// that left the bus gets no write.
+    #[test]
+    fn a_reset_clears_the_status_and_a_lost_function_gets_no_write() {
+        let clock = Clock {
+            ticks_per_microsecond: 0,
+        };
+        let mut memory = [0u64; 8];
+        let transport = modelled(&mut memory, NO_VECTOR);
+        transport.common.write8(
+            DEVICE_STATUS,
+            ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK,
+        );
+        assert_eq!(transport.status().reset(&clock, STOP_RESET_US), Ok(()));
+        assert_eq!(transport.common.read8(DEVICE_STATUS), 0);
+        let mut memory = [u64::MAX; 8];
+        let transport = modelled(&mut memory, NO_VECTOR);
+        let before = memory;
+        assert!(matches!(
+            transport.status().reset(&clock, STOP_RESET_US),
+            Err(BlockError::Device { .. })
+        ));
+        // `modelled` wrote the offered features; nothing else changed.
+        assert_eq!(memory[DEVICE_STATUS / 8], before[DEVICE_STATUS / 8]);
+        // The teardown bound fits a processor's exit.
+        const { assert!(STOP_RESET_US <= 100_000) };
     }
 
     #[test]
