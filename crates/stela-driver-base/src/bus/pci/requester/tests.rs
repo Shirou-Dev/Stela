@@ -123,7 +123,13 @@ fn cap(function: &mut Function<Config>, offset: u16, id: u16, next: u16) {
         function.config().write16(offset + 2, 3).unwrap();
     }
 }
+/// An extended entry, on a function made PCI Express when it has no standard
+/// list yet: only such a function has an extended list.
 fn ext(function: &mut Function<Config>, offset: u16, id: u16, version: u32, next: u16) {
+    if function.config().read8(0x34).unwrap() == 0 {
+        cap(function, 0x40, PCIE, 0);
+        function.config().write16(0x42, 2).unwrap();
+    }
     function
         .config()
         .write32(

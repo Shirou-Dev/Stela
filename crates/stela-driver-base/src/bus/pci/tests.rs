@@ -767,6 +767,10 @@ fn below_a_port_forwarding_ari_the_functions_follow_their_chain() {
     ecam.port(EXPRESS_DOWNSTREAM, ARI_FORWARDING);
     for (number, next) in [(0usize, 9u32), (9, 0)] {
         ecam.present(1, number >> 3, number & 7, 0);
+        // PCI Express, which alone has the extended list ARI is in.
+        *ecam.word(1, number >> 3, number & 7, 0x04) = 1 << 20;
+        *ecam.word(1, number >> 3, number & 7, 0x34) = 0x40;
+        *ecam.word(1, number >> 3, number & 7, 0x40) = u32::from(CAPABILITY_EXPRESS) | 2 << 16;
         *ecam.word(1, number >> 3, number & 7, 0x100) = u32::from(EXTENDED_ARI);
         *ecam.word(1, number >> 3, number & 7, 0x104) = next << 8;
     }

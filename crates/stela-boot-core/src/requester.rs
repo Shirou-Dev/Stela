@@ -388,6 +388,10 @@ mod tests {
         );
         for (id, control, mask) in [(0xf, 0x106, 1 << 15), (0x13, 0x104, 1), (0x1b, 0x106, 1)] {
             let mut f = function();
+            // PCI Express, which alone has an extended list.
+            f.config().write16(6, 16).unwrap();
+            f.config().write8(0x34, 0x40).unwrap();
+            f.config().write16(0x40, 0x10).unwrap();
             f.config().write32(0x100, id | 1 << 16).unwrap();
             f.config().write16(control, mask).unwrap();
             assert_eq!(
@@ -403,6 +407,9 @@ mod tests {
             assert_eq!(RequesterClaim::validate_stopped(&mut f), Ok(()));
         }
         let mut f = function();
+        f.config().write16(6, 16).unwrap();
+        f.config().write8(0x34, 0x40).unwrap();
+        f.config().write16(0x40, 0x10).unwrap();
         f.config().write32(0x100, 0x1001_000f).unwrap();
         assert_eq!(
             RequesterClaim::validate_stopped(&mut f),

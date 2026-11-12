@@ -21,7 +21,15 @@ impl Space {
     fn standard(&mut self, offset: u16, id: u8, next: u8) {
         self.put16(offset, u16::from(id) | u16::from(next) << 8);
     }
+    /// An extended entry, on a function made PCI Express by a capability
+    /// at 0xc0 when it has no standard list yet: only such a function has
+    /// an extended list.
     fn extended(&mut self, offset: u16, id: u16, next: u16) {
+        if self.0[0x34] == 0 {
+            self.0[0x34] = 0xc0;
+            self.standard(0xc0, 0x10, 0);
+            self.put16(0xc2, 2);
+        }
         self.put32(offset, u32::from(id) | 1 << 16 | u32::from(next) << 20);
     }
     fn walk(&self) -> Vec<Result<(u16, u8, u16), CapabilityError>> {
@@ -329,6 +337,30 @@ fn extended_without_configuration_space_is_empty() {
     assert!(space.walk_extended().is_empty());
     space.put32(0x100, u32::MAX);
     assert!(space.walk_extended().is_empty());
+}
+
+/// A conventional function read past 0xff through ECAM can answer with its
+/// first bytes again, as an Intel PCH's SMBus does (`8086:a323`): Linux
+/// `pci_cfg_space_size` gives it no extended space, so the alias is not read
+/// as a header with next pointer 0xa32.
+#[test]
+fn a_conventional_function_has_no_extended_list_whatever_0x100_reads() {
+    let mut space = Space::new();
+    space.put32(0, 0xa323_8086);
+    space.put32(0x100, 0xa323_8086);
+    assert!(space.walk_extended().is_empty());
+    // Power management alone does not make it PCI Express.
+    space.0[0x34] = 0x50;
+    space.standard(0x50, 1, 0);
+    assert!(space.walk_extended().is_empty());
+    // The same bytes on a PCI Express function are a malformed list.
+    space.standard(0x50, 1, 0x60);
+    space.standard(0x60, 0x10, 0);
+    space.put16(0x62, 2);
+    assert_eq!(
+        space.walk_extended().last(),
+        Some(&Err(CapabilityError::Misaligned { offset: 0xa32 }))
+    );
 }
 
 #[test]

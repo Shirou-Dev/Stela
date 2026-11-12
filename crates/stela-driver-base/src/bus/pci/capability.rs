@@ -501,6 +501,13 @@ impl<R: CapabilityRead> ExtendedCapabilities<R> {
             return Err(CapabilityError::OutOfRange { offset }.into());
         }
         self.cells.visit(EXTENDED_START, offset)?;
+        // Linux `pci_cfg_space_size`: only a PCI Express or PCI-X function
+        // has configuration space past 0xff. A conventional function read
+        // there through ECAM may answer with its first 256 bytes again, as
+        // an Intel PCH's SMBus does, which is no capability list.
+        if offset == EXTENDED_START && !self.has_extended_space()? {
+            return Ok(None);
+        }
         let header = self.read.read(offset, 4)?;
         if offset == EXTENDED_START && matches!(header, 0 | u32::MAX) {
             return Ok(None);
@@ -529,6 +536,30 @@ impl<R: CapabilityRead> ExtendedCapabilities<R> {
             layout,
         };
         Ok(Some((capability, (header >> 20) as u16)))
+    }
+
+    /// Whether the standard list holds a PCI Express or a PCI-X capability.
+    /// The list's own faults are the standard walk's to report: a pointer
+    /// outside the list or a list longer than its space ends the search.
+    fn has_extended_space(&mut self) -> Result<bool, R::Error> {
+        const STATUS: u16 = 0x06;
+        const STATUS_CAPABILITIES: u32 = 1 << 4;
+        const POINTER: u16 = 0x34;
+        if self.read.read(STATUS, 2)? & STATUS_CAPABILITIES == 0 {
+            return Ok(false);
+        }
+        let mut offset = self.read.read(POINTER, 1)? as u16 & !3;
+        for _ in 0..48 {
+            if !(0x40..0x100).contains(&offset) {
+                break;
+            }
+            let header = self.read.read(offset, 2)?;
+            if matches!(header as u8, 0x07 | 0x10) {
+                return Ok(true);
+            }
+            offset = (header >> 8) as u16 & !3;
+        }
+        Ok(false)
     }
 
     /// The body size of extended capability `id` at `offset` (pci_regs.h).

@@ -305,6 +305,10 @@ mod tests {
     }
     fn pf(count: u16, offset: u16, stride: u16) -> [u32; 1024] {
         let mut words = plain();
+        // PCI Express, which alone has the extended list SR-IOV is in.
+        words[1] |= 1 << 20;
+        words[0x34 / 4] = 0x40;
+        words[0x40 / 4] = 0x0002_0010;
         words[0x100 / 4] = 0x10010;
         words[0x108 / 4] = 1;
         words[0x10c / 4] = 16 << 16;
