@@ -481,7 +481,7 @@ impl<R: Registers, D: Delay> Link for Packet<R, D> {
         }
         match self.transmit_inner(frame) {
             Ok(()) => Ok(()),
-            Err(Error::RingFull) => Err(LinkError::Adapter("tg3 transmit ring full".into())),
+            Err(Error::RingFull) => Err(LinkError::Busy),
             Err(error) => {
                 self.fault(error);
                 Err(error.into_link())

@@ -1122,7 +1122,16 @@ fn only_real_completed_tx_slots_can_be_reused_and_full_is_recoverable() {
     for _ in 0..511 {
         packet.transmit(&[0xa5; 60]).unwrap();
     }
-    assert!(packet.transmit(&[0xb6; 60]).is_err());
+    // A full ring refuses the frame as busy at once: no producer index
+    // moves and the caller keeps the frame for a later turn.
+    let before = peer.lock().unwrap().access.len();
+    assert_eq!(packet.transmit(&[0xb6; 60]), Err(LinkError::Busy));
+    assert!(
+        peer.lock().unwrap().access[before..]
+            .iter()
+            .all(|&(write, at, _)| !(write && at == 0x304))
+    );
+    assert_eq!(packet.tx_producer, 511);
     assert_eq!(packet.failure(), None);
     {
         let mut p = peer.lock().unwrap();
