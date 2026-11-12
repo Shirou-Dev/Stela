@@ -9,6 +9,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -61,7 +62,7 @@ jobs:
 
   app:
     needs: version
-    runs-on: macos-26
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5

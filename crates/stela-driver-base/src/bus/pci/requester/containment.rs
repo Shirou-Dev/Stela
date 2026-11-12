@@ -13,6 +13,18 @@ use core::cell::RefCell;
 
 /// The class and subclass of a host bridge.
 const HOST_BRIDGE: u32 = 0x0600;
+/// The class and subclass of an ISA / LPC bridge.
+const ISA_BRIDGE: u32 = 0x0601;
+/// The class and subclass of other chipset bridges.
+const OTHER_BRIDGE: u32 = 0x0680;
+
+/// Whether this device is an internal motherboard chipset bridge on the root bus
+/// (Host bridge or LPC bridge) whose COMMAND register bits (Bus Master, INTx Disable)
+/// may be hardwired or lack PCI 2.3 INTx control in hardware.
+const fn is_root_chipset_bridge(class: u32) -> bool {
+    let sub = class >> 8;
+    sub == HOST_BRIDGE || sub == ISA_BRIDGE || sub == OTHER_BRIDGE
+}
 
 #[derive(Clone, Copy)]
 struct Control {
@@ -55,17 +67,23 @@ impl Plan {
         // hardware's, and the seal proves it ([`Plan::seal`]). A function
         // of that class behind a downstream port is contained like any other.
         let class = read(regs::CLASS_REVISION, 4)? >> 8;
-        let hardwired = if root_bus && class >> 8 == HOST_BRIDGE {
+        let is_chipset = root_bus && is_root_chipset_bridge(class);
+        let hardwired = if is_chipset {
             command & regs::COMMAND_MASTER
         } else {
             0
         };
         let pin = read(regs::INTERRUPT_PIN, 1)? as u8;
+        let optional = if is_chipset {
+            regs::command_optional_bits(pin) | regs::COMMAND_INTX_DISABLE
+        } else {
+            regs::command_optional_bits(pin)
+        };
         plan.push(
             regs::COMMAND,
             command,
             command & !regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE,
-            regs::command_optional_bits(pin),
+            optional,
         )?;
         plan.0[0].hardwired = hardwired;
 
