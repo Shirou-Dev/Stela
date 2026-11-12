@@ -696,6 +696,7 @@ fn hardware(peer: &Rc<Peer>) -> Hardware<Rc<Peer>, Rc<Peer>> {
         registers: peer.clone(),
         timer: peer.clone(),
         reset_ownership: Cell::new(firmware::ResetOwnership::default()),
+        budget: Cell::new(None),
     }
 }
 type Fixture = (
@@ -2616,6 +2617,7 @@ mod registers_oracle {
                 },
                 timer: NoDelay,
                 reset_ownership: Cell::new(firmware::ResetOwnership::default()),
+                budget: Cell::new(None),
             };
             match spec.access {
                 Access::Get(_) => assert_eq!(

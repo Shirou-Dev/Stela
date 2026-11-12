@@ -15,6 +15,7 @@ fn refused_minimum(
             registers: hw.registers,
             timer: crate::timing::refused_model(clock),
             reset_ownership: hw.reset_ownership,
+            budget: hw.budget,
         }),
         domain: old.domain.take(),
         memory: old.memory.take(),

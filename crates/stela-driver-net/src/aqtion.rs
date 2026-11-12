@@ -181,10 +181,15 @@ unsafe impl Registers for MappedRegisters {
     }
 }
 pub use crate::bus::pci::power::Timer;
+/// The register polls of a stop at drop share this budget: the drop can
+/// run inside a processor's exit, which must end well inside half a second.
+pub(crate) const STOP_BUDGET_US: u64 = 200_000;
 struct Hardware<R, T> {
     registers: R,
     timer: T,
     reset_ownership: Cell<firmware::ResetOwnership>,
+    /// What polls may still wait in all, when bounded ([`STOP_BUDGET_US`]).
+    budget: Cell<Option<u64>>,
 }
 impl<R: Registers, T: Timer> Hardware<R, T> {
     fn check_timing(&self) -> Result<()> {
@@ -233,6 +238,12 @@ impl<R: Registers, T: Timer> Hardware<R, T> {
             let word = self.read(register)?;
             if ready(word) {
                 return Ok(word);
+            }
+            if let Some(left) = self.budget.get() {
+                let left = left
+                    .checked_sub(interval)
+                    .ok_or(Error::Timeout { register })?;
+                self.budget.set(Some(left));
             }
             self.delay(interval)?;
         }
@@ -447,6 +458,21 @@ impl<R: Registers, T: Timer, C: ConfigSpace> Aqtion<R, T, C> {
         unsafe { self.domain.as_ref().unwrap().drain_posted_writes() }?;
         self.state = State::Stopped;
         Ok(())
+    }
+    /// [`Self::stop`] with every register poll drawn from one budget of
+    /// `microseconds`, for a stop inside a processor's exit. A function that
+    /// left the bus reads all ones and gets no write.
+    pub(crate) fn stop_within(&mut self, microseconds: u64) -> Result<()> {
+        let Some(function) = self.function.as_mut() else {
+            return Err(Error::Stopped);
+        };
+        if function.config().read16(4)? == u16::MAX {
+            return Err(Error::Removed);
+        }
+        self.hw().budget.set(Some(microseconds));
+        let result = self.stop();
+        self.hw().budget.set(None);
+        result
     }
     /// Stop/drain the real queue epoch before requesting PCI D3hot. The
     /// configuration owner and DMA domain remain held for ordinary resume.

@@ -140,6 +140,7 @@ fn unchanged_linux_live_read_data_flags_and_exact_independent_alive_access_match
             },
             timer: NoWait,
             reset_ownership: Cell::new(firmware::ResetOwnership::default()),
+            budget: Cell::new(None),
         };
         let actual = hw.read(32);
         // Native error is the explicit analogue of the original unplug flag;

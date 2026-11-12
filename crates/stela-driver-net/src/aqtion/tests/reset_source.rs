@@ -50,6 +50,7 @@ fn reset(flb: bool, gsr: u32, spi: bool, seed: bool) -> Vec<(u32, u32, u32)> {
         registers: boundary.clone(),
         timer: boundary.clone(),
         reset_ownership: Cell::new(firmware::ResetOwnership::default()),
+        budget: Cell::new(None),
     };
     hw.reset(peer.profile).unwrap();
     boundary.effects.take()

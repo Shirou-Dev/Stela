@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! One AQtion owner keeps its stopped-root receipt and native retirement graph.
 use super::{Error, Failure, RetirableRegisters, cold::Bound};
-use crate::aqtion::{Aqtion, Mac, PciPower, State, Timer, memory::Memory};
+use crate::aqtion::{Aqtion, Mac, PciPower, STOP_BUDGET_US, State, Timer, memory::Memory};
 use crate::{
     Link, LinkError,
     bus::{
@@ -28,8 +28,20 @@ pub struct Attached<
     failure: Option<Error>,
 }
 impl<R: RetirableRegisters, T: Timer + 'static> Drop for Attached<R, T> {
+    /// An owner that was not retired is stopped first, as Linux's close
+    /// (`aq_nic_stop`) stops it: interrupts masked, every queue off, the
+    /// link dropped through firmware, bus mastering cleared and posted
+    /// writes drained, its register polls within [`STOP_BUDGET_US`]. It is
+    /// then kept whole: only [`Self::retire`] releases its pages, binding
+    /// and registers. A function that left the bus gets no write.
+    ///
+    /// This drives the controller's registers, so the owner drops it where
+    /// its MMIO window is mapped; anywhere else the first read faults.
     fn drop(&mut self) {
         if !self.completed {
+            if self.live().is_ok() {
+                let _ = self.core_mut().stop_within(STOP_BUDGET_US);
+            }
             core::mem::forget(self.resources.take());
         }
     }

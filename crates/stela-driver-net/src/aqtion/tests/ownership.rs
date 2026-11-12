@@ -129,12 +129,65 @@ fn abandoning_an_active_native_owner_retains_pages_binding_and_registers() {
     for device in [0x07b1, 0x04c0] {
         let fixture = inputs(device);
         let owner = attach(fixture.inputs, &fixture.pages).unwrap();
+        fixture.state.events.lock().unwrap().clear();
         drop(owner);
+        // The drop stopped it: every queue off, bus mastering cleared and
+        // posted writes drained.
+        fixture.state.stopped();
+        for queue in 0..32 {
+            for field in [registers::TDM_TX_DESC_EN_SET, registers::RDM_RX_DESC_EN_SET] {
+                assert_eq!(
+                    fixture.peer.get(field.address + queue * field.stride) & field.mask,
+                    0
+                );
+            }
+        }
+        assert_eq!(*fixture.state.events.lock().unwrap(), ["bound drain"]);
         assert!(fixture.state.binding.lock().unwrap().is_some());
         assert_eq!(fixture.state.base.maps.lock().unwrap().len(), 4);
         assert_eq!(fixture.dropped.load(Ordering::Relaxed), 0);
         assert_eq!(fixture.state.registers_dropped.load(Ordering::Relaxed), 0);
         assert_eq!(fixture.state.pm.unmaps.load(Ordering::Relaxed), 0);
+    }
+}
+/// A queue that never stops ends the drop's stop within its budget, before
+/// bus mastering is cleared or any drain, and the owner stays whole; a
+/// function that left the bus gets no register write.
+#[test]
+fn a_dropped_owner_that_cannot_stop_stays_whole_within_its_budget() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    for device in [0x07b1, 0x04c0] {
+        let fixture = inputs(device);
+        let owner = attach(fixture.inputs, &fixture.pages).unwrap();
+        fixture.peer.fault.set(Fault::QueueStop);
+        fixture.state.events.lock().unwrap().clear();
+        let before = fixture.peer.elapsed.get();
+        drop(owner);
+        let waited = fixture.peer.elapsed.get() - before;
+        assert!(waited <= STOP_BUDGET_US, "{waited}");
+        assert_ne!(fixture.state.pm.command() & 4, 0);
+        assert!(fixture.state.events.lock().unwrap().is_empty());
+        assert_eq!(fixture.state.base.maps.lock().unwrap().len(), 4);
+        assert_eq!(fixture.state.registers_dropped.load(Ordering::Relaxed), 0);
+        let fixture = inputs(device);
+        let owner = attach(fixture.inputs, &fixture.pages).unwrap();
+        // SAFETY: the model's own configuration RAM; nothing else accesses
+        // it while the owner is dropped.
+        unsafe {
+            fixture
+                .state
+                .pm
+                .pointer()
+                .as_ptr()
+                .add(4)
+                .cast::<u16>()
+                .write_volatile(u16::MAX)
+        };
+        let writes = fixture.peer.writes.borrow().len();
+        drop(owner);
+        assert_eq!(fixture.peer.writes.borrow().len(), writes);
     }
 }
 #[test]

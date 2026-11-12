@@ -54,6 +54,7 @@ pub(super) unsafe fn prepare<R: RetirableRegisters, T: Timer + 'static>(
             registers,
             timer,
             reset_ownership: Cell::new(firmware::ResetOwnership::default()),
+            budget: Cell::new(None),
         },
     })));
     let result = (|| {
