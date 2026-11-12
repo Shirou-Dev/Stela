@@ -237,21 +237,18 @@ impl Remappers {
             return None;
         }
         Some((|| {
-            let lines = match self.initial_lines.as_ref() {
-                Some(lines) => lines.clone(),
-                None => source
-                    .initial_pci_lines()
-                    .or_else(|_| source.force_unremapped_pci_lines())
-                    .map_err(PreparationError::Interrupt)?,
-            };
+            let lines = self
+                .initial_lines
+                .as_ref()
+                .ok_or(PreparationError::Interrupt(MappingError::Unavailable))?;
             let _ = lines.check(source);
             // SAFETY: with no remapping hardware the complete remapping
             // fabric is empty and no root can block or translate this RID.
             // The parked master seal holds, and the kept line paths and
             // source exclude every other configuration and topology writer.
-            let config = unsafe { source.promote_cold_config(address, &lines, || Ok(())) }
+            let config = unsafe { source.promote_cold_config(address, lines, || Ok(())) }
                 .map_err(PreparationError::Configuration)?;
-            Ok((config, lines))
+            Ok((config, lines.clone()))
         })())
     }
 
