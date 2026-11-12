@@ -49,6 +49,14 @@ pub(super) struct Record {
     /// Schema 3: the installed `stela.efi`'s version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) stela_version: Option<String>,
+    /// The Stela version that made or last updated the setup
+    /// (`setup::release`); none before 0.4.
+    #[serde(
+        default,
+        rename = "stela_release",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) release: Option<String>,
     /// Schema 4: the PC disks macOS installs onto, each its own machine.
     #[serde(default)]
     pub(super) installs: Vec<machines::Install>,

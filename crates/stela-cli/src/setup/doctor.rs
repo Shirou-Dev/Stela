@@ -687,6 +687,7 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path, full: bool) -> R
         report.problem(interrupted_text(&record, usb));
     }
     report.line("model", &record.model);
+    report.line("Stela", super::release::describe(&record));
     report.line("macOS build", &record.build);
     efi_status(environment, &record, &mut report);
     firmware_status(&record, &mut report);
@@ -765,6 +766,14 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     let usb = &command.usb;
     let mut record = read_record(environment, usb)?;
     update::ready(&record, usb)?;
+    if !command.dry_run {
+        super::release::allow_older(
+            environment,
+            &record,
+            command.yes,
+            "repair it with this older stela",
+        )?;
+    }
     // Its copy of the active build is gone for the new one's room: the
     // update finishes it, and repair would download the old one again.
     if let Some(next) = &record.replacing {

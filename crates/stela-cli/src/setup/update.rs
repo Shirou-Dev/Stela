@@ -108,6 +108,8 @@ pub(super) struct UpdateOptions<'a> {
     pub(super) ipsw: Option<&'a Path>,
     pub(super) download_dir: Option<&'a Path>,
     pub(super) dry_run: bool,
+    /// `--yes`: put an older Stela on a stick without asking.
+    pub(super) yes: bool,
 }
 
 /// Replace `stela.efi` with `image_path`, preparing bundles of its schema
@@ -123,12 +125,17 @@ pub(super) fn update_stela(
         ipsw,
         download_dir,
         dry_run,
+        yes,
     } = options;
     let image = read_efi(environment, image_path)?;
     check_firmware_support(&record.esp, &image)?;
     let to = version_id(&image);
     let to_generation = environment.generation();
     ready(&record, usb)?;
+    // A dry run asks nothing; it only says what would change.
+    if !dry_run {
+        super::release::allow_older(environment, &record, yes, "put the older Stela on it")?;
+    }
     let from_generation = record.generation();
     // Restore bundles of the new generation for every machine of the active
     // build while it has an install medium. Where their restore image comes
@@ -191,7 +198,10 @@ pub(super) fn update_stela(
         }
         // An update stopped after its loader went in: the record still names
         // the previous version, or the bundles and media it replaced.
-        if record.stela_version.as_deref() != Some(to.as_str()) || record.has_leftovers() {
+        if record.stela_version.as_deref() != Some(to.as_str())
+            || record.release.as_deref() != Some(super::release::CURRENT)
+            || record.has_leftovers()
+        {
             writeln!(
                 text,
                 "  stela.efi      version {to} is installed; its update is finished"
@@ -407,6 +417,7 @@ pub(super) fn update_stela(
 fn activate(record: &mut Record, to: String) -> Result<()> {
     publish(record)?;
     record.stela_version = Some(to);
+    record.release = Some(super::release::CURRENT.into());
     write_record(&record.esp.clone(), record)?;
     prune(record)?;
     if let Some(store) = &record.translations {

@@ -5736,3 +5736,81 @@ fn a_stick_named_by_its_whole_disk_is_read_through_its_stela_volume() {
         .to_string();
     assert!(error.contains("`stela create disk0`"), "{error}");
 }
+
+/// A setup whose record says Stela `release` (none before 0.4) made it.
+fn made_by(release: Option<&str>) -> Fixture {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    let mut made = record(&f);
+    assert_eq!(made.release.as_deref(), Some(release::CURRENT));
+    made.release = release.map(Into::into);
+    record::write_record(&f.esp, &made).unwrap();
+    f
+}
+
+#[test]
+fn a_stick_records_its_stela_version_and_an_update_brings_an_older_one_to_this_one() {
+    let f = made_by(None);
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(
+        status.contains("Stela 0.3 or older; this stela is"),
+        "{status}"
+    );
+    rerun(&f, |c| c.action = Action::UpdateStela).unwrap();
+    assert_eq!(record(&f).release.as_deref(), Some(release::CURRENT));
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(
+        status.contains(&format!("Stela {}\n", release::CURRENT)),
+        "{status}"
+    );
+}
+
+#[test]
+fn an_older_stela_asks_before_it_changes_a_newer_stick_and_a_no_changes_nothing() {
+    let f = made_by(Some("99.0.0"));
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(
+        status.contains("Stela 99.0.0, newer than this stela"),
+        "{status}"
+    );
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    let unchanged = || {
+        assert_eq!(
+            (snapshot(&f.esp), snapshot(&stela_volume(&f))),
+            before,
+            "the stick changed"
+        )
+    };
+    for action in [|| Action::UpdateStela, || Action::Repair] {
+        // Without a terminal: refused, naming --yes.
+        let error = rerun(&f, |c| c.action = action()).unwrap_err().to_string();
+        assert!(
+            error.contains("newer than this stela") && error.contains("Add --yes"),
+            "{error}"
+        );
+        unchanged();
+        // Asked on a terminal, and declined.
+        let no = ui::tests::Scripted::new(&["no"]);
+        let mut request = command(&f, &f.esp);
+        (request.ipsw, request.model, request.action) = (None, None, action());
+        let environment = Environment {
+            ui: &no,
+            ..environment(&f.host)
+        };
+        let error = request.dispatch(&environment).unwrap_err().to_string();
+        assert_eq!(error, "nothing was changed");
+        assert!(
+            no.transcript()
+                .contains("Stela 99.0.0, newer than this stela")
+        );
+        unchanged();
+    }
+    // --yes puts this Stela on it.
+    rerun(&f, |c| {
+        c.action = Action::UpdateStela;
+        c.yes = true;
+    })
+    .unwrap();
+    assert_eq!(record(&f).release.as_deref(), Some(release::CURRENT));
+}

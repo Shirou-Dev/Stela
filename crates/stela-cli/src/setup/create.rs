@@ -749,6 +749,7 @@ pub(super) fn plan(
         complete: false,
         installed: None,
         stela_version: Some(update::version_id(&efi_image)),
+        release: Some(super::release::CURRENT.into()),
         installs: vec![install],
         default_install: None,
         bundle_schema: environment.interface.bundle_schema,

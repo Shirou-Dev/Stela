@@ -73,6 +73,7 @@ mod medium;
 mod ownership;
 mod prepare;
 mod record;
+mod release;
 mod sources;
 mod state;
 mod translations;
@@ -240,6 +241,21 @@ fn interrupted_text(record: &Record, usb: &Path) -> String {
         rerun(record, usb),
         fix(usb, "uninstall")
     )
+}
+
+/// Before an effect a terminal run asks about (`question`): accept it with
+/// `--yes` (`yes`), ask on a terminal, and otherwise refuse with `refusal`,
+/// naming `--yes`. Declining changes nothing. Erasing a disk never comes
+/// here: it needs the disk typed back (`--confirm-disk`).
+fn consent(environment: &Environment<'_>, yes: bool, question: &str, refusal: &str) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !environment.ui.interactive() {
+        bail!("{refusal}. Nothing was changed. Add --yes to accept.");
+    }
+    ensure!(environment.ui.confirm(question)?, "nothing was changed");
+    Ok(())
 }
 
 /// A command that found problems: its whole report, which goes to standard
@@ -984,6 +1000,7 @@ impl Request {
                         ipsw: self.ipsw.as_deref().filter(|_| self.macos.is_none()),
                         download_dir: self.download_dir.as_deref(),
                         dry_run: self.dry_run,
+                        yes: self.yes,
                     },
                 )?;
                 if let Some(build) = self.macos.take() {
