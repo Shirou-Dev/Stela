@@ -299,7 +299,13 @@ fn checkout(submodule: &Submodule) -> Result<()> {
         );
         if applied.is_err() {
             // Leave the checkout at its pin, with no `am` left to block the next.
-            exec(submodule.git().args(["am", "--abort"]))?;
+            exec(
+                submodule
+                    .git()
+                    .args(["-c", "user.name=Stela", "-c"])
+                    .arg(format!("user.email={COMMITTER_EMAIL}"))
+                    .args(["am", "--abort"]),
+            )?;
         }
         applied
             .with_context(|| format!("third_party/patches/{} no longer applies", submodule.name))?;

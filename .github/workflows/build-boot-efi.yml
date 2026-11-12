@@ -80,6 +80,11 @@ jobs:
             boot-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/stela-boot/Cargo.lock') }}-
             boot-${{ runner.os }}-
 
+      - name: Configure Git identity
+        run: |
+          git config --global user.name "Stela"
+          git config --global user.email "stela@localhost"
+
       - name: Fetch upstream sources
         run: cargo xtask gpu fetch
 
