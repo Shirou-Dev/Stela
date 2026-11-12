@@ -97,6 +97,22 @@ impl Drop for Handback {
     }
 }
 
+/// Under `sudo`, give the file this run saved at `path` (a boot log or a
+/// report) to the user who ran it, when it is in a folder of theirs.
+pub(crate) fn hand_to_invoker(path: &Path) {
+    // SAFETY: reads this process's credentials; no pointer arguments.
+    let euid = unsafe { libc::geteuid() };
+    let var = |name| std::env::var(name).ok();
+    let invoker = invoker(euid, var("SUDO_UID").as_deref(), var("SUDO_GID").as_deref());
+    let folder = std::path::absolute(path)
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .and_then(|folder| std::fs::metadata(folder).ok());
+    if let Some(heir) = folder.and_then(|meta| heir(invoker, meta.uid())) {
+        hand_back(path, heir);
+    }
+}
+
 /// Visit `root` and everything below it without following links, until
 /// `stop` returns true for an entry: whether it did.
 fn walk(root: &Path, mut stop: impl FnMut(&std::fs::Metadata) -> bool) -> bool {

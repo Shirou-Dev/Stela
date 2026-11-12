@@ -72,6 +72,8 @@ mod machines;
 mod medium;
 #[cfg(unix)]
 mod ownership;
+#[cfg(unix)]
+pub(crate) use ownership::hand_to_invoker;
 mod prepare;
 mod record;
 mod release;
@@ -265,6 +267,8 @@ fn split_report(result: Result<String>) -> (String, Result<()>) {
 /// Write `report` to `path` instead of the terminal, and say where it went.
 fn save_report(path: &Path, report: &str) -> Result<()> {
     fs::write(path, report).with_context(|| format!("cannot write {}", path.display()))?;
+    #[cfg(unix)]
+    hand_to_invoker(path);
     println!(
         "Saved the report to {}",
         crate::boot_log::shown(path).display()
@@ -822,6 +826,11 @@ impl Request {
         // `log` reads every disk without a path, and a disk, image or
         // copied log as a file; a mounted volume of a stick is read through
         // its setup below.
+        // On a terminal the logs go to a file to attach; a pipe gets them.
+        if boot_log && self.output.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        {
+            self.output = Some(crate::boot_log::default_output());
+        }
         if boot_log && !self.usb.is_dir() {
             let place = std::mem::take(&mut self.log_place);
             return crate::boot_log::BootLog {

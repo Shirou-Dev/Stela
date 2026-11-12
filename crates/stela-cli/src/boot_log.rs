@@ -153,6 +153,8 @@ pub(crate) fn write_logs(
         result => result.context("cannot write the boot log")?,
     }
     if let Some(path) = output {
+        #[cfg(unix)]
+        crate::setup::hand_to_invoker(path);
         eprintln!("{}", saved(logs.len(), path));
     }
     Ok(())
@@ -1098,6 +1100,14 @@ pub(crate) mod tests {
         // A blank copy holds nothing to print.
         std::fs::write(&path, vec![0u8; boot_log::LOG_BYTES as usize]).unwrap();
         assert!(find(&path).is_err());
+    }
+
+    #[test]
+    fn dates_are_counted_from_1970_in_utc() {
+        assert_eq!(civil_date(0), "1970-01-01");
+        assert_eq!(civil_date(59), "1970-03-01");
+        assert_eq!(civil_date(11_016), "2000-02-29");
+        assert_eq!(civil_date(20_769), "2026-11-12");
     }
 
     #[test]
