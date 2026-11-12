@@ -411,6 +411,10 @@ struct Device {
     busy: bool,
     /// Further reads each MDIO command stays busy for.
     mdio_slow: usize,
+    /// The APE firmware never takes a posted event.
+    ape_busy: bool,
+    /// Another NVRAM user holds the software arbitration lock.
+    nvram_held: bool,
     slow_left: usize,
     tx: usize,
     rx: usize,
@@ -960,7 +964,9 @@ unsafe impl Registers for Reg {
                 p.slow_left = p.mdio_slow;
             }
             0x7020 if value == 2 => {
-                p.mac.insert(at, 0x202);
+                if !p.nvram_held {
+                    p.mac.insert(at, 0x202);
+                }
             }
             0x7000 => {
                 let address = p.mac.get(&0x700c).copied().unwrap_or(0);
@@ -1005,8 +1011,10 @@ unsafe impl Registers for Reg {
             p.ape.insert(at, 0); // Writing the owner's bit releases the grant.
         } else if at == 0x0c {
             // Running APE firmware takes the posted event.
-            let status = p.ape.get(&0x4300).copied().unwrap_or(0);
-            p.ape.insert(0x4300, status & !0x8000_0000);
+            if !p.ape_busy {
+                let status = p.ape.get(&0x4300).copied().unwrap_or(0);
+                p.ape.insert(0x4300, status & !0x8000_0000);
+            }
         } else {
             p.ape.insert(at, value);
         }

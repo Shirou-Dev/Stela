@@ -182,3 +182,82 @@ fn a_slow_link_check_runs_in_steps_within_linux_bounds() {
     assert!(f.packet.carrier());
     assert_eq!(f.packet.failure(), None);
 }
+
+/// A link-loss restart, clean and with each part that never finishes: on
+/// the model clock no call waits more than 60 ms, the calls together wait
+/// what the blocking link check and restart wait, and the outcome is the
+/// same, recovered or the same fault.
+#[test]
+fn a_link_loss_restart_runs_in_steps_with_the_blocking_totals_and_outcome() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    type Case = (&'static str, fn(&mut Device), Option<Error>);
+    let cases: [Case; 6] = [
+        ("clean", |_| {}, None),
+        (
+            "engine never stops",
+            |device| device.stop_stuck = Some(0x4800),
+            Some(Error::StopTimeout(0x4800)),
+        ),
+        (
+            "APE never takes an event",
+            |device| {
+                device.ape.insert(0x4000, 0x4150_4521);
+                device.ape.insert(0x400c, 0x100);
+                device.ape_busy = true;
+            },
+            None,
+        ),
+        (
+            "firmware never answers",
+            |device| device.reset_ack = false,
+            Some(Error::FirmwareTimeout),
+        ),
+        (
+            "PHY never leaves reset",
+            |device| device.phy_stuck = true,
+            Some(Error::PhyResetTimeout),
+        ),
+        (
+            "NVRAM lock held",
+            |device| device.nvram_held = true,
+            Some(Error::NvramTimeout),
+        ),
+    ];
+    for (name, case, expected) in cases {
+        let mut blocking = clocked(|_| {});
+        case(&mut blocking.peer.lock().unwrap());
+        blocking.peer.lock().unwrap().phy.insert(1, 0);
+        let before = blocking.clock.now();
+        let link = block_on(blocking.packet.hardware.packet_carrier());
+        assert_eq!(link, Ok(false), "{name}");
+        let result = blocking.packet.restart();
+        let waited = blocking.clock.now() - before;
+        assert_eq!(result.err(), expected, "{name}");
+        assert_eq!(blocking.packet.failure(), expected, "{name}");
+
+        let mut f = clocked(|_| {});
+        assert!(f.packet.carrier(), "{name}");
+        case(&mut f.peer.lock().unwrap());
+        f.peer.lock().unwrap().phy.insert(1, 0);
+        f.clock.advance(LINK_POLL_US);
+        let (total, calls) = step_until_idle(&mut f);
+        assert_eq!(total, waited, "{name}");
+        assert!(calls as u64 > total / (CALL_US - 15_000), "{name}: {calls}");
+        assert_eq!(f.packet.failure(), expected, "{name}");
+        assert_eq!(
+            f.domain.drains.load(Ordering::Relaxed),
+            blocking.domain.drains.load(Ordering::Relaxed),
+            "{name}"
+        );
+        if expected.is_none() {
+            f.peer.lock().unwrap().phy.insert(1, 0x24);
+            assert!(f.packet.carrier(), "{name}");
+            f.packet.transmit(&[0x22; 60]).unwrap();
+        } else {
+            assert!(!f.packet.carrier(), "{name}");
+            assert!(f.packet.transmit(&[0x22; 60]).is_err(), "{name}");
+        }
+    }
+}

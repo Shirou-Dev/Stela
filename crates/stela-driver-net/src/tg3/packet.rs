@@ -57,6 +57,10 @@ impl<T> DerefMut for Held<T> {
 enum Kind {
     /// The copper link check.
     Link,
+    /// A restart, after a lost link or for a PHY resume.
+    Restart,
+    /// The PHY suspend.
+    Suspend,
 }
 /// Hardware work run a step per runtime call. It owns the hardware until
 /// it ends, so meanwhile the carrier is down, receive finds nothing and
@@ -67,6 +71,8 @@ struct Work<R: Registers, D: Delay> {
 }
 struct Finished<R: Registers, D: Delay> {
     hardware: Hardware<R, D>,
+    /// The rings, which a restart holds.
+    memory: Option<Memory>,
     result: Result<bool, Error>,
 }
 
@@ -303,7 +309,11 @@ impl<R: Registers + 'static, D: Delay + 'static> Packet<R, D> {
     fn begin_link(&mut self) {
         self.begin(Kind::Link, |mut hardware| async move {
             let result = hardware.packet_carrier().await;
-            Finished { hardware, result }
+            Finished {
+                hardware,
+                memory: None,
+                result,
+            }
         });
     }
     /// One step of the work under way, and of any work its end starts, in
@@ -318,6 +328,9 @@ impl<R: Registers + 'static, D: Delay + 'static> Packet<R, D> {
             self.work = None;
             finished.hardware.steps(None);
             self.hardware.put(finished.hardware);
+            if finished.memory.is_some() {
+                self.memory = finished.memory;
+            }
             let result = self.finished(kind, finished.result);
             if result.is_err() || self.work.is_none() {
                 return Poll::Ready(result);
@@ -343,12 +356,24 @@ impl<R: Registers + 'static, D: Delay + 'static> Packet<R, D> {
                 self.link_due = due.map_err(|error| self.fault(error))?;
                 if !carrier && self.carrier_up {
                     self.carrier_up = false;
-                    self.restart().map_err(|error| self.fault(error))?;
-                    // The restarted link is checked at the next call.
-                    self.link_due = None;
-                    return Ok(());
+                    return self.begin_restart().map_err(|error| self.fault(error));
                 }
                 self.carrier_up = carrier;
+                Ok(())
+            }
+            (Kind::Restart, Ok(_)) => {
+                self.tx_producer = 0;
+                self.tx_consumer = 0;
+                self.rx_producer = self.geometry.rx - 1;
+                self.rx_consumer = 0;
+                self.failure = None;
+                self.state = State::Running;
+                // The restarted link is checked at the next call.
+                self.link_due = None;
+                Ok(())
+            }
+            (Kind::Suspend, Ok(_)) => {
+                self.state = State::PhySuspended;
                 Ok(())
             }
             (_, Err(error)) => Err(self.fault(error)),
@@ -390,38 +415,14 @@ impl<R: Registers + 'static, D: Delay + 'static> Packet<R, D> {
     /// Stop MAC/DMA engines, observe BusMaster clear and complete the original
     /// remapper's posted payload drain. A failed attempt remains retryable only
     /// for containment; it can never resume submission or invent completion.
+    /// It runs to completion, as teardown may.
     pub fn stop(&mut self) -> Result<(), Error> {
         // Work under way ends first; its failure faults the epoch.
         let _ = self.finish();
-        if matches!(self.state, State::Stopped | State::PhySuspended) {
+        let Some(clean) = self.halt_plan()? else {
             return Ok(());
-        }
-        self.state = State::Faulted;
-        if !self.identified {
-            return Err(self.failure.unwrap_or(Error::NotIdentified));
-        }
-        // The management firmware hears of the stop only from an epoch
-        // whose every operation was observed.
-        let clean = self.failure.is_none() && self.hardware.failure().is_none();
-        let result = (|| {
-            let unload = if clean {
-                block_on(self.hardware.packet_unload_begin())
-            } else {
-                Ok(())
-            };
-            block_on(self.hardware.packet_stop())?;
-            // SAFETY: real engines acknowledged stopped, original BME clear;
-            // isolated domain and every packet/status target remain.
-            unsafe {
-                self.domain.drain_posted_writes()?;
-            }
-            unload?;
-            if clean {
-                block_on(self.hardware.packet_unload_end())?;
-            }
-            Ok(())
-        })();
-        match result {
+        };
+        match block_on(Self::halt(&mut self.hardware, &*self.domain, clean)) {
             Ok(()) => {
                 self.state = State::Stopped;
                 Ok(())
@@ -429,34 +430,93 @@ impl<R: Registers + 'static, D: Delay + 'static> Packet<R, D> {
             Err(error) => Err(self.fault(error)),
         }
     }
+    /// What stopping takes: `None` for an epoch already stopped, otherwise
+    /// a halt that tells the management firmware when the epoch is clean.
+    /// The epoch is faulted until the halt ends.
+    fn halt_plan(&mut self) -> Result<Option<bool>, Error> {
+        if matches!(self.state, State::Stopped | State::PhySuspended) {
+            return Ok(None);
+        }
+        self.state = State::Faulted;
+        if !self.identified {
+            return Err(self.failure.unwrap_or(Error::NotIdentified));
+        }
+        // The management firmware hears of the stop only from an epoch
+        // whose every operation was observed.
+        Ok(Some(
+            self.failure.is_none() && self.hardware.failure().is_none(),
+        ))
+    }
+    /// `tg3_halt`: the management firmware told of the unload when `clean`,
+    /// engines stopped, BusMaster clear and posted writes drained.
+    async fn halt(
+        hardware: &mut Hardware<R, D>,
+        domain: &dyn DmaDomain,
+        clean: bool,
+    ) -> Result<(), Error> {
+        let unload = if clean {
+            hardware.packet_unload_begin().await
+        } else {
+            Ok(())
+        };
+        hardware.packet_stop().await?;
+        // SAFETY: real engines acknowledged stopped, original BME clear;
+        // isolated domain and every packet/status target remain.
+        unsafe {
+            domain.drain_posted_writes()?;
+        }
+        unload?;
+        if clean {
+            hardware.packet_unload_end().await?;
+        }
+        Ok(())
+    }
     /// Stop/drain packets and put the admitted copper PHY into its real low
     /// power state. The original PCI function stays in D0 with every mapping
     /// kept. This supplies no PCI/system sleep or wake-on-LAN operation.
+    /// It runs to completion, as teardown may.
     pub fn suspend_phy(&mut self) -> Result<(), Error> {
+        let _ = self.finish();
+        self.begin_suspend_phy()?;
+        self.finish()
+    }
+    /// The PHY suspend as work in steps.
+    fn begin_suspend_phy(&mut self) -> Result<(), Error> {
         if self.state == State::PhySuspended {
             return Ok(());
         }
         if !self.restartable {
             return Err(Error::Stopped);
         }
-        self.stop()?;
-        self.state = State::Faulted;
+        let halt = self.halt_plan()?;
         self.carrier_up = false;
-        match block_on(self.hardware.power_down_packet_phy()) {
-            Ok(()) => {
-                self.state = State::PhySuspended;
-                Ok(())
+        let domain = self.domain.clone();
+        self.begin(Kind::Suspend, move |mut hardware| async move {
+            let result = async {
+                if let Some(clean) = halt {
+                    Self::halt(&mut hardware, &*domain, clean).await?;
+                }
+                hardware.power_down_packet_phy().await
             }
-            Err(error) => Err(self.fault(error)),
-        }
+            .await;
+            Finished {
+                hardware,
+                memory: None,
+                result: result.map(|()| true),
+            }
+        });
+        Ok(())
     }
     /// Restore this same PHY and packet epoch through the full PHY/core reset
     /// and queue rebuild. The kept platform owner must still hold PCI D0.
+    /// It runs to completion, as teardown may.
     pub fn resume_phy(&mut self) -> Result<(), Error> {
+        let _ = self.finish();
         if self.state != State::PhySuspended {
             return Err(Error::Stopped);
         }
-        self.restart()
+        self.begin_restart()?;
+        self.finish()
     }
     /// Release only after stop/drain and acknowledged removal of every real
     /// mapping. An unmap error returns this same epoch with original owners.
@@ -499,39 +559,48 @@ impl<R: Registers + 'static, D: Delay + 'static> Packet<R, D> {
     /// engine stop, BusMaster-clear readback and posted-write drain. A failure
     /// keeps every mapping and prohibits packet I/O; another containment or
     /// restart attempt cannot bypass uncertain transport/reset ownership.
+    /// It runs to completion, as teardown may; a lost link restarts in steps.
     pub fn restart(&mut self) -> Result<(), Error> {
+        let _ = self.finish();
+        self.begin_restart()?;
+        self.finish()
+    }
+    /// The restart as work in steps: halt, core reset and PHY setup, and
+    /// the rings rebuilt on their existing buffers. It holds the rings too.
+    fn begin_restart(&mut self) -> Result<(), Error> {
         if !self.restartable {
             return Err(Error::Stopped);
         }
-        self.stop()?;
-        self.state = State::Faulted;
+        let halt = self.halt_plan()?;
         self.carrier_up = false;
-        match self.rebuild_after_drain() {
-            Ok(()) => {
-                self.failure = None;
-                self.state = State::Running;
-                Ok(())
+        let domain = self.domain.clone();
+        let board = self.board;
+        let filter = self.receive_filter.clone();
+        let mut memory = self.memory.take();
+        self.begin(Kind::Restart, move |mut hardware| async move {
+            let result = async {
+                if let Some(clean) = halt {
+                    Self::halt(&mut hardware, &*domain, clean).await?;
+                }
+                let board = board.ok_or(Error::NotIdentified)?;
+                hardware.packet_reset(board).await?;
+                let memory = memory.as_mut().ok_or(Error::NotIdentified)?;
+                // SAFETY: the old epoch is fully stopped/drained and the chip
+                // reset; the same real mappings remain, with no intervening
+                // new DMA source.
+                unsafe {
+                    memory.reset_after_drain()?;
+                }
+                let addresses = memory.addresses()?;
+                hardware.packet_start(board, addresses, &filter).await
             }
-            Err(error) => Err(self.fault(error)),
-        }
-    }
-    fn rebuild_after_drain(&mut self) -> Result<(), Error> {
-        let board = self.board.ok_or(Error::NotIdentified)?;
-        block_on(self.hardware.packet_reset(board))?;
-        // SAFETY: the old epoch is fully stopped/drained and the chip reset;
-        // the same real mappings remain, with no intervening new DMA source.
-        unsafe {
-            self.memory.as_mut().unwrap().reset_after_drain()?;
-        }
-        let addresses = self.memory.as_ref().unwrap().addresses()?;
-        block_on(
-            self.hardware
-                .packet_start(board, addresses, &self.receive_filter),
-        )?;
-        self.tx_producer = 0;
-        self.tx_consumer = 0;
-        self.rx_producer = self.geometry.rx - 1;
-        self.rx_consumer = 0;
+            .await;
+            Finished {
+                hardware,
+                memory,
+                result: result.map(|()| true),
+            }
+        });
         Ok(())
     }
     fn transmit_inner(&mut self, frame: &[u8]) -> Result<(), Error> {
@@ -596,11 +665,15 @@ impl<R: Registers + 'static, D: Delay + 'static> Link for Packet<R, D> {
     /// the hardware the carrier is down.
     fn carrier(&mut self) -> bool {
         self.allowance.refill();
+        let busy = self.work.is_some();
         if self.advance().is_pending() || self.check().is_err() {
             return false;
         }
+        // Work that ended in this call had its share; a due check waits
+        // for the next call.
         match self.link_due() {
             Ok(false) => return self.carrier_up,
+            Ok(true) if busy => return self.carrier_up,
             Ok(true) => {}
             Err(error) => {
                 self.fault(error);
