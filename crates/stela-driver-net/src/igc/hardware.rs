@@ -2,6 +2,12 @@
 // Copyright (c) 2018 Intel Corporation
 //! Checked boot-lifetime adaptation of Linux igc_base/mac/phy/nvm/i225.c.
 use crate::{block::BlockError, bus::mmio::Mmio};
+use core::{
+    cell::Cell,
+    future::Future,
+    pin::{Pin, pin},
+    task::{Context, Poll, Waker},
+};
 
 pub(super) trait Registers {
     fn read(&self, register: usize) -> u32;
@@ -18,6 +24,68 @@ impl Registers for Mmio {
 }
 pub(super) trait Timer {
     fn delay(&self, microseconds: u64) -> Result<(), BlockError>;
+}
+
+/// What one runtime call may still wait: a sequence driven in slices
+/// ([`Hardware::sliced`]) yields once its waits use it up, and the next call
+/// resumes it with a fresh slice. A processor's exit must end well inside
+/// half a second.
+pub(super) struct Slice {
+    left: Cell<u64>,
+}
+
+impl Slice {
+    /// Each call's waits: up to this, plus the one delay that crosses it.
+    pub(super) const MICROSECONDS: u64 = 40_000;
+
+    pub(super) const fn new() -> Self {
+        Self {
+            left: Cell::new(Self::MICROSECONDS),
+        }
+    }
+
+    /// A new call's share.
+    pub(super) fn refill(&self) {
+        self.left.set(Self::MICROSECONDS);
+    }
+}
+
+/// Pending once, then ready: hands the processor back mid-sequence.
+struct Yield(bool);
+
+impl Future for Yield {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            Poll::Pending
+        }
+    }
+}
+
+/// Run a sequence to its end in this call, as attachment and teardown do.
+/// Without a [`Slice`] it never yields, so one poll completes it.
+pub(super) fn block<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+    }
+}
+
+/// A semaphore-held operation's result, failing if either failed.
+fn joined<V>(
+    result: Result<V, BlockError>,
+    released: Result<(), BlockError>,
+) -> Result<V, BlockError> {
+    match (result, released) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
 }
 impl Timer for crate::timing::Timing {
     fn delay(&self, us: u64) -> Result<(), BlockError> {
@@ -321,6 +389,8 @@ pub(super) struct Hardware<'a, R: Registers, T: Timer> {
     timer: &'a T,
     semaphore_attempts: usize,
     clear_semaphore_once: bool,
+    /// The share of waiting this call has, when driven in slices.
+    slice: Option<&'a Slice>,
 }
 
 impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
@@ -336,7 +406,28 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
             timer,
             semaphore_attempts: (1usize << shift) + 1,
             clear_semaphore_once: true,
+            slice: None,
         })
+    }
+
+    /// Drive this controller's sequences in slices of `slice`.
+    pub(super) fn sliced(mut self, slice: &'a Slice) -> Self {
+        self.slice = Some(slice);
+        self
+    }
+
+    /// Wait at least `microseconds`, then yield if this call's slice is
+    /// used up.
+    async fn pause(&self, microseconds: u64) -> Result<(), BlockError> {
+        self.timer.delay(microseconds)?;
+        if let Some(slice) = self.slice {
+            let left = slice.left.get().saturating_sub(microseconds);
+            slice.left.set(left);
+            if left == 0 {
+                Yield(false).await;
+            }
+        }
+        Ok(())
     }
 
     fn read(&self, register: usize) -> Result<u32, BlockError> {
@@ -352,7 +443,7 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
         self.registers.write(register, value & !clear | set);
         Ok(())
     }
-    fn poll(
+    async fn poll(
         &self,
         register: usize,
         mask: u32,
@@ -365,26 +456,27 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
             if (value & mask != 0) == set {
                 return Ok(value);
             }
-            self.timer.delay(delay)?;
+            self.pause(delay).await?;
         }
         Err(BlockError::Timeout)
     }
 
     /// The MAC reset after a bus master drain of up to `master_polls` polls.
-    fn reset(&self, master_polls: usize) -> Result<(), BlockError> {
+    async fn reset(&self, master_polls: usize) -> Result<(), BlockError> {
         self.registers.write(IMC, u32::MAX);
         self.registers.write(EIMC, u32::MAX);
         self.modify(CTRL, 0, MASTER_DISABLE)?;
         // Unlike Linux's log-and-continue recovery, a fresh Stela attachment
         // never continues past an uncertain DMA drain or NVM load.
-        self.poll(STATUS, MASTER_ENABLED, false, master_polls, 2_000)?;
+        self.poll(STATUS, MASTER_ENABLED, false, master_polls, 2_000)
+            .await?;
         self.registers.write(RCTL, 0);
         self.registers.write(TCTL, 1 << 3);
         self.read(STATUS)?; // Posted write flush before the required settle.
-        self.timer.delay(10_000)?;
+        self.pause(10_000).await?;
         self.modify(CTRL, 0, MAC_RESET)?;
-        self.poll(CTRL, MAC_RESET, false, 10, 1_000)?;
-        self.poll(EECD, AUTO_READ_DONE, true, 10, 1_000)?;
+        self.poll(CTRL, MAC_RESET, false, 10, 1_000).await?;
+        self.poll(EECD, AUTO_READ_DONE, true, 10, 1_000).await?;
         self.registers.write(IMC, u32::MAX);
         self.registers.write(EIMC, u32::MAX);
         self.read(ICR)?;
@@ -397,11 +489,14 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     /// [`DROP_MASTER_POLLS`]). Only a completed reset proves the controller
     /// writes no ring.
     pub(super) fn stop(&self, master_polls: usize) -> Result<(), BlockError> {
+        block(self.stop_steps(master_polls))
+    }
+    pub(super) async fn stop_steps(&self, master_polls: usize) -> Result<(), BlockError> {
         self.modify(RCTL, RCTL_EN, 0)?;
         self.modify(TCTL, TCTL_EN, 0)?;
         self.read(STATUS)?;
-        self.timer.delay(10_000)?;
-        self.reset(master_polls)
+        self.pause(10_000).await?;
+        self.reset(master_polls).await
     }
 
     /// igc_release_hw_control: hand the controller back to manageability
@@ -413,7 +508,7 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     fn put_hw_semaphore(&self) -> Result<(), BlockError> {
         self.modify(SWSM, SMBI | SWESMBI, 0)
     }
-    fn hw_semaphore(&mut self) -> Result<(), BlockError> {
+    async fn hw_semaphore(&mut self) -> Result<(), BlockError> {
         let mut acquired = false;
         for retry in 0..2 {
             for _ in 0..self.semaphore_attempts {
@@ -421,7 +516,7 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
                     acquired = true;
                     break;
                 }
-                self.timer.delay(500)?;
+                self.pause(500).await?;
             }
             if acquired {
                 break;
@@ -437,14 +532,14 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
             if self.read(SWSM)? & SWESMBI != 0 {
                 return Ok(());
             }
-            self.timer.delay(500)?;
+            self.pause(500).await?;
         }
         self.put_hw_semaphore()?;
         Err(BlockError::Timeout)
     }
-    fn acquire(&mut self, mask: u32) -> Result<(), BlockError> {
+    async fn acquire(&mut self, mask: u32) -> Result<(), BlockError> {
         for _ in 0..200 {
-            self.hw_semaphore()?;
+            self.hw_semaphore().await?;
             let result = self.read(SW_FW_SYNC);
             let value = match result {
                 Ok(value) => value,
@@ -465,12 +560,12 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
                 };
             }
             self.put_hw_semaphore()?;
-            self.timer.delay(5_000)?;
+            self.pause(5_000).await?;
         }
         Err(BlockError::Timeout)
     }
-    fn release(&mut self, mask: u32) -> Result<(), BlockError> {
-        self.hw_semaphore()?;
+    async fn release(&mut self, mask: u32) -> Result<(), BlockError> {
+        self.hw_semaphore().await?;
         let result = self.modify(SW_FW_SYNC, mask, 0).and_then(|()| {
             if self.read(SW_FW_SYNC)? & mask != 0 {
                 Err(BlockError::Unsupported(
@@ -483,21 +578,7 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
         let released = self.put_hw_semaphore();
         result.and(released)
     }
-    fn synchronized<V>(
-        &mut self,
-        mask: u32,
-        operation: impl FnOnce(&mut Self) -> Result<V, BlockError>,
-    ) -> Result<V, BlockError> {
-        self.acquire(mask)?;
-        let result = operation(self);
-        let released = self.release(mask);
-        match (result, released) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        }
-    }
-
-    fn mdio(&self, register: u16, write: Option<u16>) -> Result<u16, BlockError> {
+    async fn mdio(&self, register: u16, write: Option<u16>) -> Result<u16, BlockError> {
         if register > 31 {
             return Err(BlockError::Unsupported(
                 "igc MDIO register outside Clause22",
@@ -509,7 +590,7 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
         self.registers.write(MDIC, command);
         let mut value = 0;
         for _ in 0..1920 {
-            self.timer.delay(50)?;
+            self.pause(50).await?;
             value = self.read(MDIC)?;
             if value & MDIC_READY != 0 {
                 break;
@@ -528,89 +609,105 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
         }
         Ok(value as u16)
     }
-    fn mmd(&self, device: u16, register: u16, write: Option<u16>) -> Result<u16, BlockError> {
+    async fn mmd(&self, device: u16, register: u16, write: Option<u16>) -> Result<u16, BlockError> {
         // Hold the PHY semaphore across the entire address/data sequence;
         // no firmware or sibling operation can interleave its MMD selector.
-        self.mdio(MMD_CONTROL, Some(device))?;
-        self.mdio(MMD_DATA, Some(register))?;
-        self.mdio(MMD_CONTROL, Some(0x4000 | device))?;
-        let result = self.mdio(MMD_DATA, write)?;
-        self.mdio(MMD_CONTROL, Some(0))?;
+        self.mdio(MMD_CONTROL, Some(device)).await?;
+        self.mdio(MMD_DATA, Some(register)).await?;
+        self.mdio(MMD_CONTROL, Some(0x4000 | device)).await?;
+        let result = self.mdio(MMD_DATA, write).await?;
+        self.mdio(MMD_CONTROL, Some(0)).await?;
         Ok(result)
     }
 
-    fn validate_nvm(&mut self) -> Result<(), BlockError> {
+    async fn validate_nvm(&mut self) -> Result<(), BlockError> {
         if self.read(EECD)? & FLASH_PRESENT == 0 {
             return Ok(());
         }
-        self.synchronized(NVM_SYNC, |hw| {
-            let mut sum = 0u16;
-            for word in 0..64u32 {
-                hw.registers.write(EERD, word << 2 | 1);
-                let value = hw.poll(EERD, 2, true, 100_000, 5)?;
-                sum = sum.wrapping_add((value >> 16) as u16);
-            }
-            if sum != 0xbaba {
-                return Err(BlockError::Unsupported("igc NVM checksum mismatch"));
-            }
-            Ok(())
-        })
+        self.acquire(NVM_SYNC).await?;
+        let result = self.nvm_checksum().await;
+        let released = self.release(NVM_SYNC).await;
+        joined(result, released)
+    }
+    async fn nvm_checksum(&self) -> Result<(), BlockError> {
+        let mut sum = 0u16;
+        for word in 0..64u32 {
+            self.registers.write(EERD, word << 2 | 1);
+            let value = self.poll(EERD, 2, true, 100_000, 5).await?;
+            sum = sum.wrapping_add((value >> 16) as u16);
+        }
+        if sum != 0xbaba {
+            return Err(BlockError::Unsupported("igc NVM checksum mismatch"));
+        }
+        Ok(())
     }
 
-    fn phy(&mut self) -> Result<u32, BlockError> {
+    async fn phy(&mut self) -> Result<u32, BlockError> {
         // igc_check_reset_block: management firmware (SOL/IDE-R) owns the
         // PHY. igc_phy_hw_reset then skips the reset and igc_setup_link the
         // link setup: the firmware has already brought the link up.
         let blocked = self.read(MANC)? & MANC_BLOCK_PHY_RESET != 0;
         if !blocked {
-            self.synchronized(PHY_SYNC, |hw| {
-                let ctrl = hw.read(CTRL)?;
-                hw.registers.write(CTRL, ctrl | PHY_RESET);
-                hw.read(STATUS)?;
-                hw.timer.delay(100)?;
-                hw.registers.write(CTRL, ctrl);
-                hw.read(STATUS)?;
-                hw.timer.delay(100)?;
-                // igc_phy_hw_reset only logs a reset completion that never
-                // came; the identity read below still proves the PHY answers.
-                match hw.poll(PHPM, PHY_RESET_COMPLETE, true, 10_000, 1) {
-                    Ok(_) | Err(BlockError::Timeout) => {}
-                    Err(error) => return Err(error),
-                }
-                hw.timer.delay(100)?;
-                Ok(())
-            })?;
+            self.acquire(PHY_SYNC).await?;
+            let result = self.phy_reset().await;
+            let released = self.release(PHY_SYNC).await;
+            joined(result, released)?;
         }
-        self.synchronized(PHY_SYNC, |hw| {
-            let upper = hw.mdio(2, None)?;
-            hw.timer.delay(200)?;
-            let lower = hw.mdio(3, None)?;
-            let identity = u32::from(upper) << 16 | u32::from(lower);
-            if upper == 0 || upper == u16::MAX || lower == u16::MAX {
-                return Err(BlockError::Unsupported("igc invalid internal PHY identity"));
-            }
-            // Source igc_power_up_phy_copper, followed by advertisement.
-            let control = hw.mdio(PHY_CONTROL, None)?;
-            hw.mdio(PHY_CONTROL, Some(control & !(1 << 11)))?;
-            if blocked {
-                return Ok(identity);
-            }
-            let adv = hw.mdio(PHY_ADVERTISEMENT, None)?;
-            let gigabit = hw.mdio(PHY_GIGABIT, None)?;
-            let multigig = hw.mmd(MMD_AN, MMD_MULTIGIG, None)?;
-            // All source default copper speeds, no 1000/2500 half duplex;
-            // igc_fc_default resolves to full: symmetric and asymmetric PAUSE.
-            hw.mdio(PHY_ADVERTISEMENT, Some(adv | 0x0de0))?;
-            hw.mdio(PHY_GIGABIT, Some((gigabit & !0x0300) | 0x0200))?;
-            hw.mmd(MMD_AN, MMD_MULTIGIG, Some(multigig | 0x0080))?;
-            let control = hw.mdio(PHY_CONTROL, None)?;
-            hw.mdio(PHY_CONTROL, Some(control | 0x1200))?;
-            Ok(identity)
-        })
+        self.acquire(PHY_SYNC).await?;
+        let result = self.phy_setup(blocked).await;
+        let released = self.release(PHY_SYNC).await;
+        joined(result, released)
+    }
+    async fn phy_reset(&self) -> Result<(), BlockError> {
+        let ctrl = self.read(CTRL)?;
+        self.registers.write(CTRL, ctrl | PHY_RESET);
+        self.read(STATUS)?;
+        self.pause(100).await?;
+        self.registers.write(CTRL, ctrl);
+        self.read(STATUS)?;
+        self.pause(100).await?;
+        // igc_phy_hw_reset only logs a reset completion that never
+        // came; the identity read below still proves the PHY answers.
+        match self.poll(PHPM, PHY_RESET_COMPLETE, true, 10_000, 1).await {
+            Ok(_) | Err(BlockError::Timeout) => {}
+            Err(error) => return Err(error),
+        }
+        self.pause(100).await
+    }
+    async fn phy_setup(&self, blocked: bool) -> Result<u32, BlockError> {
+        let upper = self.mdio(2, None).await?;
+        self.pause(200).await?;
+        let lower = self.mdio(3, None).await?;
+        let identity = u32::from(upper) << 16 | u32::from(lower);
+        if upper == 0 || upper == u16::MAX || lower == u16::MAX {
+            return Err(BlockError::Unsupported("igc invalid internal PHY identity"));
+        }
+        // Source igc_power_up_phy_copper, followed by advertisement.
+        let control = self.mdio(PHY_CONTROL, None).await?;
+        self.mdio(PHY_CONTROL, Some(control & !(1 << 11))).await?;
+        if blocked {
+            return Ok(identity);
+        }
+        let adv = self.mdio(PHY_ADVERTISEMENT, None).await?;
+        let gigabit = self.mdio(PHY_GIGABIT, None).await?;
+        let multigig = self.mmd(MMD_AN, MMD_MULTIGIG, None).await?;
+        // All source default copper speeds, no 1000/2500 half duplex;
+        // igc_fc_default resolves to full: symmetric and asymmetric PAUSE.
+        self.mdio(PHY_ADVERTISEMENT, Some(adv | 0x0de0)).await?;
+        self.mdio(PHY_GIGABIT, Some((gigabit & !0x0300) | 0x0200))
+            .await?;
+        self.mmd(MMD_AN, MMD_MULTIGIG, Some(multigig | 0x0080))
+            .await?;
+        let control = self.mdio(PHY_CONTROL, None).await?;
+        self.mdio(PHY_CONTROL, Some(control | 0x1200)).await?;
+        Ok(identity)
     }
 
-    fn phy_read(&mut self, register: u16) -> Result<u16, BlockError> {
-        self.synchronized(PHY_SYNC, |hw| hw.mdio(register, None))
+    async fn phy_read(&mut self, register: u16) -> Result<u16, BlockError> {
+        self.acquire(PHY_SYNC).await?;
+        let result = self.mdio(register, None).await;
+        let released = self.release(PHY_SYNC).await;
+        joined(result, released)
     }
 
     /// Linux igc_check_for_copper_link, entered while a link status change
@@ -619,21 +716,27 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     /// observed link either way. A failed PHY exchange reports no link, as
     /// Linux's watchdog treats it; an absent function is a register error.
     pub(super) fn check_for_copper_link(&mut self) -> Result<Option<Negotiated>, BlockError> {
-        self.copper_link(2)
+        block(self.copper_link(2))
     }
 
     /// The same check repeated after one that found no link, with no link
     /// change since: that check's read cleared the latched-low bit, so one
     /// read gives the present state.
     pub(super) fn recheck_copper_link(&mut self) -> Result<Option<Negotiated>, BlockError> {
-        self.copper_link(1)
+        block(self.copper_link(1))
     }
 
-    fn copper_link(&mut self, status_reads: usize) -> Result<Option<Negotiated>, BlockError> {
-        let first = self.phy_read(PHY_STATUS);
-        let status = (1..status_reads).fold(first, |read, _| {
-            read.and_then(|_| self.phy_read(PHY_STATUS))
-        });
+    pub(super) async fn copper_link(
+        &mut self,
+        status_reads: usize,
+    ) -> Result<Option<Negotiated>, BlockError> {
+        let mut status = self.phy_read(PHY_STATUS).await;
+        for _ in 1..status_reads {
+            if status.is_err() {
+                break;
+            }
+            status = self.phy_read(PHY_STATUS).await;
+        }
         let link = match status {
             Ok(status) => status & MII_LINK != 0,
             Err(BlockError::Device { status: u32::MAX }) => {
@@ -642,7 +745,7 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
             Err(_) => false,
         };
         let negotiated = if link {
-            let flow_control = self.flow_control_after_link_up()?;
+            let flow_control = self.flow_control_after_link_up().await?;
             let (speed, full_duplex) = self.speed_and_duplex()?;
             Some(Negotiated {
                 speed,
@@ -679,10 +782,9 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     /// fallback when neither side's bits match, and none at half duplex.
     /// An incomplete autonegotiation leaves the MAC's pause enables as they
     /// were, as Linux does.
-    fn flow_control_after_link_up(&mut self) -> Result<FlowControl, BlockError> {
-        let status = self
-            .phy_read(PHY_STATUS)
-            .and_then(|_| self.phy_read(PHY_STATUS))?;
+    async fn flow_control_after_link_up(&mut self) -> Result<FlowControl, BlockError> {
+        self.phy_read(PHY_STATUS).await?;
+        let status = self.phy_read(PHY_STATUS).await?;
         if status & MII_AUTONEG_COMPLETE == 0 {
             let ctrl = self.read(CTRL)?;
             return Ok(match (ctrl & CTRL_RFCE != 0, ctrl & CTRL_TFCE != 0) {
@@ -692,8 +794,8 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
                 (true, true) => FlowControl::Full,
             });
         }
-        let local = self.phy_read(PHY_ADVERTISEMENT)?;
-        let partner = self.phy_read(PHY_PARTNER)?;
+        let local = self.phy_read(PHY_ADVERTISEMENT).await?;
+        let partner = self.phy_read(PHY_PARTNER).await?;
         let both = |bits: u16, value: u16| value & bits == bits;
         let mut mode = if local & PAUSE != 0 && partner & PAUSE != 0 {
             FlowControl::Full
@@ -749,13 +851,21 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     /// The 1000BASE-T status register's remote receiver OK bit, which Linux
     /// waits on for up to two seconds before reporting a 1 Gb/s carrier.
     pub(super) fn remote_receiver_ready(&mut self) -> Result<bool, BlockError> {
-        Ok(self.phy_read(PHY_GIGABIT_STATUS)? & REMOTE_RECEIVER_OK != 0)
+        block(self.remote_receiver_ready_steps())
+    }
+    pub(super) async fn remote_receiver_ready_steps(&mut self) -> Result<bool, BlockError> {
+        Ok(self.phy_read(PHY_GIGABIT_STATUS).await? & REMOTE_RECEIVER_OK != 0)
     }
 
     pub(super) fn initialize(&mut self) -> Result<u32, BlockError> {
-        self.reset(MASTER_POLLS)?;
-        self.validate_nvm()?;
-        let identity = self.phy()?;
+        block(self.initialize_steps())
+    }
+    /// igc_reset_hw, the NVM check, PHY reset and copper setup, and the MAC
+    /// configuration: in slices when [`Self::sliced`].
+    pub(super) async fn initialize_steps(&mut self) -> Result<u32, BlockError> {
+        self.reset(MASTER_POLLS).await?;
+        self.validate_nvm().await?;
+        let identity = self.phy().await?;
         // igc_setup_copper_link_base. Pause stays off until the link-up
         // resolution in check_for_copper_link enables what was negotiated.
         self.modify(

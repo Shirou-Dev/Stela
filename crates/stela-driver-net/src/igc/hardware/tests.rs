@@ -675,3 +675,49 @@ fn unchanged_linux_advertisement_matches_real_mdio_and_mmd_operations() {
     }
     assert_eq!(cases, 4096);
 }
+
+/// The same initialization driven in slices, as a transmit-hang reset runs
+/// it: every slice waits at most 60 ms, and the outcome matches the
+/// blocking run's, for a clean start and for each stuck or busy step.
+#[test]
+fn a_sliced_initialization_matches_the_blocking_one_and_waits_little_per_call() {
+    let models: [fn(&Model); 7] = [
+        |_| {},
+        |model| model.master_stuck.set(true),
+        |model| model.reset_stuck.set(true),
+        |model| model.phy_reset_stuck.set(true),
+        |model| model.firmware_busy.set(true),
+        |model| model.software_busy.set(true),
+        |model| model.mdio_silent.set(true),
+    ];
+    for (case, prepare) in models.into_iter().enumerate() {
+        for flash in [false, true] {
+            let blocking = Model::ready(flash);
+            prepare(&blocking);
+            let expected = Hardware::new(&blocking, &blocking).unwrap().initialize();
+            let model = Model::ready(flash);
+            prepare(&model);
+            let slice = Slice::new();
+            let mut hw = Hardware::new(&model, &model).unwrap().sliced(&slice);
+            let mut task = pin!(hw.initialize_steps());
+            let mut context = Context::from_waker(Waker::noop());
+            let mut calls = 0;
+            let result = loop {
+                slice.refill();
+                let before = model.elapsed.get();
+                let poll = task.as_mut().poll(&mut context);
+                let waited = model.elapsed.get() - before;
+                assert!(waited <= 60_000, "case {case}: {waited}");
+                calls += 1;
+                if let Poll::Ready(result) = poll {
+                    break result;
+                }
+            };
+            assert_eq!(result, expected, "case {case} flash {flash}");
+            assert_eq!(model.elapsed.get(), blocking.elapsed.get(), "case {case}");
+            if model.elapsed.get() > 100_000 {
+                assert!(calls > 1, "case {case}");
+            }
+        }
+    }
+}
