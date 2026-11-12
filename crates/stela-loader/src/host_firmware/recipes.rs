@@ -127,6 +127,11 @@ enum Consumer {
     /// A chip whose XID is the extended marker (`7c8` under `7cf`) and whose
     /// extended word classifies as zero, as r8169's RTL9151AS check reads it.
     RealtekExtended,
+    /// An RTL8153 or RTL8156 USB adapter whose TCR version register reads
+    /// one of `versions`, as r8152's `rtl_fw_init` picks the file.
+    RealtekUsb {
+        versions: &'static [u16],
+    },
     IntelRsa,
     Wifi,
     Nouveau,
@@ -343,6 +348,84 @@ pub const REALTEK: &[Recipe] = &[
         "1287fdd82ff2f60d75c9970c108b49cfd11456ad3fe29c9666b8539a35777dbf",
         0x7c8,
         0x2c8,
+    ),
+];
+
+/// The r8152 files' notice at the r8169 files' revision, as WHENCE names
+/// it for them.
+const REALTEK_USB_LICENSE: Artifact = Artifact {
+    source: LINUX_FIRMWARE,
+    revision: REALTEK_REVISION,
+    member: "LICENSES/LICENCE.rtlwifi_firmware.txt",
+    length: 2115,
+    sha256: "a61351665b4f264f6c631364f85b907d8f8f41f8b369533ef4021765f9f3b62e",
+};
+
+const fn realtek_usb(
+    member: &'static str,
+    length: usize,
+    sha256: &'static str,
+    versions: &'static [u16],
+) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source: LINUX_FIRMWARE,
+            revision: REALTEK_REVISION,
+            member,
+            length,
+            sha256,
+        },
+        license: &REALTEK_USB_LICENSE,
+        consumer: Consumer::RealtekUsb { versions },
+    }
+}
+
+/// The r8152 PHY and MAC patches. The driver starts a chip without its
+/// file, as r8152 does, but runs it as Realtek tuned it only with one.
+/// USB adapters are not on PCI before the boot's own USB stack runs, so a
+/// boot always reads these files, about 17 KB in all.
+pub const REALTEK_USB: &[Recipe] = &[
+    realtek_usb(
+        "rtl_nic/rtl8153a-2.fw",
+        1768,
+        "7d4f422ec0e8141576c1b486fe6b7c6ce8ec9ea1f650815fd4058878c038366d",
+        &[0x5c10],
+    ),
+    realtek_usb(
+        "rtl_nic/rtl8153a-3.fw",
+        1440,
+        "c7099a1b0fc80e02ff7276aacbb08b5771e2f5c763fb76a7a8df3a89d58d8208",
+        &[0x5c20],
+    ),
+    realtek_usb(
+        "rtl_nic/rtl8153a-4.fw",
+        1184,
+        "99a05414fc0ae3b99a453d73b5cae90bfa6d371320f78011fc58cb03a33e2a09",
+        &[0x5c30],
+    ),
+    realtek_usb(
+        "rtl_nic/rtl8153b-2.fw",
+        1880,
+        "137c9c752e8648ecfcf3b74ffc7d675c098145c222e2969721e6257af31716bc",
+        &[0x6010],
+    ),
+    realtek_usb(
+        "rtl_nic/rtl8153c-1.fw",
+        832,
+        "bbe5f74bd2625b71c9a70e0588472ef670b5eeb65f83b1202cd25b3381720a3f",
+        &[0x6400],
+    ),
+    realtek_usb(
+        "rtl_nic/rtl8156a-2.fw",
+        4024,
+        "7b50f4a307bde7b3f384935537c4d9705457fa42613eb0003ffbc4e19461a1e0",
+        &[0x7030],
+    ),
+    realtek_usb(
+        "rtl_nic/rtl8156b-2.fw",
+        5776,
+        "5a3b21e27305876af8eac4b9bd11a821487b338e4ac1b58b8be8d23467d3f91f",
+        &[0x7410, 0x7420],
     ),
 ];
 
@@ -1162,6 +1245,25 @@ fn select_realtek(request: &Request) -> Option<&'static Recipe> {
     recipe.filter(|recipe| recipe.image.member == request.name)
 }
 
+/// The r8152 driver's request: its USB adapter's IDs and the TCR version
+/// that names the file.
+fn select_realtek_usb(request: &Request) -> Option<&'static Recipe> {
+    let usb: Vec<_> = request.target.hardware.split(':').collect();
+    if usb.len() != 4 || usb[0] != "usb" || !usb[1..].iter().all(|f| hex_field(f, 4)) {
+        return None;
+    }
+    let version = request
+        .target
+        .revision
+        .strip_prefix("tcr-")
+        .filter(|s| hex_field(s, 4))
+        .and_then(|s| u16::from_str_radix(s, 16).ok())?;
+    REALTEK_USB.iter().find(|recipe| {
+        recipe.image.member == request.name
+            && matches!(recipe.consumer, Consumer::RealtekUsb { versions } if versions.contains(&version))
+    })
+}
+
 fn select_intel_rsa(request: &Request) -> Option<&'static Recipe> {
     let usb: Vec<_> = request.target.hardware.split(':').collect();
     if usb.len() != 4
@@ -1205,6 +1307,7 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
     }
     match request.target.driver.as_str() {
         "realtek" => select_realtek(request),
+        "usb-rtl815x" => select_realtek_usb(request),
         "intel-bluetooth-usb-rsa" => select_intel_rsa(request),
         "wifi-regulatory" => select_regulatory(request),
         "wifi-intel" => select_intel_wifi(request),
@@ -1401,6 +1504,75 @@ mod tests {
         for device in stela_driver_net::realtek::PCI_DEVICES {
             assert!(pinned.contains(device) || *device == 0x8169, "{device:04x}");
         }
+    }
+
+    /// The pinned member answering an r8152 request, if the request is
+    /// well formed and one does.
+    fn usb_member(name: &str, hardware: &str, revision: &str) -> Option<&'static str> {
+        let inventory = Inventory::parse(&serde_json::to_vec(&serde_json::json!({"schema":1,"complete":true,"requirements":[{
+            "name":name,"target":{"driver":"usb-rtl815x","hardware":hardware,"revision":revision,"board":null},"minimum_bytes":4
+        }]})).unwrap()).ok()?;
+        let plan = Plan::select(&inventory).ok()?;
+        assert!(
+            plan.selections[0]
+                .recipe
+                .image
+                .url()
+                .contains(REALTEK_REVISION)
+        );
+        Some(plan.selections[0].recipe.image.member)
+    }
+
+    /// Each TCR version the r8152 driver names a file for has that file
+    /// pinned, under any adapter's USB IDs, and nothing else answers.
+    #[test]
+    fn every_realtek_usb_firmware_request_has_a_pinned_file() {
+        use stela_drivers::usb::ethernet::rtl815x::Revision;
+        let mut named = 0;
+        for version in 0..=u16::MAX {
+            let tcr = format!("tcr-{version:04x}");
+            let Some(name) = Revision(version).firmware() else {
+                assert!(
+                    !REALTEK_USB.iter().any(|recipe| matches!(
+                        recipe.consumer,
+                        Consumer::RealtekUsb { versions } if versions.contains(&version)
+                    )),
+                    "{tcr}"
+                );
+                continue;
+            };
+            named += 1;
+            for hardware in ["usb:0bda:8153:3100", "usb:17ef:a387:3000"] {
+                assert_eq!(
+                    usb_member(name, hardware, &tcr),
+                    Some(name),
+                    "{hardware} {tcr}"
+                );
+            }
+            for other in REALTEK_USB.iter().map(|recipe| recipe.image.member) {
+                if other != name {
+                    assert_eq!(
+                        usb_member(other, "usb:0bda:8153:3100", &tcr),
+                        None,
+                        "{tcr} {other}"
+                    );
+                }
+            }
+        }
+        assert_eq!(named, 8);
+        for (hardware, revision) in [
+            ("usb:0bda:8153", "tcr-5c10"),
+            ("pci:0bda:8153:3100", "tcr-5c10"),
+            ("usb:0BDA:8153:3100", "tcr-5c10"),
+            ("usb:0bda:8153:3100", "tcr-5C10"),
+            ("usb:0bda:8153:3100", "xid-5c10"),
+        ] {
+            assert_eq!(
+                usb_member("rtl_nic/rtl8153a-2.fw", hardware, revision),
+                None
+            );
+        }
+        assert!(REALTEK_USB_LICENSE.verify(b"changed license").is_err());
     }
 
     fn gsp_member(name: &str) -> Option<&'static str> {

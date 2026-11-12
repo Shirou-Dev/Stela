@@ -2400,6 +2400,7 @@ dependencies = [
  "stela-crypto",
  "stela-driver-core",
  "stela-driver-net",
+ "stela-drivers",
  "stela-engine",
  "stela-formats",
  "stela-soc-data",
