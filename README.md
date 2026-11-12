@@ -74,7 +74,7 @@ sudo ./stela log --output log.txt
 On Windows, open Terminal with Run as administrator and run:
 
 ```
-.\stela.exe setup boot-log --output log.txt
+.\stela.exe log --output log.txt
 ```
 
 ## Build
