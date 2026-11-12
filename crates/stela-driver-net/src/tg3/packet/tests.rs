@@ -515,11 +515,17 @@ impl Device {
             return Err(Error::Access);
         }
         let value = match at {
-            0x84 => self
-                .sram
-                .get(&self.mac.get(&0x7c).copied().unwrap_or(0))
-                .copied()
-                .unwrap_or(0),
+            0x84 => {
+                let window = self.mac.get(&0x7c).copied().unwrap_or(0);
+                match self.sram.get(&window) {
+                    Some(value) => *value,
+                    // The bootcode publishes its PHY's ID registers.
+                    None if window == 0xb74 => {
+                        u32::from(self.phy_read(2)) << 16 | u32::from(self.phy_read(3))
+                    }
+                    None => 0,
+                }
+            }
             0x44c => {
                 if self.busy {
                     self.busy = false;

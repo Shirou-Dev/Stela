@@ -222,7 +222,11 @@ fn actual_5761_unsupported_or_unsigned_board_media_clock_or_nvram_never_publish_
                     p.sram.insert(0xd3c, 0x0040_0000);
                 }
                 12 => {
-                    p.phy.insert(3, 0);
+                    // Another family's known PHY.
+                    let id = 0x5c0d_8b62u32;
+                    p.phy.insert(2, (id >> 10) as u16);
+                    p.phy
+                        .insert(3, (((id >> 16) & 0xfc00) | (id & 0x3ff)) as u16);
                 }
                 _ => {
                     p.bdf_function = Some(1);

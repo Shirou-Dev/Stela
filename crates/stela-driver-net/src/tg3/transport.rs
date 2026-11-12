@@ -48,6 +48,45 @@ const ALLOW_APE: u32 = 0x0007_0000;
 const CPMU_STATUS: u32 = 0x362c;
 const SRAM_CPMU_STATUS: u32 = 0xe00;
 const HOST_ACCESS: u32 = 0x9a; // MASK_PCI_INT | WORD_SWAP | INDIR_ACCESS | PCISTATE_RW.
+const SRAM_DATA_SIGNATURE: u32 = 0xb54;
+const SRAM_DATA_PHY_ID: u32 = 0xb74;
+const PHY_ID_MASK: u32 = 0xffff_fff0;
+
+/// Broadcom's PHY ID layout from MII ID registers 2 and 3, which is not the
+/// ordinary (ID1 << 16) | ID2.
+const fn broadcom_phy_id(high: u32, low: u32) -> u32 {
+    ((high & 0xffff) << 10) | ((low & 0xfc00) << 16) | (low & 0x3ff)
+}
+
+/// `TG3_KNOWN_PHY_ID`: the masked PHY IDs tg3 takes from the PHY itself.
+const fn known_phy_id(masked: u32) -> bool {
+    matches!(
+        masked,
+        0x6000_8040 // BCM5400
+            | 0x6000_8050 // BCM5401
+            | 0x6000_8070 // BCM5411
+            | 0x6000_8110 // BCM5701
+            | 0x6000_8160 // BCM5703
+            | 0x6000_8190 // BCM5704
+            | 0x6000_81a0 // BCM5705
+            | 0x6000_8180 // BCM5750
+            | 0x6000_8100 // BCM5752
+            | 0x6000_8340 // BCM5714
+            | 0x6000_8350 // BCM5780
+            | 0xbc05_0ce0 // BCM5787
+            | 0xbc05_0cc0 // BCM5755
+            | 0xbc05_0ed0 // BCM5756
+            | 0xdc00_ac40 // BCM5906
+            | 0xbc05_0fd0 // BCM5761
+            | 0x5c0d_8a00 // BCM5718C
+            | 0xbc05_0ff0 // BCM5718S
+            | 0x5c0d_8a40 // BCM57765
+            | 0x5c0d_8a20 // BCM5719C
+            | 0x5c0d_8b60 // BCM5720C
+            | 0x8580_3780 // BCM5762
+            | 0x6001_0140 // BCM8002
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
@@ -506,14 +545,42 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let result = self.phy_command(register, Some(value)).map(|_| ());
         self.record(result)
     }
+    /// `tg3_phy_probe`'s PHY ID. The PHY's own ID registers are read only
+    /// when no management firmware may be using the PHY (no ASF, no APE),
+    /// and that ID is taken only when tg3 knows it (`TG3_KNOWN_PHY_ID`).
+    /// Otherwise the ID the bootcode published in the signed NIC SRAM
+    /// (`tg3_get_eeprom_hw_cfg`) stands, as in Linux; a published zero
+    /// means no copper PHY. Linux's last fallback, its subsystem-ID table
+    /// for unsigned boards, is not implemented: an unsigned board is
+    /// refused. Like Linux, the driver sets up a published ID tg3 does not
+    /// know as the family's copper PHY (tg3 keys its PHY setup to the ASIC
+    /// for these families). A known ID must be the family's own PHY.
     pub fn read_phy_identity(&mut self) -> Result<u32, Error> {
         self.check()?;
         let result = (|| {
-            let high = u32::from(self.phy_command(2, None)?);
-            let low = u32::from(self.phy_command(3, None)?);
-            // Broadcom's OUI layout is not the ordinary (ID1 << 16) | ID2.
-            let identity = (high << 10) | ((low & 0xfc00) << 16) | (low & 0x3ff);
-            let expected = match self.identity.expect("identified").asic {
+            let chip = self.identity.expect("identified");
+            let hardware = if self.management.asf || chip.ape {
+                None
+            } else {
+                let high = u32::from(self.phy_command(2, None)?);
+                let low = u32::from(self.phy_command(3, None)?);
+                Some(broadcom_phy_id(high, low))
+            };
+            let identity = match hardware {
+                Some(identity) if known_phy_id(identity & PHY_ID_MASK) => identity,
+                _ => {
+                    if self.sram(SRAM_DATA_SIGNATURE, None)? != FIRMWARE_MAGIC {
+                        return Err(Error::UnsignedBoard);
+                    }
+                    let published = self.sram(SRAM_DATA_PHY_ID, None)?;
+                    if published == 0 {
+                        0
+                    } else {
+                        broadcom_phy_id(published >> 16, published & 0xffff)
+                    }
+                }
+            };
+            let expected = match chip.asic {
                 Asic::Bcm5761 => 0xbc05_0fd0,
                 Asic::Bcm57765 => 0x5c0d_8a40,
                 Asic::Bcm5717 => 0x5c0d_8a00,
@@ -521,7 +588,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 Asic::Bcm5720 => 0x5c0d_8b60,
                 Asic::Bcm5762 => 0x8580_3780,
             };
-            if identity & 0xffff_fff0 != expected {
+            let masked = identity & PHY_ID_MASK;
+            // TG3_PHY_ID_INVALID published sends Linux to its subsystem
+            // table, which is not implemented.
+            if masked == 0 || identity == u32::MAX || (masked != expected && known_phy_id(masked)) {
                 return Err(Error::UnsupportedMedia);
             }
             Ok(identity)

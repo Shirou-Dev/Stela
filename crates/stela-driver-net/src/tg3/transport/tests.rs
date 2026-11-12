@@ -148,7 +148,15 @@ unsafe impl Registers for Reg {
         }
         let value = if at == MEM_DATA {
             let window = *m.mac.get(&MEM_BASE).unwrap_or(&0);
-            *m.sram.get(&window).unwrap_or(&0)
+            match m.sram.get(&window) {
+                Some(value) => *value,
+                // The bootcode publishes its PHY's ID registers.
+                None if window == SRAM_DATA_PHY_ID => {
+                    u32::from(*m.phy.get(&2).unwrap_or(&0)) << 16
+                        | u32::from(*m.phy.get(&3).unwrap_or(&0))
+                }
+                None => 0,
+            }
         } else if at == MAC_MI_COM && m.command != 0 {
             if m.force_busy || m.busy_reads > 0 {
                 m.busy_reads = m.busy_reads.saturating_sub(1);
@@ -291,6 +299,7 @@ fn model(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>)
         u32::from(function) << 30
     };
     m.sram.insert(SRAM_CPMU_STATUS, port | CPMU_STATUS);
+    m.sram.insert(SRAM_DATA_SIGNATURE, FIRMWARE_MAGIC);
     let m = Rc::new(RefCell::new(m));
     // SAFETY: both original owners belong to this isolated symbolic device.
     (
@@ -1203,4 +1212,96 @@ fn the_57765_class_has_no_ape_to_open_lock_or_tell() {
     let (mut hardware, m) = model(Asic::Bcm57765, 0);
     m.borrow_mut().config.insert(GEN15_PRODID, 0x0572_0000);
     assert_eq!(hardware.identify(), Err(Error::UnsupportedRevision));
+}
+
+/// Whether the driver read MII ID register 2 or 3.
+fn read_phy_id_registers(m: &Model) -> bool {
+    m.trace.iter().any(|e| {
+        matches!(e, Event::Write(MAC_MI_COM, command)
+            if command & MI_READ != 0 && matches!((command >> 16) & 31, 2 | 3))
+    })
+}
+fn publish_phy_id(m: &Rc<RefCell<Model>>, identity: u32) {
+    let low = ((identity >> 16) & 0xfc00) | (identity & 0x3ff);
+    m.borrow_mut()
+        .sram
+        .insert(SRAM_DATA_PHY_ID, ((identity >> 10) & 0xffff) << 16 | low);
+}
+/// A PHY whose ID, masked 0x5c0d_8a50, is not in TG3_KNOWN_PHY_ID.
+fn unknown_phy(m: &Rc<RefCell<Model>>) {
+    let unknown = 0x5c0d_8a51u32;
+    m.borrow_mut()
+        .phy
+        .insert(3, (((unknown >> 16) & 0xfc00) | (unknown & 0x3ff)) as u16);
+}
+
+#[test]
+fn a_known_phy_id_comes_from_the_phy_itself_without_management_firmware() {
+    let (mut hardware, m) = identified(Asic::Bcm57765, 0);
+    // The bootcode's copy is not consulted when the PHY's own ID is known.
+    publish_phy_id(&m, 0);
+    assert_eq!(hardware.read_phy_identity(), Ok(0x5c0d_8a41));
+    assert!(read_phy_id_registers(&m.borrow()));
+    assert!(
+        !m.borrow()
+            .trace
+            .iter()
+            .any(|e| matches!(e, Event::Write(MEM_BASE, SRAM_DATA_PHY_ID)))
+    );
+}
+
+#[test]
+fn an_unknown_phy_id_falls_back_to_the_one_the_bootcode_published() {
+    let (mut hardware, m) = identified(Asic::Bcm57765, 0);
+    unknown_phy(&m);
+    publish_phy_id(&m, 0x5c0d_8a42);
+    assert_eq!(hardware.read_phy_identity(), Ok(0x5c0d_8a42));
+    assert!(read_phy_id_registers(&m.borrow()));
+    // A published zero is tg3's SerDes, which is not driven.
+    let (mut hardware, m) = identified(Asic::Bcm57765, 0);
+    unknown_phy(&m);
+    publish_phy_id(&m, 0);
+    assert_eq!(hardware.read_phy_identity(), Err(Error::UnsupportedMedia));
+    // So is a published ID of another family's known PHY, and Linux's
+    // invalid ID.
+    for published in [0x5c0d_8b60, u32::MAX] {
+        let (mut hardware, m) = identified(Asic::Bcm57765, 0);
+        unknown_phy(&m);
+        publish_phy_id(&m, published);
+        assert_eq!(hardware.read_phy_identity(), Err(Error::UnsupportedMedia));
+    }
+    // A published ID tg3 does not know either is set up as the family's
+    // copper PHY, as Linux does.
+    let (mut hardware, m) = identified(Asic::Bcm57765, 0);
+    unknown_phy(&m);
+    publish_phy_id(&m, 0x5c0d_8a51);
+    assert_eq!(hardware.read_phy_identity(), Ok(0x5c0d_8a51));
+    // Without the SRAM signature there is no published ID to take.
+    let (mut hardware, m) = identified(Asic::Bcm57765, 0);
+    unknown_phy(&m);
+    m.borrow_mut().sram.insert(SRAM_DATA_SIGNATURE, 0);
+    assert_eq!(hardware.read_phy_identity(), Err(Error::UnsignedBoard));
+}
+
+#[test]
+fn management_firmware_keeps_the_phy_id_registers_to_itself() {
+    // ENABLE_APE: the published ID, with no PHY ID read at all.
+    for (asic, published) in [
+        (Asic::Bcm5761, 0xbc05_0fd1),
+        (Asic::Bcm5717, 0x5c0d_8a02),
+        (Asic::Bcm5720, 0x5c0d_8b63),
+        (Asic::Bcm5762, 0x8580_3782),
+    ] {
+        let (mut hardware, m) = identified(asic, 0);
+        publish_phy_id(&m, published);
+        assert_eq!(hardware.read_phy_identity(), Ok(published), "{asic:?}");
+        assert!(!read_phy_id_registers(&m.borrow()), "{asic:?}");
+    }
+    // ASF without an APE: the same.
+    let (mut hardware, m) = identified(Asic::Bcm57765, 0);
+    m.borrow_mut().sram.insert(0xb58, 0x80);
+    hardware.observe_management().unwrap();
+    publish_phy_id(&m, 0x5c0d_8a43);
+    assert_eq!(hardware.read_phy_identity(), Ok(0x5c0d_8a43));
+    assert!(!read_phy_id_registers(&m.borrow()));
 }
