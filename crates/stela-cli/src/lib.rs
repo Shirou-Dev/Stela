@@ -25,7 +25,7 @@ fn examples() -> String {
         "Examples:
   stela                 Choose what to do, step by step
   stela update          Update the plugged-in stick
-  stela log             Save the boot logs to a file
+  stela log             Save the boot logs to log.txt
   stela create {disk} --confirm-disk 64GB --installer offline"
     )
 }

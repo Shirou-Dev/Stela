@@ -51,8 +51,8 @@ pub(crate) enum Command {
     #[command(
         long_about = "Read every boot log on this computer's disks: the stick's and each \
                       install's. PATH limits it to one disk, volume, disk image or boot.log \
-                      copy. On a terminal the logs are saved to stela-boot-log-DATE.txt in this \
-                      folder; otherwise they are printed."
+                      copy. On a terminal the logs are saved to log.txt in this folder, the file \
+                      to attach to a report; otherwise they are printed."
     )]
     Log(Log),
     /// Remove everything Stela wrote to a stick.
