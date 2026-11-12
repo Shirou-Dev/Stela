@@ -1398,11 +1398,15 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
     };
     // SAFETY: entered, on a task.
     job.result = unsafe { gpu::nouveau::start() };
-    if job.result.is_err() {
+    if let Err(errno) = job.result {
+        output::arguments(format_args!("GPU nouveau::start error: errno={errno:?}\n"));
+        output::flush_log();
         // No source-specific device return was acknowledged.
         core::mem::forget(claimed);
         return job;
     }
+    output::arguments(format_args!("GPU nouveau::start passed\n"));
+    output::flush_log();
     for claimed in claimed {
         let authority = {
             let mut function = claimed.device.config.0.borrow_mut();
@@ -1425,6 +1429,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
                     "GPU {} catalogue refused: {error}\n",
                     claimed.name
                 ));
+                output::flush_log();
                 core::mem::forget(claimed.device);
                 continue;
             }
@@ -1438,6 +1443,11 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
             Ok(attached) => {
                 // SAFETY: entered.
                 if unsafe { attached.bound() } {
+                    output::arguments(format_args!(
+                        "GPU {}: nouveau bound successfully\n",
+                        claimed.name
+                    ));
+                    output::flush_log();
                     #[cfg(feature = "nvk")]
                     job.bound.push(Bound {
                         name: claimed.name,
@@ -1449,13 +1459,17 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
                         "GPU {}: nouveau did not bind it\n",
                         claimed.name
                     ));
+                    output::flush_log();
                 }
                 job._attached.push(attached);
             }
-            Err(error) => output::arguments(format_args!(
-                "GPU {} presentation refused: {:?}\n",
-                claimed.name, error.error
-            )),
+            Err(error) => {
+                output::arguments(format_args!(
+                    "GPU {} presentation refused: {:?}\n",
+                    claimed.name, error.error
+                ));
+                output::flush_log();
+            }
         }
     }
     job

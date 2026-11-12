@@ -41,6 +41,9 @@ const ADD_FB2: u32 = request::<FramebufferCommand>(0xb8);
 
 /// `DRM_MODE_CONNECTED`.
 const CONNECTED: u32 = 1;
+const DISCONNECTED: u32 = 2;
+const CONNECTOR_HDMIA: u32 = 11;
+const CONNECTOR_HDMIB: u32 = 12;
 /// `DRM_MODE_TYPE_PREFERRED`.
 const PREFERRED: u32 = 1 << 3;
 /// `DRM_FORMAT_XRGB8888`: blue in the low byte of the little-endian pixel.
@@ -302,6 +305,8 @@ fn list<T: Copy + Default>(count: u32) -> Result<Vec<T>, Error> {
 
 /// A connector: its state, its modes and its encoders.
 struct Output {
+    id: u32,
+    kind: u32,
     connected: bool,
     /// The image size the connector's EDID reports, in millimetres.
     size_mm: [u32; 2],
@@ -334,8 +339,13 @@ fn output<D: Drm>(drm: &mut D, id: u32) -> Result<Output, Error> {
         }
         modes.truncate(described.mode_count as usize);
         encoders.truncate(described.encoder_count as usize);
+        let has_modes = !modes.is_empty();
+        let connected = described.connection == CONNECTED
+            || (has_modes && described.connection != DISCONNECTED);
         return Ok(Output {
-            connected: described.connection == CONNECTED,
+            id,
+            kind: described.kind,
+            connected,
             size_mm: described.size_mm,
             modes,
             encoders,
@@ -451,13 +461,38 @@ impl<D: Drm> Display<D> {
     /// the mode of `wanted` pixels if it has one, as the firmware's did.
     pub fn take(mut drm: D, wanted: (u32, u32)) -> Result<Self, Error> {
         let (crtcs, connectors) = resources(&mut drm)?;
+        let mut found_outputs = Vec::new();
         for &id in &connectors {
-            let found = output(&mut drm, id)?;
-            let Some(mode) = choose(&found.modes, wanted).filter(|_| found.connected) else {
+            if let Ok(found) = output(&mut drm, id) {
+                found_outputs.push(found);
+            }
+        }
+        // Prioritize:
+        // 1. HDMI connected with modes
+        // 2. Any connected with modes (DP)
+        // 3. HDMI connected without modes
+        // 4. Any other connected
+        // 5. Outputs with modes (even if connection state was unknown)
+        found_outputs.sort_by_key(|out| {
+            let is_hdmi = out.kind == CONNECTOR_HDMIA || out.kind == CONNECTOR_HDMIB;
+            let has_modes = !out.modes.is_empty();
+            match (out.connected, has_modes, is_hdmi) {
+                (true, true, true) => 0,
+                (true, true, false) => 1,
+                (true, false, true) => 2,
+                (true, false, false) => 3,
+                (false, true, true) => 4,
+                (false, true, false) => 5,
+                _ => 6,
+            }
+        });
+
+        for found in found_outputs {
+            let Some(mode) = choose(&found.modes, wanted).filter(|_| found.connected || !found.modes.is_empty()) else {
                 continue;
             };
             if let Some(crtc) = controller(&mut drm, &found.encoders, &crtcs)? {
-                let display = Self::run(drm, crtc, id, mode)?;
+                let display = Self::run(drm, crtc, found.id, mode)?;
                 let [width, height] = found.size_mm;
                 return Ok(Self {
                     size_mm: (width != 0 && height != 0).then_some((width, height)),

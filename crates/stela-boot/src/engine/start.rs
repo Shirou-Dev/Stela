@@ -1421,9 +1421,11 @@ fn open_gpus(
         ms(probe),
         ms(host::rdtsc().wrapping_sub(claiming)),
     ));
+    output::flush_log();
     match opened {
         Ok(()) => {
             crate::status::done("started");
+            output::flush_log();
             true
         }
         Err(error) => {
@@ -1431,6 +1433,7 @@ fn open_gpus(
                 &found,
                 &format!("{error}"),
             ));
+            output::flush_log();
             false
         }
     }
@@ -2873,7 +2876,11 @@ fn start_devices(
                 && let Ok(work) = work
                 && open_gpus(work, mmio, remappers, handoff, host_firmware, gpus)
             {
+                output::arguments(format_args!("GPU serving display...\n"));
+                output::flush_log();
                 gpu::serve(handoff.screen.map_or((0, 0), |screen| screen.resolution()));
+                output::arguments(format_args!("GPU display served\n"));
+                output::flush_log();
             }
             disks.profile_callbacks(options.profile);
             if let Some(store) = store {
