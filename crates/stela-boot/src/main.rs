@@ -250,8 +250,11 @@ fn main() -> Status {
         ));
     }
     status::begin("Connecting the firmware's drivers to every device");
-    let handles = firmware::connect_all();
-    output::arguments(format_args!("FIRMWARE connected {handles} handles\n"));
+    let connected = firmware::connect_all();
+    output::arguments(format_args!(
+        "FIRMWARE connected {} handles, {} slow\n",
+        connected.handles, connected.slow
+    ));
     status::done("");
     status::begin("Reading Stela's settings");
     let (mut volume, mut firmware_root) = firmware::volume().unwrap_or_else(|e| output::fatal(e));

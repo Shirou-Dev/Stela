@@ -523,6 +523,25 @@ pub(crate) fn disk_location(handle: Handle) -> Option<alloc::string::String> {
     Some(alloc::format!("{address} {}", plain_nodes(&below)))
 }
 
+/// The class code (configuration bytes 0x0b, 0x0a, 0x09) of the PCI
+/// function `handle` is: `None` when it is no PCI function, `Some(None)`
+/// when its configuration cannot be read.
+pub(crate) fn function_class(handle: Handle) -> Option<Option<u32>> {
+    let mut io = get_protocol::<PciIo>(handle).ok()?;
+    let mut bytes = [0u8; 4];
+    // Width0=EfiPciIoWidthUint8, the revision and class bytes at 0x08.
+    // SAFETY: live boot protocol and bounded writable local output.
+    let read = status(unsafe {
+        (io.config_read)(&mut *io, 0, 0x08, bytes.len(), bytes.as_mut_ptr().cast())
+    });
+    Some(read.ok().map(|()| u32::from_le_bytes(bytes) >> 8))
+}
+
+/// The PCI address of the function `handle` is.
+pub(crate) fn function_address(handle: Handle) -> Option<Address> {
+    get_protocol::<PciIo>(handle).ok()?.address().ok()
+}
+
 /// The identity of the PCI controller the disk behind `handle` hangs from,
 /// as its configuration header gives it.
 pub(crate) fn disk_controller(handle: Handle) -> Option<stela_drivers::bus::pci::Identity> {

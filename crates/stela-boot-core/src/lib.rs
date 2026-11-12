@@ -30,6 +30,7 @@ pub mod doorbell;
 pub mod early_fault;
 pub mod entropy;
 pub mod exit_port;
+pub mod firmware_connect;
 pub mod firmware_state;
 pub mod firmware_time;
 pub mod gpu_status;

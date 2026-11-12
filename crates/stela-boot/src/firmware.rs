@@ -11,16 +11,19 @@ use core::{
     sync::atomic::{AtomicPtr, Ordering},
     time::Duration,
 };
+use stela_boot_core::firmware_connect::{self, Kind};
 use stela_contracts::refuse;
 use uefi::{
-    CStr16, Event,
+    CStr16, Event, Handle,
     boot::{self, AllocateType, EventType, MemoryType, TimerTrigger, Tpl},
     cstr16,
     fs::FileSystem,
     mem::memory_map::MemoryMap,
     proto::{
+        device_path::{DevicePath, DeviceSubType, DeviceType},
         loaded_image::LoadedImage,
         media::{file::Directory, fs::SimpleFileSystem},
+        pci::root_bridge::PciRootBridgeIo,
     },
 };
 
@@ -65,19 +68,130 @@ fn boot_volume() -> Option<(FileSystem, Directory)> {
 }
 
 /// Connect every controller to its drivers, recursively, as a boot manager
-/// does before it lists boot options (edk2 `EfiBootManagerConnectAll`). A
-/// firmware that boots fast connects only the path to the boot loader, and
-/// the bundle, the install medium and the host disks lie on other
-/// partitions and devices. A controller no driver takes stays as it was.
-/// Returns how many handles there were.
-pub(crate) fn connect_all() -> usize {
-    let Ok(handles) = boot::locate_handle_buffer(boot::SearchType::AllHandles) else {
-        return 0;
-    };
-    for &handle in handles.iter() {
-        let _ = boot::connect_controller(handle, &[], None, true);
+/// does before it lists boot options (`stela_boot_core::firmware_connect`).
+/// A firmware that boots fast connects only the path to the boot loader,
+/// and the bundle, the install medium and the host disks lie on other
+/// partitions and devices. Each connection that takes a second or more is
+/// named in the boot log and on the screen.
+pub(crate) fn connect_all() -> firmware_connect::Summary {
+    // Root bridges appear only with the firmware's own drivers, all before
+    // the mount starts, so the first list of them holds.
+    firmware_connect::connect(&mut Connector {
+        root_bridges: boot::find_handles::<PciRootBridgeIo>().unwrap_or_default(),
+    })
+}
+
+/// The firmware calls of [`connect_all`].
+struct Connector {
+    root_bridges: Vec<Handle>,
+}
+
+impl firmware_connect::Firmware for Connector {
+    type Handle = Handle;
+
+    fn handles(&mut self) -> Vec<Handle> {
+        boot::locate_handle_buffer(boot::SearchType::AllHandles)
+            .map(|handles| handles.to_vec())
+            .unwrap_or_default()
     }
-    handles.len()
+
+    fn kind(&mut self, handle: Handle) -> Kind {
+        if self.root_bridges.contains(&handle) {
+            return Kind::RootBridge;
+        }
+        if let Some(class) = crate::pci_io::function_class(handle) {
+            return Kind::Pci(class);
+        }
+        if has_mac_node(handle) {
+            return Kind::Network;
+        }
+        Kind::Other
+    }
+
+    fn connect(&mut self, handle: Handle, recursive: bool) {
+        // On screen while it runs, so a stall shows which function it is.
+        if let Some(address) = crate::pci_io::function_address(handle) {
+            crate::status::progress(&alloc::format!("{address}"));
+        }
+        let _ = boot::connect_controller(handle, &[], None, recursive);
+        // The next handles' time is not this function's.
+        crate::status::progress("");
+    }
+
+    fn millis(&mut self) -> u64 {
+        crate::output::millis_since(0)
+    }
+
+    fn slow(&mut self, handle: Handle, kind: Kind, millis: u64) {
+        let device = describe(handle, kind);
+        let seconds = millis.div_ceil(1000);
+        crate::output::arguments(format_args!(
+            "FIRMWARE slow driver start on {device}: {millis} ms\n"
+        ));
+        crate::status::info(&alloc::format!(
+            "The firmware's drivers took {seconds} s to start on {device}"
+        ));
+    }
+}
+
+fn device_path(handle: Handle) -> uefi::Result<boot::ScopedProtocol<DevicePath>> {
+    // SAFETY: a scoped read-only protocol observation during boot services.
+    unsafe {
+        boot::open_protocol::<DevicePath>(
+            boot::OpenProtocolParams {
+                handle,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            boot::OpenProtocolAttributes::GetProtocol,
+        )
+    }
+}
+
+/// Whether `handle`'s device path has a MAC address node: a network
+/// interface a driver has already started.
+fn has_mac_node(handle: Handle) -> bool {
+    device_path(handle).is_ok_and(|path| {
+        path.node_iter().any(|node| {
+            node.device_type() == DeviceType::MESSAGING
+                && node.sub_type() == DeviceSubType::MESSAGING_MAC_ADDRESS
+        })
+    })
+}
+
+/// A connected handle for a report: a PCI function's address and class;
+/// for a device under a PCI controller, the controller's address and the
+/// bus nodes below it without identifiers they may carry; else the
+/// device path.
+fn describe(handle: Handle, kind: Kind) -> alloc::string::String {
+    use alloc::string::ToString;
+    use uefi::proto::device_path::text::{AllowShortcuts, DisplayOnly};
+    match kind {
+        Kind::Pci(class) => {
+            let address = crate::pci_io::function_address(handle)
+                .map(|address| alloc::format!("{address}"))
+                .unwrap_or_else(|| "a PCI function".into());
+            match class {
+                Some(class) => alloc::format!("{address} class {class:06x}"),
+                None => address,
+            }
+        }
+        Kind::RootBridge => "a PCI root bridge".into(),
+        Kind::Network | Kind::Other => {
+            if let Some(location) = crate::pci_io::disk_location(handle) {
+                return location.trim_end().into();
+            }
+            let text = device_path(handle).ok().and_then(|path| {
+                path.to_string16(DisplayOnly(true), AllowShortcuts(false))
+                    .ok()
+                    .map(|text| text.to_string())
+            });
+            match text {
+                Some(text) => text.chars().take(120).collect(),
+                None => "a handle without a device path".into(),
+            }
+        }
+    }
 }
 
 /// The first file system that has `stela.cfg`.
