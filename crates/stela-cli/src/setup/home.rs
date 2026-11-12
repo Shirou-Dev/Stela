@@ -12,7 +12,7 @@ use super::{
     Action, Environment, Record, Reported, Request, builds, doctor, host, read_record, release,
     sources, ui::Ui, wizard,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
@@ -665,18 +665,23 @@ fn create(environment: &Environment<'_>, mut request: Request, stick: &Stick) ->
     super::create_installer(environment, request)
 }
 
-/// Run `request` and show what it did.
-fn perform(environment: &Environment<'_>, request: Request) -> Result<()> {
-    let output = request.output.clone();
-    let boot_log = matches!(request.action, Action::BootLog);
+/// Run `request` and show what it did, or save it to the request's output
+/// file.
+pub(super) fn perform(environment: &Environment<'_>, mut request: Request) -> Result<()> {
+    let output = request.output.take();
     let (report, result) = super::split_report(request.dispatch(environment));
-    print!("{report}");
-    result?;
-    if let (true, Some(path)) = (boot_log, output) {
-        environment.ui.outro(&format!(
-            "Saved the boot logs to {}",
-            crate::boot_log::shown(&path).display()
-        ))?;
+    match (output, &result) {
+        (Some(path), Ok(())) => {
+            std::fs::write(&path, &report)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            #[cfg(unix)]
+            super::hand_to_invoker(&path);
+            environment.ui.outro(&format!(
+                "Saved the boot logs to {}",
+                crate::boot_log::shown(&path).display()
+            ))?;
+        }
+        _ => print!("{report}"),
     }
-    Ok(())
+    result
 }

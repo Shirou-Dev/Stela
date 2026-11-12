@@ -6096,6 +6096,36 @@ fn journey_d_a_newer_stick_is_left_alone() {
 }
 
 #[test]
+fn the_menu_saves_the_boot_logs_to_the_file_it_names() {
+    let f = made_by(Some(release::CURRENT));
+    let usb = crate::boot_log::tests::region(&["CHOICE 3 (Install macOS)\n"]);
+    fs::write(f.esp.join(efi::BOOT_LOG), &usb).unwrap();
+    let before = stick_files(&f);
+    let output = f._dir.path().join("log.txt");
+    let person = ui::tests::Scripted::new(&[]);
+    let environment = Environment {
+        ui: &person,
+        ..environment(&f.host)
+    };
+    let request = Request {
+        action: Action::BootLog,
+        usb: f.esp.clone(),
+        output: Some(output.clone()),
+        ..Request::default()
+    };
+    home::perform(&environment, request).unwrap();
+    let saved = fs::read_to_string(&output).unwrap();
+    assert!(saved.starts_with("Boot log on the USB ("), "{saved}");
+    assert!(saved.contains("CHOICE 3 (Install macOS)\n"), "{saved}");
+    assert!(
+        person.transcript().starts_with("└ Saved the boot logs to "),
+        "{}",
+        person.transcript()
+    );
+    assert_eq!(stick_files(&f), before);
+}
+
+#[test]
 fn journey_e_an_interrupted_create_offers_to_finish_it() {
     let mut f = fixture(64 * GIB, false);
     add_stela(&mut f);
