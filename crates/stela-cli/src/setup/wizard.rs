@@ -294,7 +294,16 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
             true => format!(
                 "Network    {}, {}\n",
                 match &command.wifi {
-                    Some(ssid) => format!("Wi-Fi {ssid}"),
+                    Some(ssid) => format!(
+                        "Wi-Fi {ssid}{}",
+                        wifi::rules(
+                            command
+                                .wifi_country
+                                .clone()
+                                .or_else(environment.wifi_country)
+                                .as_deref()
+                        )
+                    ),
                     None => "Ethernet".into(),
                 },
                 super::addresses::summary(command)

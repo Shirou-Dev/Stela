@@ -689,6 +689,17 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path, full: bool) -> R
     report.line("model", &record.model);
     report.line("Stela", super::release::describe(&record));
     report.line("macOS build", &record.build);
+    report.line(
+        "Wi-Fi",
+        match &record.wifi {
+            Some(network) => format!(
+                "\"{}\"{}",
+                network.ssid,
+                super::wifi::rules(network.country.as_deref())
+            ),
+            None => "none: an Online install needs Ethernet".into(),
+        },
+    );
     efi_status(environment, &record, &mut report);
     firmware_status(&record, &mut report);
     bundle_status(environment, &record, &mut report, full);

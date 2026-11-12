@@ -163,6 +163,14 @@ pub(super) fn describe(network: &Network, esp: &Path) -> String {
     )
 }
 
+/// The country whose rules a network follows, in a few words: `, DE
+/// rules`, or nothing when it names none.
+pub(super) fn rules(country: Option<&str>) -> String {
+    country
+        .map(|country| format!(", {country} rules"))
+        .unwrap_or_default()
+}
+
 /// The networks this computer sees or knows, strongest first where the
 /// host says; empty when it has no Wi-Fi or cannot list them.
 pub(super) fn host_networks() -> Vec<String> {

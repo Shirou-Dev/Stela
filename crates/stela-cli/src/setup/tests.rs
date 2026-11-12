@@ -6120,6 +6120,42 @@ fn journey_a_blank_stick_walks_through_the_wizard_and_cancel_changes_nothing() {
 }
 
 #[test]
+fn review_and_status_show_the_wifi_country() {
+    let f = fixture(64 * GIB, false);
+    let person = ui::tests::Scripted::new(&["Online", "Home", "correct horse", "Cancel"]);
+    let networks = || vec!["Home".to_owned()];
+    let country = || Some("DE".to_owned());
+    let environment = Environment {
+        ui: &person,
+        wifi_networks: &networks,
+        wifi_country: &country,
+        ..environment(&f.host)
+    };
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(command::Global::default())
+    };
+    home::run(&environment, request).unwrap();
+    let shown = person.transcript();
+    assert!(shown.contains("Network    Wi-Fi Home, DE rules"), "{shown}");
+    // Status names the network and its country.
+    let f = made_by(Some(release::CURRENT));
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(status.contains("Wi-Fi          none"), "{status}");
+    let mut joined = record(&f);
+    joined.wifi = Some(wifi::Network {
+        ssid: "Home".into(),
+        country: Some("DE".into()),
+    });
+    record::write_record(&f.esp, &joined).unwrap();
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap_or_else(|e| e.to_string());
+    assert!(
+        status.contains("Wi-Fi          \"Home\", DE rules"),
+        "{status}"
+    );
+}
+
+#[test]
 fn journey_b_a_stick_with_stela_is_not_treated_as_blank() {
     let f = made_by(Some(release::CURRENT));
     let before = stick_files(&f);
