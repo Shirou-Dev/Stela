@@ -5698,9 +5698,12 @@ fn without_usb_the_one_disk_holding_a_setup_is_used_and_two_are_never_guessed() 
     let other = volume("other", Some("stela/boot"));
     let host = |disks: Vec<Disk>| FakeHost::new(BTreeMap::new(), disks);
     // None: the error says how to name one.
-    let error = choose_setup(&host(vec![disk("disk0", &[("Linux", Some(&system))])]))
-        .unwrap_err()
-        .to_string();
+    let error = choose_setup(
+        &host(vec![disk("disk0", &[("Linux", Some(&system))])]),
+        "status",
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("no mounted volume"), "{error}");
     assert!(error.contains("`stela create`"), "{error}");
     // One: its EFI partition, which holds the record, over its data volume.
@@ -5711,23 +5714,24 @@ fn without_usb_the_one_disk_holding_a_setup_is_used_and_two_are_never_guessed() 
             &[("Microsoft Basic Data", Some(&data)), ("EFI", Some(&esp))],
         ),
     ]);
-    assert_eq!(choose_setup(&one).unwrap(), esp);
+    assert_eq!(choose_setup(&one, "status").unwrap().0, esp);
     // A USB whose EFI partition is not mounted is found by its data volume.
     let data_only = host(vec![disk(
         "disk5",
         &[("EFI", None), ("Microsoft Basic Data", Some(&data))],
     )]);
-    assert_eq!(choose_setup(&data_only).unwrap(), data);
+    assert_eq!(choose_setup(&data_only, "status").unwrap().0, data);
     // Two: both are listed and neither is used.
     let two = host(vec![
         disk("disk5", &[("EFI", Some(&esp))]),
         disk("disk6", &[("Microsoft Basic Data", Some(&other))]),
     ]);
-    let error = choose_setup(&two).unwrap_err().to_string();
+    let error = choose_setup(&two, "settings").unwrap_err().to_string();
     assert!(error.starts_with("2 sticks hold Stela"), "{error}");
     assert!(error.contains(&esp.display().to_string()), "{error}");
     assert!(error.contains(&other.display().to_string()), "{error}");
-    assert!(error.contains("such as `stela status "), "{error}");
+    assert!(error.contains("such as `stela settings "), "{error}");
+    assert_eq!(command_words(&Action::UpdateOs), "update");
 }
 
 #[test]

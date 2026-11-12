@@ -715,16 +715,24 @@ fn stick_volume(host: &dyn Host, stick: &Path) -> Result<PathBuf> {
     })
 }
 
-/// The USB of the one disk that holds a setup ([`find_setups`]), named on
-/// the error output. None or several are an error that lists them; setup
-/// never guesses between two.
-fn choose_setup(host: &dyn Host) -> Result<PathBuf> {
+/// The command a user types for `action`, as an error names it.
+fn command_words(action: &Action) -> &'static str {
+    match action {
+        Action::Repair => "repair",
+        Action::UpdateStela | Action::UpdateOs => "update",
+        Action::Configure => "settings",
+        Action::Uninstall => "uninstall",
+        _ => "status",
+    }
+}
+
+/// The USB of the one disk that holds a setup ([`find_setups`]), with the
+/// disk it is on. None or several are an error that lists them, naming
+/// `stela {words}` with a stick; stela never guesses between two.
+fn choose_setup(host: &dyn Host, words: &str) -> Result<(PathBuf, String)> {
     let found = find_setups(host)?;
     match found.as_slice() {
-        [(volume, disk)] => {
-            eprintln!("Using the Stela USB at {} on {disk}", volume.display());
-            Ok(volume.clone())
-        }
+        [one] => Ok(one.clone()),
         [] => bail!(
             "no mounted volume on this computer holds Stela: plug in the stick and mount its \
              STELA volume, or make an installer with `stela create`"
@@ -736,7 +744,7 @@ fn choose_setup(host: &dyn Host) -> Result<PathBuf> {
                 .collect();
             bail!(
                 "{} sticks hold Stela:\n{list}Name the one to use after the command, such as \
-                 `stela status {}`",
+                 `stela {words} {}`",
                 several.len(),
                 quoted(&several[0].0.display().to_string())
             )
@@ -789,9 +797,14 @@ impl Request {
         SEVERAL.set(find_setups(&host::System).is_ok_and(|found| found.len() > 1));
         // Without STICK, a maintenance command acts on the one stick that
         // holds a setup; a whole disk named is read through its volume.
+        let mut found = None;
         if finds_usb(&self.action) {
             self.usb = match self.usb.as_os_str().is_empty() {
-                true => choose_setup(&host::System)?,
+                true => {
+                    let (volume, disk) = choose_setup(&host::System, command_words(&self.action))?;
+                    found = Some(disk);
+                    volume
+                }
                 false => stick_volume(&host::System, &self.usb)?,
             };
         }
@@ -820,6 +833,10 @@ impl Request {
                 return Ok(());
             }
             elevation::Rights::Refuse => bail!(elevation::REFUSED),
+        }
+        // Said once, by the run that has the rights.
+        if let Some(disk) = found {
+            eprintln!("Using the Stela stick at {} on {disk}", self.usb.display());
         }
         // Under sudo, what this run downloads into the invoking user's
         // cache stays theirs, also when it stops with an error.
