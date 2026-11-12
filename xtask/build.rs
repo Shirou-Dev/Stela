@@ -9,7 +9,12 @@ const FIXTURES: [(&str, &str, &str); 1] = [("src/boot/kernel.S", "kernel.bin", "
 
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
-    let clang = env::var_os("CLANG").unwrap_or_else(|| "clang".into());
+    // The fixture is assembled again when another compiler is named; an
+    // empty `CLANG` names none.
+    println!("cargo:rerun-if-env-changed=CLANG");
+    let clang = env::var_os("CLANG")
+        .filter(|clang| !clang.is_empty())
+        .unwrap_or_else(|| "clang".into());
     for (source, image, architecture) in FIXTURES {
         println!("cargo:rerun-if-changed={source}");
         let object_path = out.join(image).with_extension("o");
@@ -24,7 +29,6 @@ fn main() {
                 println!(
                     "cargo:warning=clang was not found; {source} is not assembled and its boot scenarios are unavailable"
                 );
-                println!("cargo:rerun-if-env-changed=CLANG");
                 println!("cargo:rerun-if-env-changed=PATH");
                 fs::write(out.join(image), []).expect("write empty fixture image");
                 continue;
