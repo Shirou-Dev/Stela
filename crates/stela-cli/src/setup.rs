@@ -159,6 +159,10 @@ thread_local! {
     /// Whether several plugged-in sticks hold Stela, so that a command a
     /// message names must name its stick.
     static SEVERAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The stick as the user named it on the command line, which hints
+    /// repeat: never the volume path it was resolved to, which may hold
+    /// the user's name.
+    static NAMED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// `stela {words}` in backticks, as a user types it, with the stick at
@@ -166,7 +170,12 @@ thread_local! {
 /// works.
 fn fix(usb: &Path, words: &str) -> String {
     match SEVERAL.get() {
-        true => format!("`stela {words} {}`", quoted(&usb.display().to_string())),
+        true => {
+            let stick = NAMED
+                .with_borrow(Clone::clone)
+                .unwrap_or_else(|| usb.display().to_string());
+            format!("`stela {words} {}`", quoted(&stick))
+        }
         false => format!("`stela {words}`"),
     }
 }
@@ -703,10 +712,16 @@ fn find_setups(host: &dyn Host) -> Result<Vec<(PathBuf, String)>> {
     let mut found = Vec::new();
     for disk in host.disks()? {
         if let Some(volume) = setup_volume(&disk) {
-            found.push((volume, format!("{} ({})", disk.identifier, disk.name)));
+            found.push((volume, whole_disk(&disk)));
         }
     }
     Ok(found)
+}
+
+/// A whole disk as a user types it, with its name: `/dev/sdb (USB Flash
+/// Drive)`.
+fn whole_disk(disk: &host::Disk) -> String {
+    format!("{}{} ({})", host::DISK_PREFIX, disk.identifier, disk.name)
 }
 
 /// The mounted volume of `disk` that holds a Stela setup ([`find_setups`]).
@@ -766,13 +781,14 @@ fn choose_setup(host: &dyn Host, words: &str) -> Result<(PathBuf, String)> {
         several => {
             let list: String = several
                 .iter()
-                .map(|(volume, disk)| format!("  {} on {disk}\n", volume.display()))
+                .map(|(_, disk)| format!("  {disk}\n"))
                 .collect();
+            let first = several[0].1.split(" (").next().unwrap_or_default();
             bail!(
                 "{} sticks hold Stela:\n{list}Name the one to use after the command, such as \
                  `stela {words} {}`",
                 several.len(),
-                quoted(&several[0].0.display().to_string())
+                quoted(first)
             )
         }
     }
@@ -831,7 +847,10 @@ impl Request {
                     found = Some(disk);
                     volume
                 }
-                false => stick_volume(&host::System, &self.usb)?,
+                false => {
+                    NAMED.set(Some(self.usb.display().to_string()));
+                    stick_volume(&host::System, &self.usb)?
+                }
             };
         }
         // The rights to write disks, before anything is downloaded or
@@ -862,7 +881,7 @@ impl Request {
         }
         // Said once, by the run that has the rights.
         if let Some(disk) = found {
-            eprintln!("Using the Stela stick at {} on {disk}", self.usb.display());
+            eprintln!("Using the Stela stick {disk}");
         }
         // Under sudo, what this run downloads into the invoking user's
         // cache stays theirs, also when it stops with an error.

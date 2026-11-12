@@ -5031,7 +5031,18 @@ fn every_maintenance_hint_names_the_usb() {
     );
     SEVERAL.set(true);
     assert_hints_name_the_usb(&problems);
+    // A stick named on the command line is named as it was typed.
+    NAMED.set(Some("/dev/sdb".into()));
+    let problems = rerun(&f, |c| c.action = Action::Status)
+        .unwrap_err()
+        .to_string();
+    NAMED.set(None);
     SEVERAL.set(false);
+    assert!(problems.contains("`stela repair /dev/sdb`"), "{problems}");
+    assert!(
+        !problems.contains(&format!("repair {}", f.esp.display())),
+        "{problems}"
+    );
 }
 
 /// Move the partition `from` to `to` on disk `disk`, as a PC that numbers
@@ -5724,9 +5735,18 @@ fn without_usb_the_one_disk_holding_a_setup_is_used_and_two_are_never_guessed() 
     ]);
     let error = choose_setup(&two, "settings").unwrap_err().to_string();
     assert!(error.starts_with("2 sticks hold Stela"), "{error}");
-    assert!(error.contains(&esp.display().to_string()), "{error}");
-    assert!(error.contains(&other.display().to_string()), "{error}");
-    assert!(error.contains("such as `stela settings "), "{error}");
+    // Each is named by its whole disk, never by a volume path, which may
+    // hold the user's name.
+    assert!(error.contains("disk5 (Disk disk5)"), "{error}");
+    assert!(error.contains("disk6 (Disk disk6)"), "{error}");
+    assert!(!error.contains(&esp.display().to_string()), "{error}");
+    assert!(
+        error.contains(&format!(
+            "such as `stela settings {}disk5`",
+            host::DISK_PREFIX
+        )),
+        "{error}"
+    );
     assert_eq!(command_words(&Action::UpdateOs), "update");
 }
 
