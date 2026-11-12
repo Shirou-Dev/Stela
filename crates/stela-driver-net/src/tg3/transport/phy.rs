@@ -230,7 +230,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             self.flush(TG3_CPMU_EEE_MODE, 0)?;
             let tap26 = matches!(
                 self.identity.ok_or(Error::NotIdentified)?.asic,
-                Asic::Bcm57765 | Asic::Bcm5717 | Asic::Bcm5719
+                Asic::Bcm57765 | Asic::Bcm57766 | Asic::Bcm5717 | Asic::Bcm5719
             );
             self.smdsp(true)?;
             let result = (|| {

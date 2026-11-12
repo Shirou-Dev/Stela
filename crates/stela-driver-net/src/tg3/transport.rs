@@ -316,7 +316,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if chip_revision >> 12 == 0xf {
             let at = if matches!(device, 0x1655 | 0x1656 | 0x1665 | 0x1657 | 0x165f | 0x1687) {
                 GEN2_PRODID
-            } else if matches!(device, 0x16b0 | 0x16b1 | 0x16b2 | 0x16b4 | 0x16b5 | 0x16b6) {
+            } else if super::gen15_product(device) {
                 GEN15_PRODID
             } else {
                 PRODID
@@ -332,7 +332,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             }
             (0x1655 | 0x1656 | 0x1665, 0x5717) => Asic::Bcm5717,
             (0x1657, 0x5719) => Asic::Bcm5719,
-            (0x16b0 | 0x16b1 | 0x16b2 | 0x16b4 | 0x16b5 | 0x16b6, 0x57785) => Asic::Bcm57765,
+            // tg3_detect_asic_rev: the product ID, not the device ID, tells
+            // a 57765 from a 57766.
+            (device, 0x57785) if super::gen15_product(device) => Asic::Bcm57765,
+            (device, 0x57766) if super::gen15_product(device) => Asic::Bcm57766,
             (0x165f, 0x5720) => Asic::Bcm5720,
             (0x1687, 0x5762) => Asic::Bcm5762,
             _ => return Err(Error::UnsupportedRevision),
@@ -582,7 +585,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             };
             let expected = match chip.asic {
                 Asic::Bcm5761 => 0xbc05_0fd0,
-                Asic::Bcm57765 => 0x5c0d_8a40,
+                // tg3 names no 57766 PHY; its family's is the 57765's.
+                Asic::Bcm57765 | Asic::Bcm57766 => 0x5c0d_8a40,
                 Asic::Bcm5717 => 0x5c0d_8a00,
                 Asic::Bcm5719 => 0x5c0d_8a20,
                 Asic::Bcm5720 => 0x5c0d_8b60,

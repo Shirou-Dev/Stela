@@ -4,11 +4,9 @@
 use super::*;
 
 impl Device {
+    /// A 57765-class function: a 57765 or a 57766.
     pub(super) fn is_57765(&self) -> bool {
-        matches!(
-            self.config[&0] >> 16,
-            0x16b0 | 0x16b1 | 0x16b2 | 0x16b4 | 0x16b5 | 0x16b6
-        )
+        crate::tg3::gen15_product((self.config[&0] >> 16) as u16)
     }
     /// A BCM57765 B0-class function with its BCM57765 PHY. The default
     /// NVRAM strap is the 57780 table's 376-kHz Microchip EEPROM.

@@ -166,6 +166,7 @@ pub use crate::bus::pci::power::Timer as Delay;
 pub enum Asic {
     Bcm5761,
     Bcm57765,
+    Bcm57766,
     Bcm5717,
     Bcm5719,
     Bcm5720,
@@ -176,6 +177,10 @@ impl Asic {
     /// comes from the CPMU and addresses the PHY at port + 1.
     pub const fn plus_5717(self) -> bool {
         matches!(self, Self::Bcm5717 | Self::Bcm5719 | Self::Bcm5720)
+    }
+    /// tg3's 57765_CLASS: ASIC_REV_57765 and ASIC_REV_57766.
+    pub const fn class_57765(self) -> bool {
+        matches!(self, Self::Bcm57765 | Self::Bcm57766)
     }
     /// tg3's LRG_PROD_RING_CAP: 2048-entry standard and 4096-entry return
     /// rings.
@@ -221,25 +226,30 @@ pub const fn ape(device: u16) -> bool {
 pub fn candidate(vendor: u16, device: u16, class: [u8; 3]) -> bool {
     vendor == 0x14e4
         && class == [2, 0, 0]
-        && matches!(
-            device,
-            0x16b0
-                | 0x16b1
-                | 0x16b2
-                | 0x16b4
-                | 0x16b5
-                | 0x16b6
-                | 0x1655
-                | 0x1656
-                | 0x1665
-                | 0x1657
-                | 0x165f
-                | 0x1680
-                | 0x1681
-                | 0x1688
-                | 0x1689
-                | 0x1687
-        )
+        && (gen15_product(device)
+            || matches!(
+                device,
+                0x1655
+                    | 0x1656
+                    | 0x1665
+                    | 0x1657
+                    | 0x165f
+                    | 0x1680
+                    | 0x1681
+                    | 0x1688
+                    | 0x1689
+                    | 0x1687
+            ))
+}
+
+/// The devices `tg3_detect_asic_rev` reads the product ID of from
+/// TG3PCI_GEN15_PRODID_ASICREV: BCM57781, 57785, 57761, 57765, 57791,
+/// 57795, 57762, 57766, 57782 and 57786, the 57765 class.
+pub const fn gen15_product(device: u16) -> bool {
+    matches!(
+        device,
+        0x16b0 | 0x16b1 | 0x16b2 | 0x16b4 | 0x16b5 | 0x16b6 | 0x1682 | 0x1686 | 0x16b7 | 0x16b3
+    )
 }
 
 impl From<crate::bus::dma::mapping::DmaError> for Error {

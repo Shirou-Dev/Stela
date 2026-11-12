@@ -268,6 +268,7 @@ fn model(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>)
     let (device, revision, identity) = match asic {
         Asic::Bcm5761 => (0x1681u16, 0x0576_1000, 0xbc05_0fd3u32),
         Asic::Bcm57765 => (0x16b4, 0x5778_5100, 0x5c0d_8a41),
+        Asic::Bcm57766 => (0x1686, 0x5776_6001, 0x5c0d_8a41),
         Asic::Bcm5717 => (0x1655, 0x0571_7100, 0x5c0d_8a01),
         Asic::Bcm5719 => (0x1657, 0x0571_9001, 0x5c0d_8a21),
         Asic::Bcm5720 => (0x165f, 0x0572_0000, 0x5c0d_8b62),
@@ -283,7 +284,7 @@ fn model(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>)
     m.config.insert(
         match asic {
             Asic::Bcm5761 => PRODID,
-            Asic::Bcm57765 => GEN15_PRODID,
+            Asic::Bcm57765 | Asic::Bcm57766 => GEN15_PRODID,
             _ => GEN2_PRODID,
         },
         revision,
@@ -319,6 +320,7 @@ fn config_revision_and_phy_oui_select_each_named_family() {
     for asic in [
         Asic::Bcm5761,
         Asic::Bcm57765,
+        Asic::Bcm57766,
         Asic::Bcm5717,
         Asic::Bcm5719,
         Asic::Bcm5720,
@@ -723,6 +725,7 @@ fn core_reset_uses_config_while_mmio_decode_is_gone() {
     for asic in [
         Asic::Bcm5761,
         Asic::Bcm57765,
+        Asic::Bcm57766,
         Asic::Bcm5717,
         Asic::Bcm5719,
         Asic::Bcm5720,
@@ -750,7 +753,7 @@ fn core_reset_uses_config_while_mmio_decode_is_gone() {
         assert!(m.trace.contains(&Event::Write(MAC_MI_MODE, 0x8000)));
         match asic {
             Asic::Bcm5761 => assert!(m.trace.contains(&Event::Write(0x7c00, 1 << 25))),
-            Asic::Bcm57765 => {
+            Asic::Bcm57765 | Asic::Bcm57766 => {
                 // No clock override, and no APE space opened again.
                 assert!(
                     !m.trace
@@ -1304,4 +1307,24 @@ fn management_firmware_keeps_the_phy_id_registers_to_itself() {
     publish_phy_id(&m, 0x5c0d_8a43);
     assert_eq!(hardware.read_phy_identity(), Ok(0x5c0d_8a43));
     assert!(!read_phy_id_registers(&m.borrow()));
+}
+
+#[test]
+fn the_gen15_product_id_tells_a_57766_from_a_57765() {
+    for device in [0x1682u32, 0x1686, 0x16b3, 0x16b7, 0x16b4] {
+        for (revision, asic) in [(0x5776_6001, Asic::Bcm57766), (0x5778_5100, Asic::Bcm57765)] {
+            let (mut hardware, m) = model(Asic::Bcm57766, 0);
+            m.borrow_mut().config.insert(0, (device << 16) | 0x14e4);
+            m.borrow_mut().config.insert(GEN15_PRODID, revision);
+            let identity = hardware.identify().unwrap();
+            assert_eq!(identity.asic, asic, "{device:x}");
+            assert!(!identity.ape);
+            assert!(
+                !m.borrow()
+                    .trace
+                    .iter()
+                    .any(|e| matches!(e, Event::ApeRead(..) | Event::ApeWrite(..)))
+            );
+        }
+    }
 }

@@ -45,7 +45,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         // their A0, whose PHY strap, EEE, TSO, jumbo ring, statistics and
         // read DMA errata are not implemented here, and treats every later
         // revision alike (a 5717 C0 is identified as a 5720 A0).
-        let admitted = if id.asic == Asic::Bcm57765 {
+        // tg3 has no 57766 revision errata: every 57766 is admitted.
+        let admitted = if id.asic == Asic::Bcm57766 {
+            true
+        } else if id.asic == Asic::Bcm57765 {
             id.chip_revision != CHIPREV_ID_57765_A0
         } else if id.asic == Asic::Bcm5717 {
             id.chip_revision != CHIPREV_ID_5717_A0
@@ -82,7 +85,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let asic = self.identity.unwrap().asic;
         let mut local = GRC_LCLCTRL_INT_ON_ATTN | GRC_LCLCTRL_AUTO_SEEPROM;
         // tg3_get_invariants: the 57765 class turns the debug UART off.
-        if asic == Asic::Bcm57765 {
+        if asic.class_57765() {
             local |= GRC_LCLCTRL_GPIO_UART_SEL;
         }
         if config & NIC_SRAM_DATA_CFG_EEPROM_WP != 0 {
@@ -192,9 +195,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             let vendor = config & NVRAM_CFG1_5752VENDOR_MASK;
             let eeprom = match self.identity.ok_or(Error::NotIdentified)?.asic {
                 Asic::Bcm5762 => matches!(vendor, FLASH_5762_EEPROM_HD | FLASH_5762_EEPROM_LD),
-                asic @ (Asic::Bcm57765 | Asic::Bcm5717 | Asic::Bcm5719 | Asic::Bcm5720) => {
-                    nvram_kind(asic, vendor) == Some(Nvram::Eeprom)
-                }
+                asic @ (Asic::Bcm57765
+                | Asic::Bcm57766
+                | Asic::Bcm5717
+                | Asic::Bcm5719
+                | Asic::Bcm5720) => nvram_kind(asic, vendor) == Some(Nvram::Eeprom),
                 Asic::Bcm5761 => false, // Source pinstraps are buffered flash.
             };
             if eeprom {
@@ -270,11 +275,11 @@ enum Nvram {
 fn nvram_kind(asic: Asic, vendor: u32) -> Option<Nvram> {
     Some(match (asic, vendor) {
         (
-            Asic::Bcm57765,
+            Asic::Bcm57765 | Asic::Bcm57766,
             FLASH_5787VENDOR_ATMEL_EEPROM_376KHZ | FLASH_5787VENDOR_MICRO_EEPROM_376KHZ,
         ) => Nvram::Eeprom,
         (
-            Asic::Bcm57765,
+            Asic::Bcm57765 | Asic::Bcm57766,
             FLASH_5752VENDOR_ATMEL_FLASH_BUFFERED
             | FLASH_57780VENDOR_ATMEL_AT45DB011D
             | FLASH_57780VENDOR_ATMEL_AT45DB011B
@@ -284,7 +289,7 @@ fn nvram_kind(asic: Asic, vendor: u32) -> Option<Nvram> {
             | FLASH_57780VENDOR_ATMEL_AT45DB041B,
         ) => Nvram::Atmel,
         (
-            Asic::Bcm57765,
+            Asic::Bcm57765 | Asic::Bcm57766,
             FLASH_5752VENDOR_ST_M45PE10 | FLASH_5752VENDOR_ST_M45PE20 | FLASH_5752VENDOR_ST_M45PE40,
         ) => Nvram::St,
         (

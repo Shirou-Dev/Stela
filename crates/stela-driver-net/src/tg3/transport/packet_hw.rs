@@ -60,7 +60,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let bcm5762 = asic == Asic::Bcm5762;
         let legacy = asic == Asic::Bcm5761;
         let bcm5717 = asic == Asic::Bcm5717;
-        let class_57765 = asic == Asic::Bcm57765;
+        let class_57765 = asic.class_57765();
         let bcm5719 = asic == Asic::Bcm5719;
         // tg3's statistics workaround (5717, 5720 A0 and 5762, not 5719
         // after A0)
@@ -344,6 +344,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.flush(
             RDMAC_MODE,
             rdma | if bcm5717 { RDMAC_MODE_MULT_DMA_RD_DIS } else { 0 }
+                // tg3_reset_hw: a 57766 at the standard MTU reads send data
+                // in 2K requests, and tg3 splits send BDs at 2K
+                // (TG3_TX_BD_DMA_MAX_2K). Every frame here is a single BD
+                // below 2K, so none needs splitting.
+                | if asic == Asic::Bcm57766 { RDMAC_MODE_JMB_2K_MMRR } else { 0 }
                 | RDMAC_MODE_IPV4_LSO_EN // source HW_TSO_2/3 mode; descriptors remain plain.
                 | RDMAC_MODE_ENABLE
                 | RDMAC_MODE_TGTABORT_ENAB

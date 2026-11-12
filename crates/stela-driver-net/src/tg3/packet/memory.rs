@@ -6,7 +6,7 @@
 //! Requester-domain rings; packet ownership follows completions.
 use super::*;
 use crate::bus::dma::{
-    mapping::{Direction, DmaMapping},
+    mapping::{Direction, DmaMapping, DomainKind},
     memory::{CacheAttribute, CpuMapping},
 };
 pub(super) const TX: usize = 512;
@@ -35,14 +35,23 @@ struct Buffer {
     mapping: DmaMapping,
 }
 impl Buffer {
+    /// Pages the device reaches at addresses up to `limit`. Without a
+    /// remapper the device address is the physical one, so the pages
+    /// themselves must lie below it.
     fn new(
         pages: &dyn PageSource,
         domain: Arc<dyn DmaDomain>,
         bytes: usize,
+        limit: u64,
     ) -> Result<Self, Error> {
-        let pins = pages.allocate(bytes, 4096, CacheAttribute::WriteBack)?;
+        let pins = match limit.checked_add(1) {
+            Some(end) if domain.kind() == DomainKind::Passthrough => {
+                pages.allocate_below(bytes, 4096, CacheAttribute::WriteBack, end)?
+            }
+            _ => pages.allocate(bytes, 4096, CacheAttribute::WriteBack)?,
+        };
         let cpu = pins.cpu_mapping(CacheAttribute::WriteBack)?;
-        let mapping = DmaMapping::map(domain, pins, Direction::Bidirectional, u64::MAX)?;
+        let mapping = DmaMapping::map(domain, pins, Direction::Bidirectional, limit)?;
         Ok(Self { cpu, mapping })
     }
     fn put(&self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
@@ -80,6 +89,7 @@ impl Memory {
         pages: &dyn PageSource,
         domain: Arc<dyn DmaDomain>,
         geometry: super::super::geometry::Geometry,
+        ring_limit: u64,
     ) -> Result<Self, (Error, Self)> {
         let mut value = Self {
             buffers: Vec::new(),
@@ -96,17 +106,19 @@ impl Memory {
                 .buffers
                 .try_reserve_exact(6)
                 .map_err(|_| Error::Memory(MemoryError::OutOfMemory))?;
-            for bytes in [
-                TX * TX_DESCRIPTOR_BYTES,
-                geometry.rx * RX_DESCRIPTOR_BYTES,
-                geometry.returns * RX_DESCRIPTOR_BYTES,
-                4096,
-                TX * BUFFER,
-                geometry.rx * BUFFER,
+            // Rings and status block are tg3's coherent memory; packet
+            // buffers are its streaming mappings.
+            for (bytes, limit) in [
+                (TX * TX_DESCRIPTOR_BYTES, ring_limit),
+                (geometry.rx * RX_DESCRIPTOR_BYTES, ring_limit),
+                (geometry.returns * RX_DESCRIPTOR_BYTES, ring_limit),
+                (4096, ring_limit),
+                (TX * BUFFER, u64::MAX),
+                (geometry.rx * BUFFER, u64::MAX),
             ] {
                 value
                     .buffers
-                    .push(Buffer::new(pages, domain.clone(), bytes)?);
+                    .push(Buffer::new(pages, domain.clone(), bytes, limit)?);
             }
             value.prepare()?;
             Ok(())

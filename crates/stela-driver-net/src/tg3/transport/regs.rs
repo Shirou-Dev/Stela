@@ -94,6 +94,7 @@ pub(super) const CHIPREV_ID_5719_A0: u32 = 0x05719000;
 pub(super) const CHIPREV_ID_5720_A0: u32 = 0x05720000;
 pub(super) const CPMU_STATUS_FMSK_5717: u32 = 0x20000000;
 pub(super) const RDMAC_MODE_MULT_DMA_RD_DIS: u32 = 0x01000000;
+pub(super) const RDMAC_MODE_JMB_2K_MMRR: u32 = 0x00800000;
 pub(super) const BUFMGR_MODE_NO_TX_UNDERRUN: u32 = 0x80000000;
 pub(super) const TG3_APE_GPIO_MSG: u32 = 0x0008;
 pub(super) const TG3_LSO_RD_DMA_TX_LENGTH_WA_5719: u32 = 0x02000000;

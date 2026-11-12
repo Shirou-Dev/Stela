@@ -60,6 +60,8 @@ struct Pages {
     drops: Arc<AtomicUsize>,
     allocated: Cell<usize>,
     fail_after: Option<usize>,
+    /// The physical end of each constrained allocation.
+    below: core::cell::RefCell<Vec<u64>>,
 }
 impl PageSource for Pages {
     fn allocate(
@@ -91,6 +93,18 @@ impl PageSource for Pages {
             bytes,
             alignment,
         )
+    }
+    fn allocate_below(
+        &self,
+        bytes: usize,
+        alignment: usize,
+        cache: CacheAttribute,
+        end: u64,
+    ) -> Result<PinnedPages, MemoryError> {
+        self.below.borrow_mut().push(end);
+        let base = self.next.get();
+        assert!(base + bytes.div_ceil(4096) as u64 * 4096 <= end);
+        self.allocate(bytes, alignment, cache)
     }
 }
 /// Device-completed ranges the CPU may take back, as the furthest end
@@ -143,10 +157,16 @@ struct Domain {
     defer: AtomicBool,
     drains: AtomicUsize,
     drained: AtomicBool,
+    /// The address limit each mapping was asked for, by its IOVA.
+    limits: Mutex<BTreeMap<u64, u64>>,
+    /// Report an identity domain, whose pages must meet the limits.
+    passthrough: AtomicBool,
 }
 impl Domain {
     fn new(peer: Arc<Mutex<Device>>) -> Self {
         Self {
+            limits: Mutex::new(BTreeMap::new()),
+            passthrough: AtomicBool::new(false),
             peer,
             maps: Mutex::new(BTreeMap::new()),
             next: AtomicUsize::new(0),
@@ -221,6 +241,13 @@ impl Domain {
 }
 // SAFETY: independently authored synchronous symbolic remapper; no native use.
 unsafe impl DmaDomain for Domain {
+    fn kind(&self) -> crate::bus::dma::mapping::DomainKind {
+        if self.passthrough.load(Ordering::Relaxed) {
+            crate::bus::dma::mapping::DomainKind::Passthrough
+        } else {
+            crate::bus::dma::mapping::DomainKind::Isolated
+        }
+    }
     unsafe fn map(
         &self,
         pages: &DmaPages,
@@ -228,8 +255,14 @@ unsafe impl DmaDomain for Domain {
         limit: u64,
     ) -> Result<DomainMapping, DmaError> {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let address = 0x2_0000_0000 + id as u64 * 0x100_0000;
+        // A remapper places a limited mapping below its limit.
+        let address = if limit < 0x2_0000_0000 {
+            0x1000_0000 + id as u64 * 0x100_0000
+        } else {
+            0x2_0000_0000 + id as u64 * 0x100_0000
+        };
         assert!(address + pages.bytes() as u64 <= limit);
+        self.limits.lock().unwrap().insert(address, limit);
         assert_ne!(address, pages.as_single().unwrap().physical_pages()[0]);
         let cpu = pages
             .as_single()
@@ -978,6 +1011,7 @@ fn parts() -> (Hardware<Reg, Timer>, Pages, Arc<Domain>, Arc<Mutex<Device>>) {
         drops: Arc::new(AtomicUsize::new(0)),
         allocated: Cell::new(0),
         fail_after: None,
+        below: core::cell::RefCell::new(Vec::new()),
     };
     (
         // SAFETY: original register/domain/timer owners of this isolated peer.
@@ -1824,6 +1858,7 @@ mod bcm5761;
 mod bcm5761_power;
 mod bcm5762;
 mod bcm57765;
+mod bcm57766;
 mod phy_link;
 mod phy_power;
 mod rdma_mode;

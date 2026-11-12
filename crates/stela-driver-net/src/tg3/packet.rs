@@ -113,11 +113,12 @@ impl<R: Registers, D: Delay> Packet<R, D> {
             value.identified = true;
             value.mac = board.mac;
             value.board = Some(board);
-            value.geometry =
-                Geometry::of(value.hardware.identity().ok_or(Error::NotIdentified)?.asic);
+            let asic = value.hardware.identity().ok_or(Error::NotIdentified)?.asic;
+            value.geometry = Geometry::of(asic);
             value.rx_producer = value.geometry.rx - 1;
             value.hardware.packet_reset(board)?;
-            match Memory::new(pages, value.domain.clone(), value.geometry) {
+            let ring_limit = Geometry::ring_limit(asic);
+            match Memory::new(pages, value.domain.clone(), value.geometry, ring_limit) {
                 Ok(memory) => value.memory = Some(memory),
                 Err((error, memory)) => {
                     value.memory = Some(memory);
