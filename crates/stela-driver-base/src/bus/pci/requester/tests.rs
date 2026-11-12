@@ -342,6 +342,26 @@ fn device_identity_interrupt_gating_and_header_are_observed_not_assumed() {
     );
 }
 
+/// PCIe 4.0 added Extended Message Data Capable (bit 9) and Enable (bit 10)
+/// to MSI Message Control. A function that only reports the capability, as
+/// newer GPUs do, is stopped like any other; one with it enabled is refused.
+#[test]
+fn msi_extended_message_data_is_accepted_as_a_capability_and_refused_when_enabled() {
+    for flags in [0x200, 0x380, 0xf980] {
+        let mut function = endpoint();
+        cap(&mut function, 0x40, MSI, 0);
+        function.config().write16(0x42, flags).unwrap();
+        assert_eq!(validate_stopped(&mut function), Ok(()), "{flags:#x}");
+    }
+    let mut function = endpoint();
+    cap(&mut function, 0x40, MSI, 0);
+    function.config().write16(0x42, 0x600).unwrap();
+    assert_eq!(
+        validate_stopped(&mut function),
+        Err(ClaimError::MalformedCapability { offset: 0x40 })
+    );
+}
+
 #[test]
 fn msi_layouts_pcie_versions_and_no_snoop_require_complete_extents() {
     for (flags, length) in [(0, 10), (0x80, 14), (0x100, 20), (0x180, 24)] {

@@ -46,7 +46,7 @@ impl Capabilities {
                 5 => {
                     let control = word(config, offset + 2)?;
                     let supported = (control >> 1) & 7;
-                    if control & !0x1ff != 0
+                    if control & (1 << 10) != 0
                         || control & 1 != 0
                         || supported > 5
                         || ((control >> 4) & 7) > supported

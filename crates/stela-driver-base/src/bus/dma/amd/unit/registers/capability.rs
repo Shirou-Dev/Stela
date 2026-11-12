@@ -96,7 +96,7 @@ fn capability_bytes(entry: &Capability, header: u32) -> Result<u16, Error> {
         5 => {
             let maximum = (flags >> 1) & 7;
             let enabled = (flags >> 4) & 7;
-            if flags & !0x1ff != 0 || maximum > 5 || enabled > maximum {
+            if flags & (1 << 10) != 0 || maximum > 5 || enabled > maximum {
                 return Err(Error::Capability(offset));
             }
             Ok(entry.bytes)

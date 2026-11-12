@@ -244,7 +244,7 @@ fn link<C: MsiConfigSpace>(function: &Function<C>) -> Result<(u16, u16), Error> 
             }
             5 => {
                 let flags = read(function, offset + 2)?;
-                if flags & !0x1ff != 0
+                if flags & (1 << 10) != 0
                     || (flags >> 1) & 7 > 5
                     || (flags >> 4) & 7 > (flags >> 1) & 7
                 {

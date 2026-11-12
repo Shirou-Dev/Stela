@@ -26,6 +26,11 @@ const PM: u16 = 1;
 const MSI: u16 = 5;
 const PCIX: u16 = 7;
 const VENDOR: u16 = 9;
+/// MSI Message Control's Extended Message Data Enable (PCIe 4.0 7.7.1.2).
+/// Its Capable bit 9 and the reserved bits above are left as found, as Linux
+/// leaves them; a function with 32-bit message data enabled is refused,
+/// because every vector here is programmed as 16-bit data.
+const MSI_EXTENDED_DATA_ENABLE: u16 = 1 << 10;
 const PCIE: u16 = 0x10;
 const MSIX: u16 = 0x11;
 const ATS: u16 = 0xf;
@@ -336,7 +341,7 @@ fn standard<C: ConfigSpace>(config: &C, status: u16) -> Result<(), ClaimError> {
                 let flags = inactive(config, offset + 2, 1)?;
                 let supported = (flags >> 1) & 7;
                 let selected = (flags >> 4) & 7;
-                if flags & !0x1ff != 0 || supported > 5 || selected > supported {
+                if flags & MSI_EXTENDED_DATA_ENABLE != 0 || supported > 5 || selected > supported {
                     return Err(ClaimError::MalformedCapability { offset });
                 }
             }
