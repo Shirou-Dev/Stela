@@ -1895,6 +1895,49 @@ fn a_full_transmit_ring_is_busy_at_once_and_keeps_the_adapter_running() {
         assert!(net.carrier());
     }
 }
+/// Link loss with frames still in the transmit ring only takes the carrier
+/// down, as Linux's aq_nic_update_link_status does: no restart, so no
+/// firmware reset, wait or register write in a link poll, and the queued
+/// frames stay the hardware's until it sends them after the link returns.
+#[test]
+fn link_loss_with_queued_frames_leaves_them_to_the_hardware_and_waits_for_nothing() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    for id in [0x07b1, 0x04c0] {
+        let (mut net, peer, _domain, _dropped) = setup(id);
+        net.start().unwrap();
+        let link = |up: bool| {
+            if peer.profile.generation == Generation::Atlantic {
+                peer.set(0x370, if up { 0x100 } else { 0 });
+            } else {
+                peer.set(0x13014, if up { 0x830 } else { 0 });
+            }
+        };
+        link(true);
+        peer.tx_delay.set(true);
+        for _ in 0..3 {
+            net.transmit(&[3; 60]).unwrap();
+        }
+        let (waited, writes) = (peer.elapsed.get(), peer.writes.borrow().len());
+        link(false);
+        assert!(!net.carrier());
+        assert_eq!(net.transmit(&[4; 60]), Err(LinkError::NoCarrier));
+        assert_eq!(net.receive(), Ok(None));
+        assert_eq!(net.state(), State::Running);
+        assert_eq!(peer.elapsed.get(), waited);
+        assert_eq!(peer.writes.borrow().len(), writes);
+        assert_eq!((net.tx_head, net.tx_tail), (0, 3));
+        assert_eq!(peer.pending_tx.get(), Some(3));
+        link(true);
+        peer.tx_delay.set(false);
+        assert!(net.carrier());
+        net.transmit(&[5; 60]).unwrap();
+        assert_eq!(peer.tx_head.get(), 4);
+        net.transmit(&[6; 60]).unwrap();
+        assert_eq!(net.tx_head, 4);
+    }
+}
 #[test]
 fn restart_after_delayed_traffic_drains_each_epoch_and_rebuilds_device_heads() {
     if crate::test_process::isolate_model() {

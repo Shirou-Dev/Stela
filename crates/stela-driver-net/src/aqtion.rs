@@ -518,12 +518,12 @@ impl<R: Registers, T: Timer, C: ConfigSpace> Aqtion<R, T, C> {
             return Err(Error::Stopped);
         }
         let result = self.hw().link(self.profile, self.firmware.unwrap());
+        // Link loss leaves frames still in the transmit ring to the
+        // hardware, as Linux's aq_nic_update_link_status only takes the
+        // carrier down: their descriptors stay owned until the head passes
+        // them, and a restart's firmware reset never runs in a link poll.
         if result.is_err() {
             self.state = State::Faulted;
-        } else if result == Ok(false) && self.tx_head != self.tx_tail {
-            // Link loss can strand hardware TX descriptors. Retire the
-            // engine epoch before reusing their bytes; failures keep it held.
-            self.restart()?;
         }
         result
     }
