@@ -4696,6 +4696,42 @@ threadgroup_globals_hold_bfloat(void)
    stela_metal_release(shader);
 }
 
+/* Counts a loop to 4, and by tens to 40, beside a pointer PHI stepping off
+ * null, declared between the loop header's other PHIs, as MPS's matrix multiplies leave a
+ * buffer pointer their constants rule out: nothing may come between them. */
+static const char *null_loop =
+   "define void @null_loop(ptr addrspace(1) %out) {\n"
+   "entry:\n%r = getelementptr i8, ptr addrspace(1) null, i64 16\nbr label %loop\n"
+   "loop:\n%i = phi i32 [ 0, %entry ], [ %n, %loop ]\n"
+   "%p = phi ptr addrspace(1) [ %r, %entry ], [ %q, %loop ]\n"
+   "%j = phi i32 [ 10, %entry ], [ %m, %loop ]\n"
+   "%q = getelementptr i8, ptr addrspace(1) %p, i64 4\n"
+   "%n = add i32 %i, 1\n%m = add i32 %j, 10\n%c = icmp ult i32 %n, 4\n"
+   "br i1 %c, label %loop, label %done\n"
+   "done:\n%none = icmp eq ptr addrspace(1) %p, null\n%z = zext i1 %none to i32\n"
+   "%t = add i32 %n, %z\n%s = add i32 %t, %j\n"
+   "store i32 %s, ptr addrspace(1) %out, align 4\nret void\n}\n"
+   "!air.kernel = !{!2}\n!2 = !{ptr @null_loop, !3, !4}\n!3 = !{}\n!4 = !{!40}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\","
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\","
+   " i32 4, !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"out\"}\n";
+
+/* A pointer PHI rooted at null among a block's PHIs keeps them together,
+ * and the loop and the comparison compute what they say. */
+static void
+null_pointer_phis_stay_among_phis(void)
+{
+   struct stela_air_error error;
+   const struct stela_metal_specialization specialization = {.workgroup_size = {64, 1, 1}};
+   nir_shader *shader = compile(null_loop, "null_loop", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "null_loop: %u %s\n", error.kind, error.detail);
+   assert(shader);
+   /* The pointer stepped off null is not null. */
+   assert(run_summed(shader) == 4 + 40);
+   stela_metal_release(shader);
+}
+
 /* Writes its thread's index plus 100 through the device address its
  * constant parameters hold as an integer, as MPS's kernels keep their
  * buffers' gpuAddress: the even threads' at it, the odd threads' 64 bytes
@@ -4847,6 +4883,7 @@ main(void)
    thread_constants_are_constant_data();
    threadgroup_globals_hold_bfloat();
    pointers_made_of_addresses_reach_their_memory();
+   null_pointer_phis_stay_among_phis();
    render_stages_compile_at_their_linked_locations();
    patch_functions_compile_behind_their_tessellation_stages();
    kernels_compile_with_their_stage_in();

@@ -6886,6 +6886,17 @@ address_authority(LLVMValueRef inst, struct value *authority)
    return authority;
 }
 
+/* The authority of a null pointer, without the def pointer_value makes at
+ * the cursor: a PHI declared among others takes it, and nothing may come
+ * between them. */
+static struct value *
+null_authority(LLVMValueRef null, struct value *authority)
+{
+   *authority = (struct value){.access = STELA_AIR_READ_WRITE, .pointer_root = null, .null = true,
+                               .offset_known = true};
+   return authority;
+}
+
 static bool
 address_pointer(struct translator *t, LLVMValueRef inst)
 {
@@ -8851,6 +8862,8 @@ cfg_declare_phi(struct translator *t, LLVMValueRef inst)
                            node->root && node->root == t->imageblock_root ? imageblock_authority(t, &authority) :
                            node->root && LLVMIsAIntToPtrInst(node->root) ?
                               address_authority(node->root, &authority) :
+                           node->root && LLVMIsAConstantPointerNull(node->root) ?
+                              null_authority(node->root, &authority) :
                               pointer_value(t, node->root);
       if (!root)
          return fail(t, STELA_AIR_MEMORY, "pointer PHI lacks completed provenance proof");
