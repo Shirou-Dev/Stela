@@ -560,7 +560,7 @@ fn stop_disables_both_directions_before_the_reset_and_release_returns_control() 
         ]);
     }
     let hw = Hardware::new(&model, &model).unwrap();
-    hw.stop().unwrap();
+    hw.stop(DROP_MASTER_POLLS).unwrap();
     hw.release_control().unwrap();
     let state = model.state.borrow();
     let position = |entry| state.writes.iter().position(|&w| w == entry).unwrap();
@@ -575,7 +575,8 @@ fn stop_disables_both_directions_before_the_reset_and_release_returns_control() 
     assert!(model.elapsed.get() >= 20_000);
     drop(state);
 
-    // An incomplete drain or reset is never a stop.
+    // An incomplete drain or reset is never a stop, and a drop's stop ends
+    // well inside a processor's exit.
     for stuck in [0, 1] {
         let model = Model::ready(false);
         if stuck == 0 {
@@ -584,9 +585,12 @@ fn stop_disables_both_directions_before_the_reset_and_release_returns_control() 
             model.reset_stuck.set(true);
         }
         assert_eq!(
-            Hardware::new(&model, &model).unwrap().stop(),
+            Hardware::new(&model, &model)
+                .unwrap()
+                .stop(DROP_MASTER_POLLS),
             Err(BlockError::Timeout)
         );
+        assert!(model.elapsed.get() < 120_000, "{}", model.elapsed.get());
     }
 }
 

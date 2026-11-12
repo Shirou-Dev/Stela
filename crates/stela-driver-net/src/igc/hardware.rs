@@ -78,6 +78,11 @@ const LENERRS: usize = 0x4138;
 
 const MASTER_DISABLE: u32 = 1 << 2;
 const MASTER_ENABLED: u32 = 1 << 19;
+/// Linux's bus master drain: 800 polls 2 ms apart.
+pub(super) const MASTER_POLLS: usize = 800;
+/// The drain of a stop at drop, 80 ms: the drop can run inside a
+/// processor's exit, which must end well inside half a second.
+pub(super) const DROP_MASTER_POLLS: usize = 40;
 const MAC_RESET: u32 = 1 << 26;
 const PHY_RESET: u32 = 1 << 31;
 const AUTO_READ_DONE: u32 = 1 << 9;
@@ -365,13 +370,14 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
         Err(BlockError::Timeout)
     }
 
-    fn reset(&self) -> Result<(), BlockError> {
+    /// The MAC reset after a bus master drain of up to `master_polls` polls.
+    fn reset(&self, master_polls: usize) -> Result<(), BlockError> {
         self.registers.write(IMC, u32::MAX);
         self.registers.write(EIMC, u32::MAX);
         self.modify(CTRL, 0, MASTER_DISABLE)?;
         // Unlike Linux's log-and-continue recovery, a fresh Stela attachment
         // never continues past an uncertain DMA drain or NVM load.
-        self.poll(STATUS, MASTER_ENABLED, false, 800, 2_000)?;
+        self.poll(STATUS, MASTER_ENABLED, false, master_polls, 2_000)?;
         self.registers.write(RCTL, 0);
         self.registers.write(TCTL, 1 << 3);
         self.read(STATUS)?; // Posted write flush before the required settle.
@@ -386,14 +392,16 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     }
 
     /// Linux igc_down's register sequence: stop receive and transmit, give
-    /// in-flight frames 10 ms, then igc_reset's MAC reset after the bus master
-    /// drain. Only a completed reset proves the controller writes no ring.
-    pub(super) fn stop(&self) -> Result<(), BlockError> {
+    /// in-flight frames 10 ms, then igc_reset's MAC reset after a bus master
+    /// drain of up to `master_polls` polls ([`MASTER_POLLS`] or
+    /// [`DROP_MASTER_POLLS`]). Only a completed reset proves the controller
+    /// writes no ring.
+    pub(super) fn stop(&self, master_polls: usize) -> Result<(), BlockError> {
         self.modify(RCTL, RCTL_EN, 0)?;
         self.modify(TCTL, TCTL_EN, 0)?;
         self.read(STATUS)?;
         self.timer.delay(10_000)?;
-        self.reset()
+        self.reset(master_polls)
     }
 
     /// igc_release_hw_control: hand the controller back to manageability
@@ -745,7 +753,7 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     }
 
     pub(super) fn initialize(&mut self) -> Result<u32, BlockError> {
-        self.reset()?;
+        self.reset(MASTER_POLLS)?;
         self.validate_nvm()?;
         let identity = self.phy()?;
         // igc_setup_copper_link_base. Pause stays off until the link-up

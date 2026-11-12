@@ -344,12 +344,12 @@ impl Igc {
 
     /// Linux igc_down: record the counters, then stop the controller. Errors
     /// leave its DMA state uncertain.
-    fn stop(&mut self) -> Result<(), BlockError> {
+    fn stop(&mut self, master_polls: usize) -> Result<(), BlockError> {
         if let Some(error) = &self.timing_failure {
             return Err(error.clone());
         }
         let _ = self.statistics.accumulate(&self.device);
-        hardware::Hardware::new(&self.device, &self.clock)?.stop()
+        hardware::Hardware::new(&self.device, &self.clock)?.stop(master_polls)
     }
 
     /// Linux igc_reinit_locked, as igc_reset_task runs it for a transmit
@@ -358,7 +358,7 @@ impl Igc {
     /// a fresh link check. Any failure leaves the adapter faulted.
     fn reinitialize(&mut self) -> Result<(), BlockError> {
         let result = (|| {
-            self.stop()?;
+            self.stop(hardware::MASTER_POLLS)?;
             self.phy_identity = hardware::Hardware::new(&self.device, &self.clock)?.initialize()?;
             self.receive.reset();
             self.transmit.reset();
@@ -489,11 +489,12 @@ impl Igc {
 impl Drop for Igc {
     /// Linux igc_down then igc_release_hw_control. The rings are freed only
     /// once the controller verifiably stopped; otherwise they stay allocated.
+    /// Its waits stay under 120 ms, inside a processor's exit.
     ///
     /// This drives the controller's registers, so the owner drops it where
     /// its MMIO window is mapped; anywhere else the first read faults.
     fn drop(&mut self) {
-        if self.stop().is_ok() {
+        if self.stop(hardware::DROP_MASTER_POLLS).is_ok() {
             let _ =
                 hardware::Hardware::new(&self.device, &self.clock).map(|hw| hw.release_control());
             // SAFETY: the completed MAC reset stopped every descriptor and
@@ -1015,6 +1016,36 @@ mod tests {
         drop(net);
         assert_ne!(registers[CTRL / 4] & MAC_RESET, 0);
         assert_eq!(registers[CTRL_EXT / 4], DRV_LOAD);
+    }
+
+    /// A bus master that never drains fails the drop's stop within its
+    /// bound, before any MAC reset, and control stays with the driver.
+    #[test]
+    fn dropping_an_adapter_whose_bus_master_never_drains_ends_within_an_exit() {
+        let mut fixture = Fixture::new();
+        let (clock, elapsed) = crate::timing::counted_model(Clock {
+            ticks_per_microsecond: 1,
+        });
+        fixture.net.clock = clock;
+        fixture.registers[STATUS / 4] |= 1 << 19;
+        fixture.registers[CTRL_EXT / 4] = DRV_LOAD;
+        let Fixture {
+            net,
+            registers,
+            _backing,
+        } = fixture;
+        drop(net);
+        assert!(elapsed.get() < 120_000, "{}", elapsed.get());
+        assert_eq!(registers[CTRL / 4] & MAC_RESET, 0);
+        assert_eq!(registers[CTRL_EXT / 4], DRV_LOAD);
+        // A drained master whose reset never completes waits no longer.
+        let mut fixture = Fixture::new();
+        let (clock, elapsed) = crate::timing::counted_model(Clock {
+            ticks_per_microsecond: 1,
+        });
+        fixture.net.clock = clock;
+        drop(fixture);
+        assert!(elapsed.get() < 120_000, "{}", elapsed.get());
     }
 
     /// A function that is gone reads all ones: dropping it writes nothing.
