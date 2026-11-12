@@ -20,27 +20,26 @@ pub(crate) struct Global {
 pub(crate) enum Command {
     /// Erase a stick and make a macOS installer on it
     #[command(
-        long_about = "Erase a stick and make a macOS installer on it. Without a terminal, \
+        long_about = "Erase a stick and make a macOS installer on it. Without a terminal,\n\
                       erasing needs --confirm-disk."
     )]
     Create(Box<Create>),
     /// Bring a stick to this version of Stela
     #[command(
-        long_about = "Replace the stick's Stela with this version and prepare its boot files \
-                      again when needed. Downloads only the boot files it needs."
+        long_about = "Replace the stick's Stela with this version and prepare its boot\n\
+                      files again when needed. Downloads only the boot files it needs."
     )]
     Update(Update),
-    /// Fix what is damaged or missing on a stick, and finish an interrupted
-    /// create or update
+    /// Fix what is damaged or missing; finish a stopped create or update
     #[command(
-        long_about = "Check the stick and put back what is damaged or missing: settings, boot \
-                      files, macOS pieces, firmware the last boot asked for. Finishes an \
-                      interrupted create or update."
+        long_about = "Check the stick and put back what is damaged or missing: settings,\n\
+                      boot files, macOS pieces, firmware the last boot asked for.\n\
+                      Finishes an interrupted create or update."
     )]
     Repair(Repair),
     /// Show what is on a stick and whether it is healthy; changes nothing
     #[command(
-        long_about = "Show what is on the stick and whether it is healthy. Changes nothing. \
+        long_about = "Show what is on the stick and whether it is healthy. Changes nothing.\n\
                       Exits 1 when something needs doing, and names the command."
     )]
     Status(Status),
@@ -49,10 +48,10 @@ pub(crate) enum Command {
     Settings(Settings),
     /// Save the boot logs for a bug report
     #[command(
-        long_about = "Read every boot log on this computer's disks: the stick's and each \
-                      install's. PATH limits it to one disk, volume, disk image or boot.log \
-                      copy. On a terminal the logs are saved to log.txt in this folder, the file \
-                      to attach to a report; otherwise they are printed."
+        long_about = "Read every boot log on this computer's disks: the stick's and each\n\
+                      install's. PATH limits it to one disk, volume, disk image or boot.log\n\
+                      copy. On a terminal the logs are saved to log.txt in this folder, the\n\
+                      file to attach to a report; otherwise they are printed."
     )]
     Log(Log),
     /// Remove everything Stela wrote to a stick.
@@ -116,9 +115,14 @@ fn path() -> impl TypedValueParser<Value = PathBuf> {
 /// holds Stela.
 #[derive(Args)]
 pub(crate) struct Stick {
-    /// The stick's whole disk or one of its mounted volumes. It can be left
-    /// out when only one stick fits.
-    #[arg(value_name = "STICK", value_parser = path())]
+    /// The stick's whole disk or one of its mounted volumes.
+    /// It can be left out when only one stick fits.
+    #[arg(
+        value_name = "STICK",
+        value_parser = path(),
+        help = "The stick, when several fit",
+        verbatim_doc_comment
+    )]
     stick: Option<PathBuf>,
 }
 
@@ -169,7 +173,13 @@ fn join(value: &str) -> Result<Join, String> {
 struct Wifi {
     /// Wi-Fi to join during the install, or none. The passphrase is asked
     /// for and stored in plaintext on the stick.
-    #[arg(long, value_name = "SSID|none", value_parser = join)]
+    #[arg(
+        long,
+        value_name = "SSID|none",
+        value_parser = join,
+        help = "Wi-Fi for the install, or none",
+        verbatim_doc_comment
+    )]
     wifi: Option<Join>,
     /// Read the Wi-Fi passphrase from FILE
     #[arg(long, value_name = "FILE")]
@@ -249,7 +259,12 @@ struct Addressing {
     #[arg(long, value_name = "ADDRESS", requires = "ipv4")]
     gateway: Option<std::net::Ipv4Addr>,
     /// Up to 3 DNS servers, comma-separated, or auto for DHCP's
-    #[arg(long, value_name = "SERVERS|auto", value_parser = dns)]
+    #[arg(
+        long,
+        value_name = "SERVERS|auto",
+        value_parser = dns,
+        help = "DNS servers (up to 3), or auto"
+    )]
     dns: Option<Automatic<Vec<std::net::IpAddr>>>,
 }
 
@@ -330,14 +345,21 @@ impl Machine {
 /// `stela create`.
 #[derive(Args)]
 pub(crate) struct Create {
-    /// The stick's whole disk (/dev/sdb, disk5 or PhysicalDrive2), which is
-    /// erased, or one of its mounted volumes. Without it, stela asks.
-    #[arg(value_name = "STICK", value_parser = path())]
-    stick: Option<PathBuf>,
-    /// Offline copies macOS to the stick (32 GB or more); the install needs
-    /// no internet. Online downloads macOS during the install. Default:
-    /// offline when it fits.
+    /// The stick's whole disk (/dev/sdb, disk5 or PhysicalDrive2), which
+    /// is erased, or one of its mounted volumes. Without it, stela asks.
     #[arg(
+        value_name = "STICK",
+        value_parser = path(),
+        help = "The stick to erase",
+        verbatim_doc_comment
+    )]
+    stick: Option<PathBuf>,
+    /// Offline copies macOS to the stick (32 GB or more); the install
+    /// needs no internet. Online downloads macOS during the install.
+    /// Default: offline when it fits.
+    #[arg(
+        help = "The installer to make",
+        verbatim_doc_comment,
         long,
         value_enum,
         value_name = "offline|online",
@@ -354,7 +376,12 @@ pub(crate) struct Create {
     wifi: Wifi,
     /// The stick's model or size, typed back: needed without a terminal,
     /// and for disks that are not USB sticks
-    #[arg(long, value_name = "MODEL|SIZE")]
+    #[arg(
+        long,
+        value_name = "MODEL|SIZE",
+        help = "The stick's model or size, typed back",
+        verbatim_doc_comment
+    )]
     confirm_disk: Option<String>,
     /// Where downloaded images are kept: Stela's per-user cache by default.
     #[arg(long, hide = true)]
@@ -458,9 +485,15 @@ impl Create {
 pub(crate) struct Update {
     #[command(flatten)]
     stick: Stick,
-    /// Also change the macOS the stick installs. The installed macOS is not
-    /// changed; it updates itself.
-    #[arg(long, value_name = "VERSION|BUILD|latest", value_parser = macos)]
+    /// Also change the macOS the stick installs. The installed macOS is
+    /// not changed; it updates itself.
+    #[arg(
+        long,
+        value_name = "VERSION|BUILD|latest",
+        value_parser = macos,
+        help = "Also change the macOS it installs",
+        verbatim_doc_comment
+    )]
     macos: Option<String>,
     /// Use this IPSW instead of downloading
     #[arg(long, value_name = "FILE")]
@@ -490,16 +523,21 @@ impl Update {
 pub(crate) struct Repair {
     #[command(flatten)]
     stick: Stick,
-    /// Read every macOS piece (slow). Done by itself when the last install
-    /// reported a damaged piece.
-    #[arg(long)]
+    /// Read every macOS piece (slow). Done by itself when the last
+    /// install reported a damaged piece.
+    #[arg(long, help = "Read every macOS piece (slow)", verbatim_doc_comment)]
     full: bool,
     /// Use this IPSW instead of downloading
     #[arg(long, value_name = "FILE")]
     ipsw: Option<PathBuf>,
-    /// Read the Wi-Fi passphrase from FILE when finishing an interrupted
-    /// create without a terminal
-    #[arg(long, value_name = "FILE")]
+    /// Read the Wi-Fi passphrase from FILE when finishing an
+    /// interrupted create without a terminal
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Passphrase file, for a stopped create",
+        verbatim_doc_comment
+    )]
     wifi_passphrase_file: Option<PathBuf>,
     /// Where downloaded images are kept: Stela's per-user cache by default.
     #[arg(long, hide = true)]
@@ -556,9 +594,15 @@ pub(crate) struct Settings {
     wifi: Wifi,
     #[command(flatten)]
     addressing: Addressing,
-    /// Allow a USB4 device on PCs without an IOMMU that confines it; repeat
-    /// for more
-    #[arg(long, value_name = "UUID|none", value_parser = usb4_device)]
+    /// Allow a USB4 device on PCs without an IOMMU that confines it;
+    /// repeat for more
+    #[arg(
+        long,
+        value_name = "UUID|none",
+        value_parser = usb4_device,
+        help = "Allow a USB4 device; repeat for more",
+        verbatim_doc_comment
+    )]
     usb4_allow: Vec<String>,
     /// Boot this install by default.
     #[arg(long, hide = true)]
@@ -597,7 +641,12 @@ impl Settings {
 pub(crate) struct Log {
     /// One disk, volume, disk image or boot.log copy to read instead of
     /// every disk of this computer.
-    #[arg(value_name = "PATH", value_parser = path())]
+    #[arg(
+        value_name = "PATH",
+        value_parser = path(),
+        help = "One disk, volume, image or boot.log",
+        verbatim_doc_comment
+    )]
     path: Option<PathBuf>,
     /// Save to FILE
     #[arg(short, long, value_name = "FILE")]

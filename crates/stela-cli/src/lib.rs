@@ -69,8 +69,7 @@ pub(crate) struct Cli {
     /// Show what would change, and change nothing
     #[arg(short = 'n', long, global = true)]
     dry_run: bool,
-    /// Without a terminal, accept what a run on a terminal would ask about.
-    /// Never covers erasing a disk.
+    /// Accept questions without a terminal
     #[arg(short = 'y', long, global = true)]
     yes: bool,
 }
@@ -141,6 +140,27 @@ pub fn main() -> ExitCode {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn every_help_line_fits_80_columns() {
+        let mut cli = Cli::command();
+        cli.build();
+        let mut pages = vec![
+            cli.render_help().to_string(),
+            cli.render_long_help().to_string(),
+        ];
+        for command in cli.get_subcommands_mut() {
+            if !command.is_hide_set() {
+                pages.push(command.render_help().to_string());
+                pages.push(command.render_long_help().to_string());
+            }
+        }
+        for page in pages {
+            for line in page.lines() {
+                assert!(line.chars().count() <= 80, "{line:?} in:\n{page}");
+            }
+        }
+    }
 
     #[test]
     fn a_0_3_command_line_is_named_and_runs_nothing() {
