@@ -171,6 +171,11 @@ fn fix(usb: &Path, words: &str) -> String {
     }
 }
 
+/// How a message says to start over: the hidden `uninstall` is never
+/// suggested.
+const START_OVER: &str = "start over with `stela create` on the stick's whole disk, which \
+    erases it";
+
 /// `word` as a shell takes it as one argument.
 fn quoted(word: &str) -> String {
     if word.is_empty() || word.contains(|c: char| c.is_whitespace() || c == '"') {

@@ -370,8 +370,8 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
         let install = record.install(Some(name))?.clone();
         ensure!(
             record.installs.len() > 1,
-            "install \"{name}\" is this setup's only one; {} removes the setup",
-            super::fix(&command.usb, "uninstall")
+            "install \"{name}\" is this setup's only one; to remove it, {}",
+            super::START_OVER
         );
         record.installs.retain(|i| i.name != *name);
         if record.default_install.as_deref() == Some(name.as_str()) {

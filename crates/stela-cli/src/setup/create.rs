@@ -414,10 +414,10 @@ impl Resume {
         } = request;
         let [install] = &previous.installs[..] else {
             bail!(
-                "the interrupted setup on {} names {} installs; remove it with {} first",
+                "the interrupted setup on {} names {} installs; {}",
                 previous.esp.display(),
                 previous.installs.len(),
-                super::fix(&command.usb, "uninstall")
+                super::START_OVER
             );
         };
         let mut differences = Vec::new();
@@ -468,9 +468,9 @@ impl Resume {
         let generation = environment.generation();
         let Some(ecid) = install.ecid else {
             bail!(
-                "the interrupted setup on {} names no ECID; remove it with {} first",
+                "the interrupted setup on {} names no ECID; {}",
                 previous.esp.display(),
-                super::fix(&command.usb, "uninstall")
+                super::START_OVER
             );
         };
         if !differences.is_empty() {
@@ -636,12 +636,12 @@ pub(super) fn plan(
         true => match super::record::interrupted(host, &esp, &command.usb) {
             Some(previous) => Some(previous),
             None => bail!(
-                "{} is already set up ({}). Update it with {} or {}, or remove it with {} first",
+                "{} is already set up ({}). Update it with {} or {}, or {}",
                 esp.display(),
                 esp.join(RECORD).display(),
                 super::fix(&command.usb, "update"),
                 super::fix(&command.usb, "update --macos VERSION"),
-                super::fix(&command.usb, "uninstall")
+                super::START_OVER
             ),
         },
     };
@@ -1042,10 +1042,10 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
             ensure!(
                 command.install_image.is_none_or(|asked| asked == kind),
                 "{} holds an interrupted {} setup, which goes on as it began. Run it again \
-                 without --installer, or remove it with {} and start over",
+                 without --installer, or {}",
                 esp.display(),
                 kind.name(),
-                super::fix(&command.usb, "uninstall")
+                super::START_OVER
             );
             command.install_image = Some(kind);
         } else if !esp.join(RECORD).exists() {

@@ -792,8 +792,7 @@ pub(super) fn lost_keys(install: &super::machines::Install, usb: &Path, several:
         )
     } else {
         format!(
-            "remove the setup with {}, then set it up again with {}",
-            fix("uninstall"),
+            "make the stick again with {}, which erases it",
             fix(&format!("create {target} --initialize-nor"))
         )
     };

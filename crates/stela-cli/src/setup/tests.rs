@@ -591,7 +591,9 @@ fn setup_installs_from_the_usb_and_uninstall_restores_it() {
     assert_eq!(record.schema_version, RECORD_SCHEMA);
     // A second setup is refused until the first is undone.
     let again = setup(&environment(host), command(&f, &f.esp));
-    assert!(again.unwrap_err().to_string().contains("`stela uninstall`"));
+    let again = again.unwrap_err().to_string();
+    assert!(again.contains("start over with `stela create`"), "{again}");
+    assert!(!again.contains("uninstall"), "{again}");
     // The only install is not removed alone.
     let error = rerun(&f, |c| {
         c.action = Action::Configure;
@@ -4929,15 +4931,7 @@ fn assert_hints_name_the_usb(text: &str) {
         let first = hint.split(' ').next().unwrap();
         assert!(
             [
-                "create",
-                "update",
-                "repair",
-                "status",
-                "settings",
-                "log",
-                "uninstall",
-                "nvram",
-                "state"
+                "create", "update", "repair", "status", "settings", "log", "nvram", "state"
             ]
             .contains(&first),
             "`stela {hint}` in:\n{text}"
