@@ -14,7 +14,6 @@ struct Catalog {
 #[derive(Deserialize)]
 struct Device {
     name: String,
-    cpid: Option<u32>,
     firmwares: Vec<Firmware>,
 }
 
@@ -30,17 +29,6 @@ struct Firmware {
 
 pub(super) struct Releases {
     pub images: Vec<Image>,
-    pub models: BTreeMap<String, String>,
-}
-
-fn device_name(device: &Device) -> String {
-    if let Some(chip) = device.cpid.and_then(stela_soc_data::board::name) {
-        let chip = chip.strip_prefix("Apple ").unwrap_or(chip);
-        if !device.name.contains(chip) {
-            return format!("{} · {chip}", device.name);
-        }
-    }
-    device.name.clone()
 }
 
 pub(super) fn load() -> Result<Releases> {
@@ -84,7 +72,6 @@ fn parse(bytes: &[u8]) -> Result<Releases> {
         )
     })?;
     let mut images: BTreeMap<(String, String), Image> = BTreeMap::new();
-    let mut models = BTreeMap::new();
     for (model, device) in catalog.devices {
         if !model.starts_with("Mac") && !model.starts_with("iMac") {
             continue;
@@ -92,7 +79,6 @@ fn parse(bytes: &[u8]) -> Result<Releases> {
         if device.name.to_ascii_lowercase().contains("virtual") {
             continue;
         }
-        models.insert(model.clone(), device_name(&device));
         for firmware in device.firmwares {
             if !firmware.signed {
                 continue;
@@ -133,7 +119,6 @@ fn parse(bytes: &[u8]) -> Result<Releases> {
     }
     Ok(Releases {
         images: images.into_values().collect(),
-        models,
     })
 }
 
@@ -180,16 +165,6 @@ mod tests {
         let images = parse(&serde_json::to_vec(&catalog)?)?.images;
         assert_eq!(images[0].models, ["MacBookAir10,1"]);
         Ok(())
-    }
-
-    #[test]
-    fn year_only_names_include_the_chip_from_the_shared_soc_registry() {
-        let device = Device {
-            name: "Mac Studio (2025)".into(),
-            cpid: Some(0x6041),
-            firmwares: vec![],
-        };
-        assert_eq!(device_name(&device), "Mac Studio (2025) · M4 Max");
     }
 
     #[test]

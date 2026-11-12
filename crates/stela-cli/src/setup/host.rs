@@ -22,13 +22,13 @@ mod unsupported;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{ADMIN, DISK_EXAMPLE, System};
+pub(crate) use linux::{ADMIN, DISK_EXAMPLE, DISK_PREFIX, System};
 #[cfg(target_os = "macos")]
-pub(crate) use macos::{ADMIN, DISK_EXAMPLE, System};
+pub(crate) use macos::{ADMIN, DISK_EXAMPLE, DISK_PREFIX, System};
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub(crate) use unsupported::{ADMIN, DISK_EXAMPLE, System};
+pub(crate) use unsupported::{ADMIN, DISK_EXAMPLE, DISK_PREFIX, System};
 #[cfg(windows)]
-pub(crate) use windows::{ADMIN, DISK_EXAMPLE, System};
+pub(crate) use windows::{ADMIN, DISK_EXAMPLE, DISK_PREFIX, System};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileSystem {

@@ -1,24 +1,27 @@
-//! A small Clack-style front end to the same setup command used by scripts.
+//! The create wizard: the questions that make an installer on a stick plain
+//! `stela` or `stela create` chose, asked through [`Ui`] so tests script
+//! them. Only real choices are asked: the installer always (Offline shown
+//! unavailable with its reason where it cannot be made), and Wi-Fi for an
+//! Online installer. The macOS version is the newest tested one and the
+//! Mac the one supported model; Review shows both, and "Change something"
+//! changes any item without walking every step again. No disk is written
+//! here.
 use super::{
-    InstallImage, Request, firmware,
+    Environment, InstallImage, Request, firmware,
+    home::Stick,
     host::{self, Disk, Host, Removal},
-    record::{self, Record},
+    sources,
+    ui::{self, Ui},
     wifi,
 };
-use crate::{progress::Phase, restore};
+use crate::restore;
 use anyhow::{Context, Result, ensure};
-use std::{
-    io::IsTerminal,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-mod catalog;
-mod choices;
 pub(super) mod menu;
 pub(super) mod theme;
 
-// Advertised USB capacity classes; preparation also checks exact image sizes.
-const NETWORK_MIN: u64 = 7 * 1024 * 1024 * 1024;
+use menu::Item;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Usb {
@@ -45,16 +48,12 @@ impl Usb {
             .disks()?
             .into_iter()
             .find(|d| d.identifier == self.id)
-            .context("the selected USB was disconnected; run setup again")?;
+            .context("the chosen stick was disconnected; run stela again")?;
         ensure!(
             disk.erasable() && *self == Self::from_disk(&disk, host),
-            "the selected USB changed; run setup again and choose it again"
+            "the chosen stick changed; run stela again and choose it again"
         );
         Ok(())
-    }
-
-    fn path(&self) -> PathBuf {
-        PathBuf::from(&self.id)
     }
 
     fn size(&self) -> String {
@@ -62,13 +61,20 @@ impl Usb {
     }
 
     fn description(&self) -> String {
-        format!("{} · {} · {}", self.name, self.size(), self.id)
+        format!(
+            "{} · {} · {}{}",
+            self.name,
+            self.size(),
+            host::DISK_PREFIX,
+            self.id
+        )
     }
 
-    /// Its model or size, typed back to erase a disk other than a USB, or
-    /// any disk when setup cannot tell which one this computer runs from.
-    fn typed_back(&self) -> Result<String> {
-        cliclack::log::warning(format!(
+    /// Its model or size, typed back to erase a disk other than a USB
+    /// stick, or any disk when stela cannot tell which one this computer
+    /// runs from.
+    fn typed_back(&self, ui: &dyn Ui) -> Result<String> {
+        ui.warning(&format!(
             "{} ({}, {}) {}.",
             self.name,
             self.size(),
@@ -77,16 +83,18 @@ impl Usb {
         ))?;
         let (name, bytes) = (self.name.clone(), self.bytes);
         let expected = format!("Type {} or {}", self.name, self.size());
-        Ok(cliclack::input("Type its model or size to erase it")
-            .placeholder(&format!("{} or {}", self.name, self.size()))
-            .validate(move |typed: &String| {
+        ui.input(
+            "Type its model or size to erase it",
+            &format!("{} or {}", self.name, self.size()),
+            "",
+            Box::new(move |typed: &str| {
                 if host::names_disk(&name, bytes, typed) {
                     Ok(())
                 } else {
                     Err(expected.clone())
                 }
-            })
-            .interact()?)
+            }),
+        )
     }
 
     /// The name and size people recognize, for the erase warning.
@@ -101,222 +109,202 @@ struct LocalImage {
     product_version: String,
     #[serde(rename = "ProductBuildVersion")]
     product_build: String,
-    #[serde(rename = "SupportedProductTypes")]
-    supported_models: Vec<String>,
 }
 
 fn local_image(path: &Path) -> Result<LocalImage> {
-    // Read only metadata into the wizard, rather than keeping every board's
-    // component map. Preparation validates the selected identity before erase.
+    // Only the version is read here; preparation checks the image before
+    // anything is erased.
     let bytes = restore::archive::read_member(path, "BuildManifest.plist", 64 * 1024 * 1024)?;
     Ok(plist::from_reader(std::io::Cursor::new(bytes))?)
 }
 
-/// `false` is cancellation. No disk is written by this function.
-pub(super) fn configure(command: &mut Request, host: &dyn Host) -> Result<bool> {
-    ensure!(
-        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
-        "interactive setup needs a terminal; scripts pass --usb, and --ipsw for a local image"
-    );
-    match configure_inner(command, host) {
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted) =>
+/// The macOS image the installer is made from, and what making it
+/// downloads.
+struct Image {
+    version: String,
+    /// It holds all of macOS, not only its startup files.
+    whole: bool,
+    /// Its bytes and its boot files' bytes, when known.
+    bytes: Option<u64>,
+    boot_bytes: Option<u64>,
+    /// An image of the build this computer holds already.
+    local: Option<PathBuf>,
+}
+
+/// The image `command` names: its `--ipsw`, or the build to download.
+fn image(environment: &Environment<'_>, command: &mut Request) -> Result<Image> {
+    if let Some(path) = command.ipsw.clone() {
+        let manifest = local_image(&path).with_context(|| format!("reading {}", path.display()))?;
+        stela_formats::builds::find(&manifest.product_build)
+            .with_context(|| path.display().to_string())?;
+        command.fetch = false;
+        command.build = manifest.product_build.clone();
+        return Ok(Image {
+            version: manifest.product_version,
+            whole: restore::payload::holds_system_image(&path)?,
+            bytes: std::fs::metadata(&path).ok().map(|meta| meta.len()),
+            boot_bytes: None,
+            local: Some(path),
+        });
+    }
+    command.fetch = true;
+    let version = environment
+        .builds
+        .iter()
+        .find(|entry| entry.build == command.build)
+        .map_or_else(|| command.build.clone(), |entry| entry.version.into());
+    let sizes = (environment.image_size)(&command.build, command.model()).ok();
+    Ok(Image {
+        version,
+        whole: true,
+        bytes: sizes.map(|(_, whole)| whole),
+        boot_bytes: sizes.map(|(boot, _)| boot),
+        local: None,
+    })
+}
+
+impl Image {
+    /// What making `kind` downloads now, and its Review line.
+    fn download(
+        &self,
+        environment: &Environment<'_>,
+        command: &Request,
+        kind: InstallImage,
+    ) -> (u64, String) {
+        if self.local.is_some() {
+            return (0, "none (uses the IPSW named)".into());
+        }
+        let need = match kind {
+            InstallImage::Full => sources::Need::WholeImage,
+            InstallImage::Network => sources::Need::BootFiles,
+        };
+        if sources::cached_image(
+            environment,
+            need,
+            &command.build,
+            command.model(),
+            command.download_dir.as_deref(),
+        )
+        .is_some()
         {
-            cliclack::outro_cancel("Setup cancelled. Your USB was not changed.")?;
+            return (
+                0,
+                format!(
+                    "none (uses the macOS {} image already on this computer)",
+                    self.version
+                ),
+            );
+        }
+        match (kind, self.bytes, self.boot_bytes) {
+            (InstallImage::Full, Some(bytes), _) => (
+                bytes,
+                format!(
+                    "{}, written to the stick as it arrives",
+                    host::size_text(bytes)
+                ),
+            ),
+            (InstallImage::Network, _, Some(bytes)) => {
+                (bytes, format!("{} now", host::size_text(bytes)))
+            }
+            _ => (0, "the size is unknown until Apple's server answers".into()),
+        }
+    }
+}
+
+/// Ask how to make the installer on `stick`, which a yes erases: `false`
+/// is a no, and nothing was changed.
+pub(super) fn configure(
+    environment: &Environment<'_>,
+    command: &mut Request,
+    stick: &Stick,
+) -> Result<bool> {
+    let ui = environment.ui;
+    ensure!(
+        ui.interactive(),
+        "making an installer step by step needs a terminal; scripts run `stela create STICK \
+         --confirm-disk SIZE`"
+    );
+    match ask(environment, command, stick) {
+        Err(error) if ui::cancelled(&error) => {
+            ui.cancel("Nothing was changed.")?;
             Ok(false)
         }
         result => result,
     }
 }
 
-/// The EFI partition of `usb` and the interrupted first setup it holds,
-/// which the same choices again resume (`create::plan`). The partition is
-/// mounted to look, as setup mounts it anyway.
-pub(super) fn interrupted(host: &dyn Host, usb: &Disk) -> Option<(PathBuf, Record)> {
-    let partition = usb.partitions.iter().find(|p| p.content == "EFI")?;
-    let esp = match &partition.mount {
-        Some(mount) => mount.clone(),
-        None => host.mount(&partition.identifier).ok()?,
-    };
-    let record = record::interrupted(host, &esp, &esp)?;
-    Some((esp, record))
+/// The parts Review can change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Installer,
+    Macos,
+    Wifi,
+    Addresses,
 }
 
-fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
-    cliclack::set_theme(theme::Stela);
-    crate::progress::follow(theme::rail());
-    cliclack::intro(
-        theme::accent()
-            .bold()
-            .apply_to("Stela · Create a macOS installer"),
-    )?;
-    let disks = host.disks()?;
-    let choices: Vec<_> = disks
+fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> Result<bool> {
+    let ui = environment.ui;
+    let host = environment.host;
+    let usb = Usb::from_disk(&stick.disk, host);
+    command.usb = PathBuf::from(&usb.id);
+    command
+        .model
+        .get_or_insert_with(|| super::PINNED_MODEL.into());
+    let model_name = environment
+        .models
         .iter()
-        .filter(|d| d.erasable())
-        .map(|d| Usb::from_disk(d, host))
-        .collect();
-    ensure!(
-        !choices.is_empty(),
-        "no removable USB found. Connect a USB and run setup again."
-    );
-    let mut images = None;
-    let mut names = catalog::cached_names();
-    let mut first = true;
-    // `--build`, or the newest supported build.
-    let mut preferred_build = Some(command.build.clone());
+        .find(|(model, _)| *model == command.model())
+        .map_or(command.model(), |(_, name)| *name)
+        .to_owned();
+    let mut image = image(environment, command)?;
+    let mut parts = vec![Part::Installer];
     loop {
-        let rows: Vec<_> = choices
-            .iter()
-            .enumerate()
-            .map(|(i, usb)| menu::Item {
-                value: i,
-                label: usb.description(),
-                hint: if usb.bytes == 0 {
-                    "Capacity unavailable".into()
-                } else if usb.bytes < NETWORK_MIN {
-                    "Too small · Requires an 8 GB or larger USB".into()
-                } else if usb.bytes < super::FULL_MIN {
-                    "Online installer only · Offline needs 32 GB or more".into()
-                } else {
-                    "Offline or Online installer".into()
-                },
-                enabled: usb.bytes >= NETWORK_MIN,
-            })
-            .collect();
-        if !rows.iter().any(|row| row.enabled) {
-            cliclack::note(
-                "USBs found",
-                rows.iter()
-                    .map(|row| format!("{} · {}", row.label, row.hint))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )?;
-            anyhow::bail!("no USB of 8 GB or more found; connect one and run setup again");
-        }
-        let initial = choices
-            .iter()
-            .position(|usb| usb.path() == command.usb)
-            .unwrap_or(0);
-        let usb = &choices[menu::select("1. Choose a USB", &rows, initial)?];
-        command.usb = usb.path();
-        // A setup this USB holds that stopped part way is finished, not
-        // erased and begun again.
-        let disk = disks.iter().find(|d| d.identifier == usb.id);
-        if let Some((esp, record)) = disk.and_then(|disk| interrupted(host, disk)) {
-            cliclack::log::info(format!(
-                "This USB holds a setup that was interrupted: {}",
-                record.resume_summary()
-            ))?;
-            let choice = cliclack::select("Resume it or start over?")
-                .item(
-                    0,
-                    "Resume it",
-                    "Keeps what it wrote, checks each piece and finishes the rest",
-                )
-                .item(1, "Start over", "Erases the USB")
-                .initial_value(0)
-                .interact()?;
-            if choice == 0 {
-                command.resume_from(esp, &record);
-                if command.wifi.is_some() {
-                    cliclack::log::warning("The passphrase is stored in plaintext on the USB.")?;
-                    let ssid = command.wifi.clone().unwrap_or_default();
-                    command.wifi_passphrase =
-                        Some(wifi::ask_passphrase(&super::ui::Terminal, &ssid)?);
+        for part in std::mem::take(&mut parts) {
+            match part {
+                Part::Installer => {
+                    let (rows, initial) =
+                        installer_rows(usb.bytes, image.whole, image.bytes, command.install_image);
+                    let kind = INSTALLERS[ui.select("Installer", &rows, initial)?];
+                    command.install_image = Some(kind);
+                    // Only the Online installer's install needs a network.
+                    if kind == InstallImage::Network && command.wifi.is_none() {
+                        parts.push(Part::Wifi);
+                    }
                 }
-                return Ok(true);
+                Part::Macos => {
+                    choose_macos(environment, command)?;
+                    image = self::image(environment, command)?;
+                }
+                Part::Wifi => choose_wifi(environment, command)?,
+                Part::Addresses => super::addresses::choose(ui, command)?,
             }
         }
-        // A local IPSW named on the command line supplies the boot files,
-        // and macOS too when it holds the whole image.
-        let prefilled = first && command.ipsw.is_some();
-        first = false;
-        // macOS's size, for the Offline choice, and whether the image holds
-        // all of it.
-        let (image_bytes, whole);
-        let (version, models) = if prefilled {
-            let path = command.ipsw.clone().unwrap();
-            let progress = Phase::spinner("Reading IPSW metadata");
-            let manifest =
-                local_image(&path).with_context(|| format!("reading {}", path.display()))?;
-            progress.finish();
-            stela_formats::builds::find(&manifest.product_build)
-                .with_context(|| path.display().to_string())?;
-            command.ipsw = Some(path);
-            command.fetch = false;
-            command.build = manifest.product_build.clone();
-            preferred_build = Some(command.build.clone());
-            let ipsw = command.ipsw.as_deref().unwrap();
-            whole = crate::restore::payload::holds_system_image(ipsw)?;
-            image_bytes = std::fs::metadata(ipsw).ok().map(|meta| meta.len());
-            cliclack::log::info(format!(
-                "macOS {} ({}) · local IPSW{}",
-                manifest.product_version,
-                manifest.product_build,
-                if stela_formats::builds::tested(&manifest.product_build) {
-                    ""
-                } else {
-                    " · not tested yet"
-                }
-            ))?;
-            (manifest.product_version, manifest.supported_models)
-        } else {
-            if images.is_none() {
-                let progress = Phase::spinner("Loading available macOS versions");
-                images = Some(catalog::load()?);
-                if let Ok(fresh) = catalog::model_names() {
-                    names = fresh;
-                }
-                progress.finish();
-            }
-            let entries = images.as_ref().unwrap();
-            let image =
-                &entries[choices::release(entries, preferred_build.as_deref().unwrap_or(""))?];
-            command.build = image.build.clone();
-            preferred_build = Some(command.build.clone());
-            command.ipsw = None;
-            command.fetch = true;
-            whole = true;
-            image_bytes = download_size(image);
-            (image.version.clone(), image.models.clone())
-        };
-        ensure!(
-            !models.is_empty(),
-            "this image lists no compatible Mac models"
-        );
-        let mut models = models;
-        models.sort();
-        models.dedup();
-        command.model = Some(choices::model(&models, &names, command.model.as_deref())?);
-        let (rows, initial) = installer_rows(usb.bytes, whole, image_bytes, command.install_image);
-        let install_image = INSTALLERS[menu::select("4. Installer", &rows, initial)?];
-        command.install_image = Some(install_image);
-        // Only the Online installer's install needs the internet, and so a
-        // way to it.
-        let online = install_image == InstallImage::Network;
-        let network = if online {
-            choose_wifi(command)?;
-            super::addresses::choose(command)?;
-            format!(
-                "{}{}",
-                match &command.wifi {
-                    Some(ssid) => format!("Wi-Fi      {ssid}\n"),
-                    None => "Wi-Fi      None (Ethernet)\n".into(),
-                },
-                super::addresses::review(command)
-            )
-        } else {
+        if !parts.is_empty() {
+            continue;
+        }
+        let online = command.install_image == Some(InstallImage::Network);
+        if !online {
             (command.wifi, command.wifi_passphrase) = (None, None);
             (command.ipv4, command.ipv4_gateway, command.dns) = (None, None, None);
-            String::new()
+        }
+        let kind = command.install_image.unwrap_or(InstallImage::Network);
+        let (download, download_text) = image.download(environment, command, kind);
+        let network = match online {
+            false => String::new(),
+            true => format!(
+                "Network    {}, {}\n",
+                match &command.wifi {
+                    Some(ssid) => format!("Wi-Fi {ssid}"),
+                    None => "Ethernet".into(),
+                },
+                super::addresses::summary(command)
+            ),
         };
-        cliclack::note(
-            if online { "7. Review" } else { "5. Review" },
-            format!(
-                "USB        {}\nInstaller  {}\nmacOS      {version} ({})\nMac        {}\n{network}{}",
+        ui.note(
+            "Review",
+            &format!(
+                "USB        {}\nInstaller  {}\nmacOS      {} ({})\nMac        {model_name}\n\
+                 {network}Download   {download_text}\n{}",
                 usb.serial.as_ref().map_or_else(
                     || usb.description(),
                     |serial| format!("{} · serial {serial}", usb.description())
@@ -325,10 +313,8 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
                     false => "Offline · the install needs no internet",
                     true => "Online · the install downloads macOS",
                 },
+                image.version,
                 command.build,
-                names
-                    .get(command.model())
-                    .map_or(command.model(), String::as_str),
                 // Only a scripted --profile turns it on.
                 if command.profile {
                     "Profiling  On\n"
@@ -338,42 +324,92 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
             ),
         )?;
         for note in firmware::host_notes(host)? {
-            cliclack::log::info(note)?;
+            ui.info(&note)?;
         }
-        cliclack::log::info(super::create::SIGNING_NOTE)?;
-        cliclack::log::warning(format!("Everything on {} will be erased.", usb.short()))?;
-        match cliclack::select("Create the installer?")
-            .item(
-                0,
-                "Create installer",
-                format!("Erase {} and write the installer", usb.short()),
-            )
-            .item(1, "Edit choices", "")
-            .item(2, "Cancel", "")
-            .initial_value(0)
-            .interact()?
-        {
+        ui.info(super::create::SIGNING_SUMMARY)?;
+        if let Some(record) = &stick.record {
+            ui.warning(&format!(
+                "This stick holds Stela with macOS {}: a new installer replaces it. To keep it, \
+                 choose Cancel and run `stela update`.",
+                super::home::macos_name(&record.build)
+            ))?;
+        }
+        ui.warning(&format!("Everything on {} will be erased.", usb.short()))?;
+        let create = match download {
+            0 => "Erase and create".to_owned(),
+            bytes => format!("Erase and create (downloads {})", host::size_text(bytes)),
+        };
+        let rows = ui::rows(&[(&create, ""), ("Change something", ""), ("Cancel", "")]);
+        match ui.select("Create the installer?", &rows, 0)? {
             0 => {
                 if matches!(usb.removal, Removal::Typed | Removal::Unsure) {
-                    command.confirm_disk = Some(usb.typed_back()?);
+                    command.confirm_disk = Some(usb.typed_back(ui)?);
                 }
                 usb.verify(host)?;
                 command.confirmed = true;
                 return Ok(true);
             }
-            1 => continue,
+            1 => parts.push(change(environment, command, online)?),
             _ => {
-                cliclack::outro_cancel("Setup cancelled. Your USB was not changed.")?;
+                ui.cancel("Nothing was changed.")?;
                 return Ok(false);
             }
         }
     }
 }
 
+/// Which part of the installer to change.
+fn change(environment: &Environment<'_>, command: &Request, online: bool) -> Result<Part> {
+    let mut rows = vec![(Part::Installer, "Installer")];
+    // A local IPSW fixes the version; otherwise each tested build is one.
+    if command.ipsw.is_none() && environment.builds.len() > 1 {
+        rows.push((Part::Macos, "macOS version"));
+    }
+    if online {
+        rows.push((Part::Wifi, "Wi-Fi"));
+        rows.push((Part::Addresses, "Network addresses"));
+    }
+    let items: Vec<_> = rows.iter().map(|(_, label)| (*label, "")).collect();
+    let index = environment
+        .ui
+        .select("Change what?", &ui::rows(&items), 0)?;
+    Ok(rows[index].0)
+}
+
+/// The macOS version: each build Stela was tested with.
+fn choose_macos(environment: &Environment<'_>, command: &mut Request) -> Result<()> {
+    let builds: Vec<_> = environment.builds.iter().collect();
+    let labels: Vec<String> = builds
+        .iter()
+        .map(|entry| format!("macOS {} ({})", entry.version, entry.build))
+        .collect();
+    let items: Vec<_> = labels
+        .iter()
+        .enumerate()
+        .map(|(value, label)| Item {
+            value,
+            label: label.clone(),
+            hint: if value == 0 {
+                "Newest tested".into()
+            } else {
+                String::new()
+            },
+            enabled: true,
+        })
+        .collect();
+    let initial = builds
+        .iter()
+        .position(|entry| entry.build == command.build)
+        .unwrap_or(0);
+    let index = environment.ui.select("macOS version", &items, initial)?;
+    command.build = builds[index].build.into();
+    Ok(())
+}
+
 /// The installer step's choices, by their menu values.
 const INSTALLERS: [InstallImage; 2] = [InstallImage::Full, InstallImage::Network];
 
-/// The installer step on a USB of `usb_bytes`, for an image of
+/// The installer step on a stick of `usb_bytes`, for an image of
 /// `image_bytes` that holds all of macOS (`whole`) or only its startup
 /// files: Offline, shown unavailable with its reason where it cannot be
 /// made, and Online; and the one preselected, `chosen` before or else
@@ -383,7 +419,7 @@ fn installer_rows(
     whole: bool,
     image_bytes: Option<u64>,
     chosen: Option<InstallImage>,
-) -> (Vec<menu::Item>, usize) {
+) -> (Vec<Item>, usize) {
     let unavailable = super::offline_unavailable(usb_bytes, whole);
     let offline = match &unavailable {
         Some(reason) => {
@@ -392,7 +428,7 @@ fn installer_rows(
             hint
         }
         None => format!(
-            "macOS is copied to the USB now{}. The install needs no internet.",
+            "macOS is copied to the stick now{}. The install needs no internet.",
             image_bytes.map_or_else(String::new, |bytes| format!(
                 " (about {:.0} GB)",
                 bytes as f64 / 1e9
@@ -400,13 +436,13 @@ fn installer_rows(
         ),
     };
     let rows = vec![
-        menu::Item {
+        Item {
             value: 0,
             label: InstallImage::Full.name().into(),
             hint: offline,
             enabled: unavailable.is_none(),
         },
-        menu::Item {
+        Item {
             value: 1,
             label: InstallImage::Network.name().into(),
             hint: "Small and quick to make. The install downloads macOS, so the PC needs \
@@ -422,31 +458,33 @@ fn installer_rows(
     (rows, initial)
 }
 
-/// The size of the catalog's macOS image, from Apple's server; nothing
-/// when the server does not say.
-fn download_size(image: &restore::Image) -> Option<u64> {
-    let progress = Phase::spinner("Checking the size of macOS");
-    let size = restore::open_image(image).ok().map(|remote| remote.size());
-    progress.finish();
-    size
-}
-
 /// An Online installer's Wi-Fi: a network this computer sees or knows, one
 /// typed in, or none.
-fn choose_wifi(command: &mut Request) -> Result<()> {
-    let progress = Phase::spinner("Looking for Wi-Fi networks");
-    let networks = wifi::host_networks();
-    progress.finish();
+pub(super) fn choose_wifi(environment: &Environment<'_>, command: &mut Request) -> Result<()> {
+    let ui = environment.ui;
+    let networks = (environment.wifi_networks)();
     const ETHERNET: usize = usize::MAX;
     const TYPED: usize = usize::MAX - 1;
-    let mut select = cliclack::select("5. Wi-Fi during installation").item(
-        ETHERNET,
-        "No Wi-Fi",
-        "Connect the PC to Ethernet during installation",
-    );
-    for (index, ssid) in networks.iter().enumerate() {
-        select = select.item(index, ssid, "");
+    let mut rows = vec![Item {
+        value: ETHERNET,
+        label: "No Wi-Fi (Ethernet)".into(),
+        hint: "Connect the PC to Ethernet during installation".into(),
+        enabled: true,
+    }];
+    for (value, ssid) in networks.iter().enumerate() {
+        rows.push(Item {
+            value,
+            label: ssid.clone(),
+            hint: String::new(),
+            enabled: true,
+        });
     }
+    rows.push(Item {
+        value: TYPED,
+        label: "Another network".into(),
+        hint: "Type its name".into(),
+        enabled: true,
+    });
     let initial = command
         .wifi
         .as_ref()
@@ -456,23 +494,21 @@ fn choose_wifi(command: &mut Request) -> Result<()> {
         } else {
             ETHERNET
         });
-    let choice = select
-        .item(TYPED, "Another network", "Type its name")
-        .initial_value(initial)
-        .interact()?;
-    let ssid = match choice {
+    let ssid = match ui.select("Wi-Fi during installation", &rows, initial)? {
         ETHERNET => {
             (command.wifi, command.wifi_passphrase) = (None, None);
             return Ok(());
         }
-        TYPED => cliclack::input("Network name")
-            .default_input(command.wifi.as_deref().unwrap_or_default())
-            .validate(|name: &String| wifi::ssid(name).map(|_| ()))
-            .interact()?,
+        TYPED => ui.input(
+            "Network name",
+            "",
+            command.wifi.as_deref().unwrap_or_default(),
+            Box::new(|name: &str| wifi::ssid(name).map(|_| ())),
+        )?,
         index => networks[index].clone(),
     };
-    cliclack::log::warning("The passphrase is stored in plaintext on the USB.")?;
-    command.wifi_passphrase = Some(wifi::ask_passphrase(&super::ui::Terminal, &ssid)?);
+    ui.warning("The passphrase is stored in plaintext on the stick.")?;
+    command.wifi_passphrase = Some(wifi::ask_passphrase(ui, &ssid)?);
     command.wifi = Some(ssid);
     Ok(())
 }
@@ -482,22 +518,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_manifest_checks_version_and_model() -> Result<()> {
+    fn local_manifest_names_its_version() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("local.ipsw");
         crate::efi::synthetic_ipsw(&path)?;
         let manifest = local_image(&path)?;
         assert_eq!(manifest.product_build, restore::payload::SYNTHETIC_BUILD);
-        assert!(
-            manifest
-                .supported_models
-                .contains(&restore::payload::SYNTHETIC_MODEL.into())
-        );
         assert!(local_image(&dir.path().join("missing.ipsw")).is_err());
         Ok(())
     }
 
-    fn shown(rows: &[menu::Item]) -> Vec<(String, String, bool)> {
+    fn shown(rows: &[Item]) -> Vec<(String, String, bool)> {
         rows.iter()
             .map(|row| (row.label.clone(), row.hint.clone(), row.enabled))
             .collect()
@@ -507,14 +538,15 @@ mod tests {
         "Small and quick to make. The install downloads macOS, so the PC needs internet.";
 
     #[test]
-    fn a_large_usb_offers_both_installers_with_offline_first() {
+    fn a_large_stick_offers_both_installers_with_offline_first() {
         let (rows, initial) = installer_rows(64_000_000_000, true, Some(17_800_000_000), None);
         assert_eq!(
             shown(&rows),
             [
                 (
                     "Offline".into(),
-                    "macOS is copied to the USB now (about 18 GB). The install needs no internet."
+                    "macOS is copied to the stick now (about 18 GB). The install needs no \
+                     internet."
                         .into(),
                     true
                 ),
@@ -522,25 +554,25 @@ mod tests {
             ]
         );
         assert_eq!(INSTALLERS[initial], InstallImage::Full);
-        // Edit choices comes back to Online once it was chosen.
+        // Change something comes back to Online once it was chosen.
         let (_, initial) = installer_rows(64_000_000_000, true, None, Some(InstallImage::Network));
         assert_eq!(INSTALLERS[initial], InstallImage::Network);
         let (rows, _) = installer_rows(64_000_000_000, true, None, None);
         assert_eq!(
             rows[0].hint,
-            "macOS is copied to the USB now. The install needs no internet."
+            "macOS is copied to the stick now. The install needs no internet."
         );
     }
 
     #[test]
-    fn a_small_usb_shows_offline_unavailable_with_its_reason() {
+    fn a_small_stick_shows_offline_unavailable_with_its_reason() {
         let (rows, initial) = installer_rows(16_000_000_000, true, Some(17_800_000_000), None);
         assert_eq!(
             shown(&rows),
             [
                 (
                     "Offline".into(),
-                    "Needs a USB of 32 GB or more (this one is 16.0 GB)".into(),
+                    "Needs a USB stick of 32 GB or more (this one is 16.0 GB)".into(),
                     false
                 ),
                 ("Online".into(), ONLINE.into(), true),

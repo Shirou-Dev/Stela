@@ -166,6 +166,37 @@ fn saved(count: usize, path: &Path) -> String {
     }
 }
 
+/// Where `stela log` saves the logs on a terminal: `stela-boot-log-DATE.txt`
+/// in this folder, numbered when one of that name exists.
+pub(crate) fn default_output() -> PathBuf {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() / 86_400);
+    let date = civil_date(days);
+    (1..)
+        .map(|n| match n {
+            1 => PathBuf::from(format!("stela-boot-log-{date}.txt")),
+            n => PathBuf::from(format!("stela-boot-log-{date}-{n}.txt")),
+        })
+        .find(|path| !path.exists())
+        .expect("some number is free")
+}
+
+/// The UTC date `days` after 1970-01-01, as `2026-11-12`.
+fn civil_date(days: u64) -> String {
+    // Howard Hinnant's days-to-civil algorithm, for dates after 1970.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 /// `path` in full, as a file to attach is found again.
 pub(crate) fn shown(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())

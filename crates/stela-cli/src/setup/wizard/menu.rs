@@ -1,4 +1,4 @@
-//! Capacity-aware menus with fixed hint rows and Escape-to-parent submenus.
+//! Capacity-aware menus with fixed hint rows.
 use anyhow::{Result, ensure};
 use cliclack::{Theme, ThemeState};
 use console::{Key, Style, Term, truncate_str};
@@ -17,23 +17,9 @@ impl Drop for Cursor {
         let _ = self.0.show_cursor();
     }
 }
+/// The value of the item chosen; Escape is an `Interrupted` error, which
+/// the caller reports.
 pub(crate) fn select(prompt: &str, items: &[Item], initial: usize) -> Result<usize> {
-    run(prompt, items, initial, false)
-}
-pub(crate) fn submenu(prompt: &str, items: &[Item], initial: usize) -> Result<Option<usize>> {
-    let mut rows = items.to_vec();
-    rows.push(Item {
-        value: usize::MAX,
-        label: "Back".into(),
-        hint: String::new(),
-        enabled: true,
-    });
-    Ok(match run(prompt, &rows, initial, true)? {
-        usize::MAX => None,
-        value => Some(value),
-    })
-}
-fn run(prompt: &str, items: &[Item], initial: usize, submenu: bool) -> Result<usize> {
     ensure!(
         items.iter().any(|item| item.enabled),
         "{prompt}: nothing here can be chosen"
@@ -42,21 +28,11 @@ fn run(prompt: &str, items: &[Item], initial: usize, submenu: bool) -> Result<us
     term.hide_cursor()?;
     let _cursor = Cursor(term.clone());
     let theme = super::theme::Stela;
-    let hints = !submenu && items.iter().any(|item| !item.hint.is_empty());
-    let mut query = String::new();
+    let hints = items.iter().any(|item| !item.hint.is_empty());
     let mut chosen = initial;
     let mut printed = 0;
     loop {
-        let visible: Vec<_> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| {
-                !submenu
-                    || item.value == usize::MAX
-                    || item.label.to_lowercase().contains(&query.to_lowercase())
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let visible: Vec<_> = (0..items.len()).collect();
         let enabled: Vec<_> = visible
             .iter()
             .copied()
@@ -76,30 +52,10 @@ fn run(prompt: &str, items: &[Item], initial: usize, submenu: bool) -> Result<us
             .lines()
             .map(str::to_owned)
             .collect();
-        if submenu {
-            lines.push(format!(
-                "{}  {}",
-                theme.bar(&ThemeState::Active),
-                Style::new().dim().apply_to(if query.is_empty() {
-                    "Type to filter".into()
-                } else {
-                    format!("Filter: {query}")
-                })
-            ));
-        }
         for &index in visible.iter().skip(start).take(rows) {
             let item = &items[index];
-            // A submenu shows the chosen row's hint, and every greyed-out
-            // row's reason, beside its label; a menu with hint rows shows
-            // them below.
-            let beside = submenu && (index == selected || !item.enabled);
-            let label = if beside && !item.hint.is_empty() {
-                format!(
-                    "{}  {}",
-                    item.label,
-                    Style::new().dim().apply_to(&item.hint)
-                )
-            } else if item.enabled || hints {
+            // A menu with hint rows shows them below each label.
+            let label = if item.enabled || hints {
                 item.label.clone()
             } else {
                 format!("{} [unavailable]", item.label)
@@ -121,11 +77,7 @@ fn run(prompt: &str, items: &[Item], initial: usize, submenu: bool) -> Result<us
                 ));
             }
         }
-        let help = if submenu {
-            "↑/↓ move · Enter choose · Esc back · Type to filter"
-        } else {
-            "↑/↓ move · Enter choose · Esc cancel"
-        };
+        let help = "↑/↓ move · Enter choose · Esc cancel";
         lines.extend(
             theme
                 .format_footer_with_message(&ThemeState::Active, help)
@@ -143,9 +95,6 @@ fn run(prompt: &str, items: &[Item], initial: usize, submenu: bool) -> Result<us
             Key::ArrowDown => chosen = items[enabled[(cursor + 1).min(enabled.len() - 1)]].value,
             Key::Enter => {
                 term.clear_last_lines(printed)?;
-                if submenu && chosen == usize::MAX {
-                    return Ok(chosen);
-                }
                 let text = theme.format_header(&ThemeState::Submit, prompt)
                     + &theme.format_select_item(
                         &ThemeState::Submit,
@@ -157,19 +106,9 @@ fn run(prompt: &str, items: &[Item], initial: usize, submenu: bool) -> Result<us
                 term.write_str(&text)?;
                 return Ok(chosen);
             }
-            Key::Escape if submenu => {
-                term.clear_last_lines(printed)?;
-                return Ok(usize::MAX);
-            }
             Key::Escape | Key::CtrlC => {
-                cliclack::outro_cancel("Setup cancelled. Your USB was not changed.")?;
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "setup cancelled").into());
-            }
-            Key::Backspace if submenu => {
-                query.pop();
-            }
-            Key::Char(c) if submenu && !c.is_control() => {
-                query.push(c);
+                term.clear_last_lines(printed)?;
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled").into());
             }
             _ => {}
         }

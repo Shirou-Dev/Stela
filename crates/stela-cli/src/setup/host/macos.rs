@@ -15,6 +15,8 @@ use std::{
 /// How setup gets the rights its raw reads and writes need.
 pub(crate) const ADMIN: &str = "sudo";
 /// A whole disk as `--usb` names it.
+/// What a disk identifier is preceded by where a user types it.
+pub(crate) const DISK_PREFIX: &str = "";
 pub(crate) const DISK_EXAMPLE: &str = "disk5";
 
 /// The computer `stela setup` runs on.

@@ -100,6 +100,8 @@ pub fn main() -> ExitCode {
         .run();
     let code = match result {
         Ok(()) => ExitCode::SUCCESS,
+        // The report named what is due.
+        Err(error) if error.is::<setup::home::Due>() => ExitCode::FAILURE,
         Err(error) => {
             eprintln!(
                 "{} {error:#}",

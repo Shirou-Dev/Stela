@@ -377,6 +377,7 @@ fn environment(host: &FakeHost) -> Environment<'_> {
         image_size: &offline_image_size,
         fetch_image: &offline_fetch_image,
         ui: &ui::NoTerminal,
+        wifi_networks: &Vec::new,
         bundle_inputs: &fake_bundle_inputs,
         prepare_restore: &fake_prepare_restore,
         prepare_update: &fake_prepare_update,
@@ -449,7 +450,6 @@ fn other_mac_models_are_refused_naming_the_supported_one() {
         );
     }
     assert_eq!(PINNED_MODEL, "Mac14,3");
-    assert!(supported_model("Mac14,3") && !supported_model("MacBookPro18,3"));
 }
 
 /// Stand-ins for the restore and update restore `boot prepare` of a
@@ -5140,25 +5140,14 @@ fn a_usb_made_without_an_nvidia_gpu_needs_no_firmware_step() {
 }
 
 #[test]
-fn the_wizard_resumes_an_interrupted_setup_on_the_chosen_usb() {
+fn repair_resumes_an_interrupted_setup_with_its_recorded_inputs() {
     let mut f = fixture(64 * GIB, false);
     add_installed_disk(&mut f, &[], &[]);
-    let usb = f
-        .host
-        .disks
-        .iter()
-        .find(|d| d.identifier == "disk5")
-        .unwrap()
-        .clone();
-    assert!(wizard::interrupted(&f.host, &usb).is_none());
     setup(&environment(&f.host), installed_command(&f)).unwrap();
-    assert!(
-        wizard::interrupted(&f.host, &usb).is_none(),
-        "a finished setup"
-    );
     interrupt_setup(&f);
-    let (esp, found) = wizard::interrupted(&f.host, &usb).expect("an interrupted setup");
-    assert_eq!(esp, f.esp);
+    let found = read_record(&environment(&f.host), &f.esp).unwrap();
+    assert!(!found.complete, "an interrupted setup");
+    let esp = f.esp.clone();
     // Resuming names the mounted volume, not the whole disk, and the
     // recorded inputs.
     let mut command = command(&f, Path::new("disk5"));
@@ -5310,7 +5299,7 @@ fn offline_is_made_on_a_usb_of_32_gb_or_more_from_an_image_with_all_of_macos() {
     }
     assert_eq!(
         offline_unavailable(16_000_000_000, true).as_deref(),
-        Some("needs a USB of 32 GB or more (this one is 16.0 GB)")
+        Some("needs a USB stick of 32 GB or more (this one is 16.0 GB)")
     );
     assert!(offline_unavailable(8_000_000_000, true).is_some());
     let startup_files = offline_unavailable(64 * GIB, false).unwrap();
@@ -5351,7 +5340,7 @@ fn a_new_setup_makes_the_installer_asked_for_or_else_offline_where_it_fits() {
     assert_eq!(
         choose(full, 16_000_000_000, None),
         Err(
-            "Offline needs a USB of 32 GB or more (this one is 16.0 GB). Use --installer \
+            "Offline needs a USB stick of 32 GB or more (this one is 16.0 GB). Use --installer \
              online, or a larger USB"
                 .into()
         )
@@ -5399,7 +5388,7 @@ fn installer_flag_offline_on_a_small_usb_is_refused_before_anything_changes() {
         .unwrap_err()
         .to_string();
     assert!(
-        error.starts_with("Offline needs a USB of 32 GB or more (this one is 16.0 GB)"),
+        error.starts_with("Offline needs a USB stick of 32 GB or more (this one is 16.0 GB)"),
         "{error}"
     );
     assert_eq!((snapshot(&f.esp), snapshot(&volume)), before);
@@ -5899,4 +5888,282 @@ fn repair_asks_before_downloading_more_than_a_gigabyte_and_a_no_changes_nothing(
     assert!(error.contains("asked for Pieces"), "{error}");
     let error = repair(&ui::NoTerminal, true).unwrap_err().to_string();
     assert!(error.contains("asked for Pieces"), "{error}");
+}
+
+/// Plain `stela` on `f`'s computer, answered by `answers`; what it showed
+/// and how it ended. `networks` are the Wi-Fi networks this computer sees.
+fn plain_stela(f: &Fixture, answers: &[&str], networks: &[&str]) -> (String, Result<()>, bool) {
+    let person = ui::tests::Scripted::new(answers);
+    let networks: Vec<String> = networks.iter().map(|n| (*n).to_owned()).collect();
+    let list = move || networks.clone();
+    let environment = Environment {
+        ui: &person,
+        wifi_networks: &list,
+        ..environment(&f.host)
+    };
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(command::Global::default())
+    };
+    let result = home::run(&environment, request);
+    (person.transcript(), result, person.done())
+}
+
+/// Every file on `f`'s stick.
+fn stick_files(f: &Fixture) -> (BTreeMap<PathBuf, Vec<u8>>, BTreeMap<PathBuf, Vec<u8>>) {
+    (snapshot(&f.esp), snapshot(&f.data))
+}
+
+#[test]
+fn journey_a_blank_stick_walks_through_the_wizard_and_cancel_changes_nothing() {
+    let f = fixture(64 * GIB, false);
+    let before = stick_files(&f);
+    let (shown, result, done) = plain_stela(
+        &f,
+        &[
+            "Online",
+            "No Wi-Fi (Ethernet)",
+            "Change something",
+            "Installer",
+            "Offline",
+            "Cancel",
+        ],
+        &[],
+    );
+    result.unwrap();
+    assert!(done, "{shown}");
+    // One stick: it is not asked for. Offline is offered first, Wi-Fi only
+    // for Online, and the erase is named before the last question.
+    assert!(!shown.contains("? Which stick?"), "{shown}");
+    for line in [
+        "? Installer",
+        "● Offline · macOS is copied to the stick now",
+        "? Wi-Fi during installation",
+        "◇ Review",
+        "  Installer  Online · the install downloads macOS",
+        "  Installer  Offline · the install needs no internet",
+        "? Change what?",
+        "● Erase and create",
+        "■ Nothing was changed.",
+    ] {
+        assert!(shown.contains(line), "{line:?} missing:\n{shown}");
+    }
+    assert!(shown.contains("Everything on"), "{shown}");
+    assert_eq!(stick_files(&f), before);
+    assert!(f.host.unmounted.borrow().is_empty());
+    // Escape at the first question changes nothing either.
+    let (shown, result, _) = plain_stela(&f, &["cancel"], &[]);
+    result.unwrap();
+    assert!(shown.ends_with("■ Nothing was changed."), "{shown}");
+    assert_eq!(stick_files(&f), before);
+}
+
+#[test]
+fn journey_b_a_stick_with_stela_is_not_treated_as_blank() {
+    let f = made_by(Some(release::CURRENT));
+    let before = stick_files(&f);
+    let (shown, result, done) = plain_stela(&f, &["Nothing to do"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(!shown.contains("? Installer"), "{shown}");
+    assert!(
+        shown.contains(&format!("● Stela {} · Offline · macOS", release::CURRENT)),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("● Nothing to do · This stick is ready"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("○ Erase it and make a new installer"),
+        "{shown}"
+    );
+    assert!(shown.contains("└ Nothing to do."), "{shown}");
+    assert_eq!(stick_files(&f), before);
+    // Erasing it from the menu warns that it holds Stela; Cancel keeps it.
+    let (shown, result, done) = plain_stela(
+        &f,
+        &["Erase it and make a new installer", "Offline", "Cancel"],
+        &[],
+    );
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(
+        shown.contains("▲ This stick holds Stela with macOS"),
+        "{shown}"
+    );
+    assert_eq!(stick_files(&f), before);
+}
+
+#[test]
+fn journey_c_an_older_stick_offers_the_update_and_quit_changes_nothing() {
+    let f = made_by(None);
+    let before = stick_files(&f);
+    let question = format!("? Update this stick to Stela {}?", release::CURRENT);
+    let (shown, result, done) = plain_stela(&f, &["Quit"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(shown.contains(&question), "{shown}");
+    assert!(shown.contains("● Stela 0.3 or older · Offline"), "{shown}");
+    assert!(shown.contains("● Replaces stela.efi"), "{shown}");
+    assert!(shown.ends_with("■ Nothing was changed."), "{shown}");
+    assert_eq!(stick_files(&f), before);
+    // Update brings it to this Stela.
+    let (shown, result, _) = plain_stela(&f, &["Update", "Not now"], &[]);
+    result.unwrap();
+    assert_eq!(record(&f).release.as_deref(), Some(release::CURRENT));
+    assert!(shown.contains("└ Done."), "{shown}");
+}
+
+#[test]
+fn journey_d_a_newer_stick_is_left_alone() {
+    let f = made_by(Some("99.0.0"));
+    let before = stick_files(&f);
+    let (shown, result, done) = plain_stela(&f, &["Show status"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(
+        shown.contains("▲ This stick has Stela 99.0.0, newer than this stela"),
+        "{shown}"
+    );
+    // Nothing that changes the stick is offered.
+    assert!(!shown.contains("Update"), "{shown}");
+    assert!(!shown.contains("Repair"), "{shown}");
+    assert!(!shown.contains("Erase"), "{shown}");
+    assert_eq!(stick_files(&f), before);
+}
+
+#[test]
+fn journey_e_an_interrupted_create_offers_to_finish_it() {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    interrupt_setup(&f);
+    let before = stick_files(&f);
+    let (shown, result, done) = plain_stela(&f, &["Quit"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    for line in [
+        "▲ A create stopped part way: continuing the Offline installer",
+        "? Finish the create?",
+        "● Finish it · Keeps what is written, checks it, and writes the rest",
+        "○ Start over · Erases the stick",
+        "■ Nothing was changed.",
+    ] {
+        assert!(shown.contains(line), "{line:?} missing:\n{shown}");
+    }
+    assert_eq!(stick_files(&f), before);
+}
+
+#[test]
+fn journey_f_an_interrupted_macos_switch_offers_to_finish_it() {
+    let f = made_by(Some(release::CURRENT));
+    let mut switching = record(&f);
+    switching.replacing = Some("STELA2".into());
+    record::write_record(&f.esp, &switching).unwrap();
+    let before = stick_files(&f);
+    let (shown, result, done) = plain_stela(&f, &["Quit"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(
+        shown.contains("● Finish the switch to macOS STELA2"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("cannot install macOS until it is"),
+        "{shown}"
+    );
+    assert_eq!(stick_files(&f), before);
+}
+
+#[test]
+fn journey_g_a_damaged_stick_offers_repair_and_quit_changes_nothing() {
+    let f = made_by(Some(release::CURRENT));
+    fs::remove_file(f.esp.join(LOADER_PATH)).unwrap();
+    let before = stick_files(&f);
+    let (shown, result, done) = plain_stela(&f, &["Quit"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(shown.contains("▲ This stick needs repair:"), "{shown}");
+    assert!(shown.contains("? Repair this stick?"), "{shown}");
+    assert_eq!(stick_files(&f), before);
+}
+
+#[test]
+fn journey_h_without_a_terminal_plain_stela_reports_and_fails_when_something_is_due() {
+    let f = made_by(None);
+    let before = stick_files(&f);
+    let request = Request::home(command::Global::default());
+    let error = home::run(&environment(&f.host), request).unwrap_err();
+    assert!(error.is::<home::Due>());
+    let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
+    assert!(due);
+    assert!(text.contains("Stela 0.3 or older · Offline"), "{text}");
+    assert!(text.contains("Next: stela update\n"), "{text}");
+    assert_eq!(stick_files(&f), before);
+    // A healthy stick: nothing is due.
+    let f = made_by(Some(release::CURRENT));
+    let request = Request::home(command::Global::default());
+    home::run(&environment(&f.host), request).unwrap();
+    let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
+    assert!(!due, "{text}");
+    assert!(text.contains("Nothing to do."), "{text}");
+}
+
+#[test]
+fn journey_settings_change_the_wifi_and_cancel_changes_nothing() {
+    let f = made_by(Some(release::CURRENT));
+    let before = stick_files(&f);
+    let (shown, result, done) = plain_stela(
+        &f,
+        &[
+            "Change Wi-Fi or network settings",
+            "Home",
+            "correct horse",
+            "Automatic",
+            "Cancel",
+        ],
+        &["Home"],
+    );
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(shown.contains("? Save these settings?"), "{shown}");
+    assert!(shown.ends_with("■ Nothing was changed."), "{shown}");
+    assert_eq!(stick_files(&f), before);
+    let (shown, result, done) = plain_stela(
+        &f,
+        &[
+            "Change Wi-Fi or network settings",
+            "Home",
+            "correct horse",
+            "Automatic",
+            "Save",
+        ],
+        &["Home"],
+    );
+    result.unwrap();
+    assert!(done, "{shown}");
+    let saved = record(&f);
+    assert_eq!(
+        saved.wifi.as_ref().map(|wifi| wifi.ssid.as_str()),
+        Some("Home")
+    );
+}
+
+#[test]
+fn journey_several_sticks_are_chosen_from_and_quit_changes_nothing() {
+    let mut f = made_by(Some(release::CURRENT));
+    let mut second = disk("disk6", &[("EFI", None)]);
+    second.removal = host::Removal::Usb;
+    f.host.disks.push(second);
+    let before = stick_files(&f);
+    let (shown, result, done) = plain_stela(&f, &["Quit"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(shown.contains("? Which stick?"), "{shown}");
+    // The Stela stick comes first.
+    let stela = shown.find("Disk disk5").unwrap();
+    let other = shown.find("Disk disk6").unwrap();
+    assert!(stela < other, "{shown}");
+    assert_eq!(stick_files(&f), before);
 }

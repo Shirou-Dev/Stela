@@ -1,7 +1,7 @@
-//! The mount network's addresses set by hand (`--ipv4`, `--ipv4-gateway`,
+//! The mount network's addresses set by hand (`--ipv4`, `--gateway`,
 //! `--dns`). Without them `stela.efi` takes DHCP's and IPv6
 //! autoconfiguration's.
-use super::Request;
+use super::{Request, ui::Ui};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
@@ -116,74 +116,75 @@ pub(super) fn servers(word: &str) -> Result<Servers, String> {
     })
 }
 
-/// The wizard's network step: automatic addresses, or a static IPv4
-/// address with its router and DNS servers.
-pub(super) fn choose(request: &mut Request) -> Result<()> {
-    let manual = cliclack::select("6. Network addresses")
-        .item(false, "Automatic", "DHCP and IPv6 autoconfiguration")
-        .item(
-            true,
-            "Static IPv4",
-            "Type the address, router and DNS servers",
-        )
-        .initial_value(request.ipv4.is_some())
-        .interact()?;
+/// The network addresses step: automatic, or a static IPv4 address with
+/// its router and DNS servers.
+pub(super) fn choose(ui: &dyn Ui, request: &mut Request) -> Result<()> {
+    let rows = super::ui::rows(&[
+        ("Automatic", "DHCP and IPv6 autoconfiguration"),
+        ("Static IPv4", "Type the address, router and DNS servers"),
+    ]);
+    let manual = ui.select(
+        "Network addresses",
+        &rows,
+        usize::from(request.ipv4.is_some()),
+    )? == 1;
     if !manual {
         (request.ipv4, request.ipv4_gateway, request.dns) = (None, None, None);
         return Ok(());
     }
-    let typed: String = cliclack::input("IPv4 address and prefix length")
-        .placeholder("192.168.1.20/24")
-        .default_input(
-            &request
-                .ipv4
-                .map(|ipv4| ipv4.to_string())
-                .unwrap_or_default(),
-        )
-        .validate(|word: &String| ipv4(word).map(|_| ()))
-        .interact()?;
+    let typed = ui.input(
+        "IPv4 address and prefix length",
+        "192.168.1.20/24",
+        &request
+            .ipv4
+            .map(|ipv4| ipv4.to_string())
+            .unwrap_or_default(),
+        Box::new(|word: &str| ipv4(word).map(|_| ())),
+    )?;
     let address = ipv4(&typed).map_err(anyhow::Error::msg)?;
-    let typed: String = cliclack::input("Router")
-        .placeholder("192.168.1.1")
-        .default_input(
-            &request
-                .ipv4_gateway
-                .map(|gateway| gateway.to_string())
-                .unwrap_or_default(),
-        )
-        .validate(move |word: &String| match word.parse::<Ipv4Addr>() {
+    let typed = ui.input(
+        "Router",
+        "192.168.1.1",
+        &request
+            .ipv4_gateway
+            .map(|gateway| gateway.to_string())
+            .unwrap_or_default(),
+        Box::new(move |word: &str| match word.parse::<Ipv4Addr>() {
             Ok(gateway) if address.neighbors(gateway) => Ok(()),
             _ => Err(format!("another IPv4 address of {address}'s subnet")),
-        })
-        .interact()?;
+        }),
+    )?;
     let gateway: Ipv4Addr = typed.parse()?;
-    let typed: String = cliclack::input("DNS servers")
-        .placeholder("1.1.1.1,9.9.9.9")
-        .default_input(
-            &request
-                .dns
-                .as_deref()
-                .map(|dns| {
-                    dns.iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                })
-                .unwrap_or_default(),
-        )
-        .validate(|word: &String| servers(word).map(|_| ()))
-        .interact()?;
+    let typed = ui.input(
+        "DNS servers",
+        "1.1.1.1,9.9.9.9",
+        &request
+            .dns
+            .as_deref()
+            .map(servers_text_plain)
+            .unwrap_or_default(),
+        Box::new(|word: &str| servers(word).map(|_| ())),
+    )?;
     request.ipv4 = Some(address);
     request.ipv4_gateway = Some(gateway);
     request.dns = Some(servers(&typed).map_err(anyhow::Error::msg)?.0);
     Ok(())
 }
 
-/// The wizard's review line.
-pub(super) fn review(request: &Request) -> String {
+/// Servers as they are typed: comma-separated.
+fn servers_text_plain(servers: &[IpAddr]) -> String {
+    servers
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The addresses a request sets, in a few words for Review.
+pub(super) fn summary(request: &Request) -> String {
     match request.ipv4 {
         Some(ipv4) => format!(
-            "Address    {ipv4}{}{}\n",
+            "address {ipv4}{}{}",
             request
                 .ipv4_gateway
                 .map(|gateway| format!(" via {gateway}"))
@@ -191,10 +192,10 @@ pub(super) fn review(request: &Request) -> String {
             request
                 .dns
                 .as_deref()
-                .map(|dns| format!(" · DNS {}", servers_text(dns)))
+                .map(|dns| format!(", DNS {}", servers_text(dns)))
                 .unwrap_or_default()
         ),
-        None => "Address    Automatic\n".into(),
+        None => "automatic addresses".into(),
     }
 }
 

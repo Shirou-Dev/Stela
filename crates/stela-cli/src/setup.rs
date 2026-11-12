@@ -64,6 +64,7 @@ mod elevation;
 mod fdr;
 mod firmware;
 mod format;
+pub(crate) mod home;
 pub(crate) mod host;
 mod inputs;
 mod installed;
@@ -74,6 +75,7 @@ mod ownership;
 mod prepare;
 mod record;
 mod release;
+mod settings;
 mod sources;
 mod state;
 mod translations;
@@ -118,18 +120,10 @@ fn join_slashed(base: &Path, relative: &str) -> PathBuf {
 }
 
 /// The Mac models setup presents, with their names: the M2 Mac mini, the
-/// board the engine is tested on. Other Macs stay listed in the wizard,
-/// greyed out, and are refused by name.
+/// board the engine is tested on. Other Macs are refused by name.
 pub(crate) const SUPPORTED_MODELS: &[(&str, &str)] = &[("Mac14,3", "Mac mini M2")];
 /// The Mac model Stela presents by default.
 pub(crate) const PINNED_MODEL: &str = SUPPORTED_MODELS[0].0;
-
-/// Setup can present Mac `model`.
-pub(crate) fn supported_model(model: &str) -> bool {
-    SUPPORTED_MODELS
-        .iter()
-        .any(|(supported, _)| *supported == model)
-}
 
 /// Refuse a Mac model `models` does not hold, naming the ones it does.
 fn check_model(models: &[(&str, &str)], model: &str) -> Result<()> {
@@ -230,7 +224,11 @@ fn consent(environment: &Environment<'_>, yes: bool, question: &str, refusal: &s
     if !environment.ui.interactive() {
         bail!("{refusal}. Nothing was changed. Add --yes to accept.");
     }
-    ensure!(environment.ui.confirm(question)?, "nothing was changed");
+    let accepted = match environment.ui.confirm(question) {
+        Err(error) if ui::cancelled(&error) => false,
+        answer => answer?,
+    };
+    ensure!(accepted, "nothing was changed");
     Ok(())
 }
 
@@ -330,7 +328,7 @@ pub(super) fn offline_unavailable(capacity: u64, whole: bool) -> Option<String> 
     }
     (capacity != 0 && capacity < FULL_MIN).then(|| {
         format!(
-            "needs a USB of 32 GB or more (this one is {})",
+            "needs a USB stick of 32 GB or more (this one is {})",
             host::size_text(capacity)
         )
     })
@@ -354,6 +352,8 @@ fn image_is_remote(ipsw: &Path, choice: InstallImage) -> Result<bool> {
 /// What one `stela` command does.
 #[derive(Default)]
 enum Action {
+    /// Plain `stela`: look at the sticks and offer the next step.
+    Home,
     /// Create a setup, or add an install to one with `--target`.
     #[default]
     Create,
@@ -557,6 +557,8 @@ struct Environment<'a> {
     fetch_image: &'a FetchImageOf<'a>,
     /// Where questions are asked: the terminal, or no one.
     ui: &'a dyn ui::Ui,
+    /// The Wi-Fi networks this computer sees or knows (`wifi::host_networks`).
+    wifi_networks: &'a dyn Fn() -> Vec<String>,
     bundle_inputs: &'a InputsOf<'a>,
     /// The macOS builds setup prepares (`stela_formats::builds::SUPPORTED`);
     /// tests add their synthetic images' builds.
@@ -656,7 +658,7 @@ fn writes_disks(action: &Action) -> bool {
 /// not given: every one but `create`, which finds a stick to erase, and
 /// `log`, which reads every disk.
 fn finds_usb(action: &Action) -> bool {
-    !matches!(action, Action::Create | Action::BootLog)
+    !matches!(action, Action::Home | Action::Create | Action::BootLog)
 }
 
 /// The mounted volume of each of this computer's disks that holds a Stela
@@ -733,11 +735,39 @@ fn choose_setup(host: &dyn Host) -> Result<PathBuf> {
     }
 }
 
+/// Make the installer the wizard asked for, then say what comes next.
+fn create_installer(environment: &Environment<'_>, request: Request) -> Result<()> {
+    let ui = environment.ui;
+    let dry_run = request.dry_run;
+    let profile = request.profile;
+    let (report, result) = split_report(request.dispatch(environment));
+    if let Err(error) = result {
+        print!("{report}");
+        return Err(error);
+    }
+    if dry_run {
+        print!("{report}");
+        return Ok(());
+    }
+    let profile = match profile {
+        true => "\nProfiling is on. Keep EFI/stela/boot.log after your run.",
+        false => "",
+    };
+    ui.note(
+        "Next steps",
+        &format!(
+            "Boot the target PC from this stick and choose Install macOS.\n{}{profile}",
+            create::network_next_step(&report)
+        ),
+    )?;
+    ui.outro("Your installer stick is ready")
+}
+
 impl Request {
     /// Plain `stela`: look at the sticks and offer the next step.
     pub(crate) fn home(global: Global) -> Self {
         Self {
-            action: Action::Create,
+            action: Action::Home,
             build: builds::DEFAULT.build.into(),
             fetch: true,
             dry_run: global.dry_run,
@@ -813,6 +843,7 @@ impl Request {
             image_caches: &image_caches,
             bundle_inputs: &|archive, model| crate::boot::restore_inputs_in(archive, model),
             ui: ui::Terminal::or_none(),
+            wifi_networks: &wifi::host_networks,
             image_size: &|build, model| {
                 let image = restore::select(&restore::catalog()?, Some(build), Some(model))?;
                 restore::inputs_size(&image, model)
@@ -859,41 +890,59 @@ impl Request {
             builds: builds::SUPPORTED,
             models: SUPPORTED_MODELS,
         };
-        let interactive = self.usb.as_os_str().is_empty();
-        // A stela without its stela.efi says so before the wizard asks
-        // anything.
-        if interactive && self.efi.is_none() {
-            self.efi = Some(assets::resolve()?);
+        let asks = environment.ui.interactive();
+        let wizard = matches!(self.action, Action::Create) && self.usb.as_os_str().is_empty();
+        // A stela without its stela.efi says so before anything is asked.
+        if (wizard || matches!(self.action, Action::Home)) && self.efi.is_none() {
+            let path = assets::resolve()?;
+            read_efi(&environment, &path)?;
+            self.efi = Some(path);
         }
-        if let Some(path) = self.efi.as_ref().filter(|_| interactive) {
-            read_efi(&environment, path)?;
+        match self.action {
+            Action::Home => return home::run(&environment, self),
+            Action::Create if wizard => {
+                ensure!(
+                    asks,
+                    "name the stick to erase without a terminal: stela create {} --confirm-disk \
+                     SIZE",
+                    host::DISK_EXAMPLE
+                );
+                let sticks: Vec<_> = home::sticks(&environment)?
+                    .into_iter()
+                    .filter(|stick| stick.disk.bytes == 0 || stick.disk.bytes >= home::NETWORK_MIN)
+                    .collect();
+                ensure!(
+                    !sticks.is_empty(),
+                    "no USB stick of 8 GB or more found: plug one in"
+                );
+                let stick = match home::choose(environment.ui, sticks) {
+                    Err(error) if ui::cancelled(&error) => None,
+                    stick => stick?,
+                };
+                let Some(stick) = stick else {
+                    return environment.ui.cancel("Nothing was changed.");
+                };
+                if !wizard::configure(&environment, &mut self, &stick)? {
+                    return Ok(());
+                }
+                return create_installer(&environment, self);
+            }
+            // Plain `stela settings` on a terminal asks for each setting.
+            Action::Configure if asks && !settings::named(&self) => {
+                let record = read_record(&environment, &self.usb)?;
+                if !settings::ask(&environment, &mut self, Some(&record))? {
+                    return Ok(());
+                }
+            }
+            _ => {}
         }
-        if interactive && !wizard::configure(&mut self, environment.host)? {
-            return Ok(());
-        }
-        let dry_run = self.dry_run;
-        let profile = self.profile;
         let output = self.output.take();
         let (report, result) = split_report(self.dispatch(&environment));
         if let Err(error) = result {
             print!("{report}");
             return Err(error);
         }
-        if interactive && !dry_run {
-            let profile = if profile {
-                "\nProfiling is on. Keep EFI/stela/boot.log after your run."
-            } else {
-                ""
-            };
-            cliclack::note(
-                "Next steps",
-                format!(
-                    "Boot the target PC from this USB and choose Install macOS.\n{}{profile}",
-                    create::network_next_step(&report)
-                ),
-            )?;
-            cliclack::outro("Your installer USB is ready")?;
-        } else if let Some(path) = output {
+        if let Some(path) = output {
             save_report(&path, &report)?;
         } else {
             print!("{report}");
@@ -1027,7 +1076,7 @@ impl Request {
                 }
                 Ok(report)
             }
-            Action::Create | Action::Status | Action::Uninstall => {
+            Action::Home | Action::Create | Action::Status | Action::Uninstall => {
                 unreachable!("these run without the setup record")
             }
         }

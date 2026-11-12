@@ -22,6 +22,8 @@ mod system_disks;
 /// How setup gets the rights its raw reads and writes need.
 pub(crate) const ADMIN: &str = "sudo";
 /// A whole disk as `--usb` names it.
+/// What a disk identifier is preceded by where a user types it.
+pub(crate) const DISK_PREFIX: &str = "/dev/";
 pub(crate) const DISK_EXAMPLE: &str = "/dev/sdb";
 
 /// The EFI system partition's GPT type, as `lsblk` prints it, and its MBR

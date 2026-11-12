@@ -62,10 +62,6 @@ pub fn catalog() -> Result<Vec<Image>> {
     Ok(release_catalog()?.images.clone())
 }
 
-pub(crate) fn model_names() -> Result<BTreeMap<String, String>> {
-    Ok(release_catalog()?.models.clone())
-}
-
 fn release_catalog() -> Result<&'static history::Releases> {
     static CATALOG: std::sync::OnceLock<history::Releases> = std::sync::OnceLock::new();
     if CATALOG.get().is_none() {

@@ -63,6 +63,8 @@ use windows_sys::{
 /// How setup gets the rights its raw reads and writes need.
 pub(crate) const ADMIN: &str = "a terminal run as administrator";
 /// A whole disk as `--usb` names it.
+/// What a disk identifier is preceded by where a user types it.
+pub(crate) const DISK_PREFIX: &str = "";
 pub(crate) const DISK_EXAMPLE: &str = "PhysicalDrive2";
 
 /// The EFI system partition's GPT type.

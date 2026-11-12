@@ -524,6 +524,10 @@ impl Resume {
     }
 }
 
+/// [`SIGNING_NOTE`] in a sentence, as the wizard says it before a create.
+pub(super) const SIGNING_SUMMARY: &str = "Apple's signing service receives this machine's ECID \
+    and the restore's hashes to sign the restore.";
+
 /// What an install sends to Apple's signing service; the plan says it
 /// before setup writes the USB.
 pub(super) const SIGNING_NOTE: &str = "Apple's signing service (gs.apple.com) receives this \

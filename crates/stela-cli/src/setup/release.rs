@@ -38,6 +38,14 @@ pub(super) fn newer(record: &Record) -> Option<String> {
         .filter(|version| compare(version, CURRENT) == Ordering::Greater)
 }
 
+/// Whether a stick was made by an older stela than this one.
+pub(super) fn older(record: &Record) -> bool {
+    record
+        .release
+        .as_deref()
+        .is_none_or(|version| compare(version, CURRENT) == Ordering::Less)
+}
+
 /// Before this older stela changes `record`'s stick (`doing`, such as "put
 /// the older Stela on it"): ask on a terminal, accept with `--yes`, and
 /// refuse otherwise, changing nothing.
