@@ -613,7 +613,8 @@ impl Device {
         }
         match path {
             DmaPath::Status => {
-                self.require_bits(0x3c00, 0x187, if self.is_5761() { 0x102 } else { 0x106 });
+                let attention = !(self.is_5761() || self.is_5719());
+                self.require_bits(0x3c00, 0x187, if attention { 0x106 } else { 0x102 });
                 self.require_bits(0x4c00, 3, 2); // host status needs write DMA.
             }
             DmaPath::Tx => {
@@ -622,8 +623,8 @@ impl Device {
                 self.require_bits(0x45c, 0x103, 0x102); // TX, A0 MBUF lockup fix.
                 self.require_bits(0x6800, 0x20000, 0x20000); // host send BDs.
                 self.require_bits(0x4800, 3, 2); // read DMA.
-                if self.config[&0] == 0x165f_14e4 {
-                    self.require_bits(0x4900, 4, 4); // BCM5720 RDMA FIFO overflow fix.
+                if matches!(self.config[&0], 0x165f_14e4 | 0x1657_14e4) {
+                    self.require_bits(0x4900, 4, 4); // BCM5719/5720 RDMA FIFO overflow fix.
                     self.require_bits(0x4910, 0xf0000, 0xf0000); // 4K BD/LSO boundaries.
                 }
                 for at in [0x1400, 0x1800, 0xc00, 0x1000, 0x1c00] {
@@ -1804,6 +1805,7 @@ fn fatal_flow_observed_during_low_water_ack_is_never_discarded() {
     assert!(packet.retire().is_ok());
 }
 
+mod bcm5719;
 mod bcm5761;
 mod bcm5761_power;
 mod bcm5762;

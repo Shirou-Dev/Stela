@@ -3,7 +3,7 @@
 // Copyright (C) 2001-2003 Jeff Garzik
 // Copyright (C) 2004 Sun Microsystems Inc.
 // Copyright (C) 2005-2018 Broadcom
-//! BCM5720/5761/5762 A0 copper setup. EEE and pause are explicitly not advertised.
+//! BCM5719/5720/5761/5762 copper setup. EEE and pause are explicitly not advertised.
 use super::{board::Board, regs::*, *};
 const BMCR: u32 = 0;
 const BMSR: u32 = 1;
@@ -219,9 +219,16 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             )?;
             self.flush(TG3_CPMU_EEE_CTRL, TG3_CPMU_EEE_CTRL_EXIT_20_1_US)?;
             self.flush(TG3_CPMU_EEE_MODE, 0)?;
+            let bcm5719 = self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5719;
             self.smdsp(true)?;
             let result = (|| {
                 self.write_mmd(7, 0x3c, 0)?; // MDIO_AN_EEE_ADV, disabled policy.
+                if bcm5719 {
+                    // tg3_phy_autoneg_cfg: nothing advertised, so 5717/5719
+                    // clear TAP26 before the shared CH34TP2 change.
+                    self.pw(MII_TG3_DSP_ADDRESS, MII_TG3_DSP_TAP26)?;
+                    self.pw(MII_TG3_DSP_RW_PORT, 0)?;
+                }
                 self.pw(MII_TG3_DSP_ADDRESS, MII_TG3_DSP_CH34TP2)?;
                 let value = u32::from(self.pr(MII_TG3_DSP_RW_PORT)?);
                 self.pw(MII_TG3_DSP_ADDRESS, MII_TG3_DSP_CH34TP2)?;

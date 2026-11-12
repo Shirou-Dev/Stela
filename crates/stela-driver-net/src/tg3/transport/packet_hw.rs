@@ -3,7 +3,7 @@
 // Copyright (C) 2001-2003 Jeff Garzik
 // Copyright (C) 2004 Sun Microsystems Inc.
 // Copyright (C) 2005-2018 Broadcom
-//! One BCM5720/5761/5762 A0 host-send/standard-receive/return queue, polled status DMA.
+//! One BCM5719/5720/5761/5762 host-send/standard-receive/return queue, polled status DMA.
 use super::{board::Board, phy::Speed, regs::*, *};
 
 impl<R: Registers, D: Delay> Hardware<R, D> {
@@ -59,6 +59,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let asic = self.identity.ok_or(Error::NotIdentified)?.asic;
         let bcm5762 = asic == Asic::Bcm5762;
         let legacy = asic == Asic::Bcm5761;
+        let bcm5719 = asic == Asic::Bcm5719;
+        // tg3's statistics workaround (5720 A0 and 5762, not 5719 after A0)
+        // and its kept transmit length and mode fields (5720 and 5762).
+        let attention = Self::statistics_attention(asic);
+        let keeps_tx_fields = matches!(asic, Asic::Bcm5720 | Asic::Bcm5762);
         let geometry = super::super::geometry::Geometry::of(asic);
         if bcm5762 && self.read(TG3_CPMU_CLCK_ORIDE_ENABLE)? & TG3_CPMU_MAC_ORIDE_ENABLE == 0 {
             return Err(Error::ConfigDidNotLatch);
@@ -77,7 +82,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 | GRC_MODE_NO_TX_PHDR_CSUM
                 | GRC_MODE_IRQ_ON_MAC_ATTN
                 | GRC_MODE_HOST_STACKUP
-                | if legacy { 0 } else { GRC_MODE_IRQ_ON_FLOW_ATTN },
+                | if attention {
+                    GRC_MODE_IRQ_ON_FLOW_ATTN
+                } else {
+                    0
+                },
         )?;
         let misc = self.read(GRC_MISC_CFG)?;
         self.flush(
@@ -111,10 +120,15 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             BUFMGR_MODE,
             BUFMGR_MODE_ENABLE
                 | BUFMGR_MODE_ATTN_ENABLE
-                | if legacy {
-                    0
+                | if bcm5719 {
+                    BUFMGR_MODE_NO_TX_UNDERRUN
                 } else {
+                    0
+                }
+                | if attention {
                     BUFMGR_MODE_MBLOW_ATTN_ENAB
+                } else {
+                    0
                 },
         )?;
         let mut enabled = false;
@@ -195,10 +209,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             mac.iter().map(|b| u32::from(*b)).sum::<u32>() & 0x3ff,
         )?;
         self.write(MAC_RX_MTU_SIZE, 1522)?;
-        let lengths = if legacy {
-            0
-        } else {
+        let lengths = if keeps_tx_fields {
             self.read(MAC_TX_LENGTHS)? & (TX_LENGTHS_JMB_FRM_LEN_MSK | TX_LENGTHS_CNT_DWN_VAL_MSK)
+        } else {
+            0
         };
         self.write(
             MAC_TX_LENGTHS,
@@ -252,7 +266,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         self.flush(
             HOSTCC_MODE,
-            HOSTCC_MODE_ENABLE | HOSTCC_MODE_32BYTE | if legacy { 0 } else { HOSTCC_MODE_ATTN },
+            HOSTCC_MODE_ENABLE | HOSTCC_MODE_32BYTE | if attention { HOSTCC_MODE_ATTN } else { 0 },
         )?;
         self.write(RCVCC_MODE, RCVCC_MODE_ENABLE | RCVCC_MODE_ATTN_ENABLE)?;
         self.write(RCVLPC_MODE, RCVLPC_MODE_ENABLE)?;
@@ -288,7 +302,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         )?;
         self.wait(40)?;
         // BCM5762 uses a different register and rewrites the source
-        // margin/watermark fields. BCM5720 and BCM5761 only add FIFO_OFLW_FIX.
+        // margin/watermark fields. BCM5719 after A0, BCM5720 and BCM5761
+        // only add FIFO_OFLW_FIX.
         // Preserve every unrelated observed bit.
         let reserve_register = if bcm5762 {
             TG3_RDMA_RSRVCTRL_REG2
@@ -311,10 +326,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if self.read(reserve_register)? != reserve {
             return Err(Error::ConfigDidNotLatch);
         }
-        let rdma = if legacy {
-            0
-        } else {
+        let rdma = if keeps_tx_fields {
             self.read(RDMAC_MODE)? & RDMAC_MODE_H2BNC_VLAN_DET
+        } else {
+            0
         };
         self.flush(
             RDMAC_MODE,
@@ -332,8 +347,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 | if legacy { 0 } else { RDMAC_MODE_IPV6_LSO_EN },
         )?;
         self.wait(40)?;
-        // Observe the residual channel lengths before applying 5720's
-        // documented workaround; no synthetic normal-channel assumption.
+        // Observe the residual channel lengths before applying 5719's or
+        // 5720's documented workaround; no synthetic normal-channel assumption.
         for index in 0..if bcm5762 || legacy {
             0
         } else {
@@ -343,7 +358,12 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 let value = self.read(TG3_LSO_RD_DMA_CRPTEN_CTRL)?;
                 self.write(
                     TG3_LSO_RD_DMA_CRPTEN_CTRL,
-                    value | TG3_LSO_RD_DMA_TX_LENGTH_WA_5720,
+                    value
+                        | if bcm5719 {
+                            TG3_LSO_RD_DMA_TX_LENGTH_WA_5719
+                        } else {
+                            TG3_LSO_RD_DMA_TX_LENGTH_WA_5720
+                        },
                 )?;
                 break;
             }
@@ -369,10 +389,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         ] {
             self.flush(at, value)?;
         }
-        let tx_mode = if legacy {
-            0
-        } else {
+        let tx_mode = if keeps_tx_fields {
             self.read(MAC_TX_MODE)? & (TX_MODE_JMB_FRM_LEN | TX_MODE_CNT_DN_MODE)
+        } else {
+            0
         };
         self.flush(
             MAC_TX_MODE,
@@ -415,6 +435,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.stopped = false;
         Ok(())
     }
+    /// tg3_get_invariants' statistics workaround: 5720 A0 and 5762 raise
+    /// flow attention for the MBUF low-water discard indication.
+    fn statistics_attention(asic: Asic) -> bool {
+        matches!(asic, Asic::Bcm5720 | Asic::Bcm5762)
+    }
     pub(in crate::tg3) fn packet_carrier(&mut self) -> Result<bool, Error> {
         self.copper_carrier()
             .map(|speed: Option<Speed>| speed.is_some())
@@ -424,10 +449,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             HOSTCC_MODE,
             HOSTCC_MODE_ENABLE
                 | HOSTCC_MODE_32BYTE
-                | if self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5761 {
-                    0
-                } else {
+                | if Self::statistics_attention(self.identity.ok_or(Error::NotIdentified)?.asic) {
                     HOSTCC_MODE_ATTN
+                } else {
+                    0
                 }
                 | HOSTCC_MODE_NOW
                 | HOSTCC_MODE_NOINT_ON_NOW,
@@ -442,6 +467,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let message = self.read(MSGINT_STATUS)?;
         let read_dma = self.read(RDMAC_STATUS)?;
         let write_dma = self.read(WDMAC_STATUS)?;
+        // tg3_process_error never treats the low-water bit as an error;
+        // 5719 raises it without the statistics workaround's attention.
         let allowed = if self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5761 {
             0
         } else {

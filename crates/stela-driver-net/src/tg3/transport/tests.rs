@@ -225,6 +225,7 @@ unsafe impl Registers for Reg {
 fn model(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>) {
     let (device, revision, identity) = match asic {
         Asic::Bcm5761 => (0x1681u16, 0x0576_1000, 0xbc05_0fd3u32),
+        Asic::Bcm5719 => (0x1657, 0x0571_9001, 0x5c0d_8a21),
         Asic::Bcm5720 => (0x165f, 0x0572_0000, 0x5c0d_8b62),
         Asic::Bcm5762 => (0x1687, 0x0576_2000, 0x8580_3781),
     };
@@ -265,7 +266,7 @@ fn identified(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Mod
 
 #[test]
 fn config_revision_and_phy_oui_select_each_named_family() {
-    for asic in [Asic::Bcm5761, Asic::Bcm5720, Asic::Bcm5762] {
+    for asic in [Asic::Bcm5761, Asic::Bcm5719, Asic::Bcm5720, Asic::Bcm5762] {
         for function in 0..4 {
             let (mut hardware, _) = model(asic, function);
             let identity = hardware.identify().unwrap();
@@ -273,11 +274,7 @@ fn config_revision_and_phy_oui_select_each_named_family() {
             assert_eq!(identity.function, function);
             assert_eq!(
                 identity.phy_address,
-                if asic == Asic::Bcm5720 {
-                    function + 1
-                } else {
-                    1
-                }
+                if asic.plus_5717() { function + 1 } else { 1 }
             );
             assert_ne!(hardware.read_phy_identity().unwrap() & 0xf, 0);
         }
@@ -295,6 +292,20 @@ fn a_candidate_id_cannot_authorize_wrong_asic_or_serdes() {
             .iter()
             .any(|e| matches!(e, Event::Write(..) | Event::ApeWrite(..)))
     );
+    let (mut hardware, m) = model(Asic::Bcm5719, 0);
+    m.borrow_mut().config.insert(GEN2_PRODID, 0x0572_0000);
+    assert_eq!(hardware.identify(), Err(Error::UnsupportedRevision));
+    // A 5720 PHY OUI never stands in for a 5719's.
+    let (mut hardware, m) = model(Asic::Bcm5719, 0);
+    let identity = 0x5c0d_8b62u32;
+    m.borrow_mut()
+        .phy
+        .insert(2, ((identity >> 10) & 0xffff) as u16);
+    m.borrow_mut()
+        .phy
+        .insert(3, (((identity >> 16) & 0xfc00) | (identity & 0x3ff)) as u16);
+    hardware.identify().unwrap();
+    assert_eq!(hardware.read_phy_identity(), Err(Error::UnsupportedMedia));
     let (mut hardware, m) = model(Asic::Bcm5720, 0);
     m.borrow_mut().mac.insert(SG_DIG_STATUS, SG_DIG_IS_SERDES);
     assert_eq!(hardware.identify(), Err(Error::UnsupportedMedia));
@@ -303,7 +314,7 @@ fn a_candidate_id_cannot_authorize_wrong_asic_or_serdes() {
 
 #[test]
 fn mdio_takes_each_real_phy_grant_and_restores_autopoll_before_unlock() {
-    for asic in [Asic::Bcm5761, Asic::Bcm5720, Asic::Bcm5762] {
+    for asic in [Asic::Bcm5761, Asic::Bcm5719, Asic::Bcm5720, Asic::Bcm5762] {
         for function in 0..4 {
             let (mut hardware, m) = identified(asic, function);
             m.borrow_mut()
@@ -634,7 +645,7 @@ fn reset_model(asic: Asic) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>) {
 
 #[test]
 fn core_reset_uses_config_while_mmio_decode_is_gone() {
-    for asic in [Asic::Bcm5761, Asic::Bcm5720, Asic::Bcm5762] {
+    for asic in [Asic::Bcm5761, Asic::Bcm5719, Asic::Bcm5720, Asic::Bcm5762] {
         let (mut hardware, m) = reset_model(asic);
         hardware.reset_core().unwrap();
         assert!(hardware.core_reset_completed());
@@ -657,7 +668,9 @@ fn core_reset_uses_config_while_mmio_decode_is_gone() {
         assert!(m.trace.contains(&Event::Write(MAC_MI_MODE, 0x8000)));
         match asic {
             Asic::Bcm5761 => assert!(m.trace.contains(&Event::Write(0x7c00, 1 << 25))),
-            Asic::Bcm5720 => assert!(m.trace.contains(&Event::Write(0x3624, 1 << 31))),
+            Asic::Bcm5719 | Asic::Bcm5720 => {
+                assert!(m.trace.contains(&Event::Write(0x3624, 1 << 31)));
+            }
             Asic::Bcm5762 => assert!(m.trace.contains(&Event::Write(0x3628, 1 << 13))),
         }
     }
@@ -684,6 +697,7 @@ fn management_firmware_hears_the_driver_start_and_the_reset_carries_asf_state() 
         (Asic::Bcm5761, 0, 0x2c + 16, 0x1000),
         (Asic::Bcm5720, 0, 0x8400 + 16, 0x1000),
         (Asic::Bcm5720, 2, 0x8400 + 16, 1 << 2),
+        (Asic::Bcm5719, 3, 0x8400 + 16, 1 << 3),
         (Asic::Bcm5762, 0, 0x8400 + 16, 0x1000),
     ] {
         let (mut hardware, m) = identified(asic, function);
@@ -857,7 +871,7 @@ fn absent_or_invalid_board_ownership_evidence_refuses_before_reset() {
 
 #[test]
 fn unavailable_native_clock_refuses_before_identification_access_and_keeps_original_owner() {
-    for asic in [Asic::Bcm5761, Asic::Bcm5720, Asic::Bcm5762] {
+    for asic in [Asic::Bcm5761, Asic::Bcm5719, Asic::Bcm5720, Asic::Bcm5762] {
         for rate in [0, 3_000, u64::MAX] {
             let (mut previous, model) = model(asic, 0);
             let registers = previous.release_registers();
@@ -885,7 +899,7 @@ fn unavailable_native_clock_refuses_before_identification_access_and_keeps_origi
 
 #[test]
 fn every_mdio_wait_failure_restores_autopoll_releases_original_grant_and_poison_keeps() {
-    for asic in [Asic::Bcm5761, Asic::Bcm5720, Asic::Bcm5762] {
+    for asic in [Asic::Bcm5761, Asic::Bcm5719, Asic::Bcm5720, Asic::Bcm5762] {
         let (mut hardware, model) = identified(asic, 1);
         model
             .borrow_mut()
@@ -946,7 +960,7 @@ fn every_mdio_wait_failure_restores_autopoll_releases_original_grant_and_poison_
 
 #[test]
 fn every_core_reset_wait_failure_prevents_completion_and_keeps_original_epoch() {
-    for asic in [Asic::Bcm5761, Asic::Bcm5720, Asic::Bcm5762] {
+    for asic in [Asic::Bcm5761, Asic::Bcm5719, Asic::Bcm5720, Asic::Bcm5762] {
         let (mut hardware, model) = reset_model(asic);
         let before = model.borrow().delay_count;
         hardware.reset_core().unwrap();

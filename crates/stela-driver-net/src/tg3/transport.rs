@@ -268,7 +268,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         let mut chip_revision = host >> 16;
         if chip_revision >> 12 == 0xf {
-            let at = if matches!(device, 0x165f | 0x1687) {
+            let at = if matches!(device, 0x1657 | 0x165f | 0x1687) {
                 GEN2_PRODID
             } else {
                 PRODID
@@ -277,6 +277,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         let asic = match (device, chip_revision >> 12) {
             (0x1680 | 0x1681 | 0x1688 | 0x1689, 0x5761) => Asic::Bcm5761,
+            (0x1657, 0x5719) => Asic::Bcm5719,
             (0x165f, 0x5720) => Asic::Bcm5720,
             (0x1687, 0x5762) => Asic::Bcm5762,
             _ => return Err(Error::UnsupportedRevision),
@@ -292,7 +293,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if self.read(MEMARB_MODE)? & ENABLE == 0 {
             return Err(Error::ConfigDidNotLatch);
         }
-        let function = if asic == Asic::Bcm5720 {
+        let function = if asic.plus_5717() {
             let saved = self.sram(SRAM_CPMU_STATUS, None)?;
             let status = if saved & 0xffff == CPMU_STATUS {
                 saved
@@ -308,8 +309,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if Self::checked(self.regs().config_read32(PCISTATE)?)? & ALLOW_APE != ALLOW_APE {
             return Err(Error::ConfigDidNotLatch);
         }
-        // tg3_mdio_init: only 5717_PLUS (5720 here) changes the PHY address.
-        let phy_address = if asic == Asic::Bcm5720 {
+        // tg3_mdio_init: only 5717_PLUS changes the PHY address.
+        let phy_address = if asic.plus_5717() {
             if self.read(SG_DIG_STATUS)? & SG_DIG_IS_SERDES != 0 {
                 return Err(Error::UnsupportedMedia);
             }
@@ -477,6 +478,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             let identity = (high << 10) | ((low & 0xfc00) << 16) | (low & 0x3ff);
             let expected = match self.identity.expect("identified").asic {
                 Asic::Bcm5761 => 0xbc05_0fd0,
+                Asic::Bcm5719 => 0x5c0d_8a20,
                 Asic::Bcm5720 => 0x5c0d_8b60,
                 Asic::Bcm5762 => 0x8580_3780,
             };

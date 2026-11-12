@@ -15,7 +15,7 @@ impl Geometry {
                 rx: 512,
                 returns: 512,
             },
-            Asic::Bcm5720 | Asic::Bcm5762 => Self {
+            Asic::Bcm5719 | Asic::Bcm5720 | Asic::Bcm5762 => Self {
                 rx: 2048,
                 returns: 4096,
             },

@@ -165,7 +165,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                     self.write(PHY_TEST_CONTROL, PSCRAM)?;
                 }
                 self.write(GRC_MISC_CFG, RESET_PCIE_CLOCK)?;
-                if identity.asic == Asic::Bcm5720 {
+                if identity.asic.plus_5717() {
                     self.write(CPMU_CLOCK_OVERRIDE, CLOCK_OVERRIDE)?;
                 }
                 Ok(())
@@ -217,7 +217,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 let value = self.read(POST_RESET_PCIE)?;
                 self.write(POST_RESET_PCIE, value | PCIE_POST_RESET_FIX)?;
             }
-            if identity.asic == Asic::Bcm5720 {
+            if identity.asic.plus_5717() {
                 let value = self.read(CPMU_CLOCK_OVERRIDE)?;
                 self.write(CPMU_CLOCK_OVERRIDE, value & !CLOCK_OVERRIDE)?;
             }
