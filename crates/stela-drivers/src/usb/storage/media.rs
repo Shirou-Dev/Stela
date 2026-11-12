@@ -695,6 +695,38 @@ mod tests {
         }
     }
 
+    /// A unit whose first command at attach never completes, as a stick
+    /// that is not ready yet: one port reset, then the fresh probe publishes
+    /// the disk, with the first attempt's failure kept for the log.
+    #[test]
+    fn a_first_command_that_hangs_at_attach_resets_the_device_and_probes_again() {
+        use crate::usb::xhci;
+        let mut memory = vec![0u64; 512 * 1024];
+        let (controller, device, hardware, mut dma) =
+            xhci::model::reset_fixture(&mut memory, xhci::SUPER_SPEED, 32, 3);
+        let binding = uas::Binding::new(
+            &device,
+            &crate::usb::descriptor::interfaces(&device.configuration)[0],
+        )
+        .unwrap();
+        let mut failures = Vec::new();
+        hardware.borrow_mut().hang_next = true;
+        // SAFETY: exclusive fresh fixture interface; no endpoints configured.
+        let (_storage, disks) = unsafe {
+            super::super::discover_uas_retained(
+                controller,
+                &device,
+                binding,
+                &mut dma,
+                &mut failures,
+            )
+        }
+        .unwrap();
+        assert_eq!(disks.len(), 1);
+        assert_eq!(hardware.borrow().resets, 1);
+        assert!(!failures.is_empty());
+    }
+
     #[test]
     fn service_recovers_poison_observed_during_metadata_scan_once() {
         use crate::usb::xhci;

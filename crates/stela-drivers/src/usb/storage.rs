@@ -433,7 +433,9 @@ pub(super) fn discover_retained(
     let mut storage = UsbStorage {
         owner: media::TransportOwner::Bot(owner),
     };
-    let disks = storage.rescan(failures)?;
+    // As the SCSI error handler does for a first command that times out:
+    // one device reset and fresh probes before the interface is given up.
+    let disks = storage.service(dma, failures)?;
     Ok((storage, disks))
 }
 
@@ -503,7 +505,9 @@ pub unsafe fn discover_uas_retained(
     let mut storage = UsbStorage {
         owner: media::TransportOwner::Uas(owner),
     };
-    let disks = storage.rescan(failures)?;
+    // As the SCSI error handler does for a first command that times out:
+    // one device reset and fresh probes before the interface is given up.
+    let disks = storage.service(dma, failures)?;
     Ok((storage, disks))
 }
 
