@@ -61,11 +61,18 @@ fn parse(bytes: &[u8]) -> Result<Releases> {
     let catalog: Catalog = serde_json::from_slice(bytes).map_err(|error| {
         // A network that wants a sign-in first answers with its own page.
         let page = bytes.trim_ascii_start().starts_with(b"<");
+        // The service answers a request it cannot serve with well-formed
+        // JSON that holds no devices.
+        let empty = serde_json::from_slice::<serde_json::Value>(bytes)
+            .is_ok_and(|value| value.get("devices").is_none_or(serde_json::Value::is_null));
         anyhow::anyhow!(
             "the list of macOS releases from api.ipsw.me cannot be read ({error}){}",
             if page {
                 "; the network answered with a web page instead, as one that wants a sign-in \
                  first does: sign in to the network and run setup again"
+            } else if empty {
+                "; api.ipsw.me answered without its list, as it does when it is overloaded: \
+                 wait a few minutes and run the command again"
             } else {
                 ""
             }
@@ -135,6 +142,18 @@ mod tests {
             "iPhone1,1": {"name":"iPhone", "firmwares":[firmware]}
         }}))
         .unwrap()
+    }
+
+    /// api.ipsw.me has answered `{"devices":null}` (issue 39): the message
+    /// says the service gave no list, not only what the parser expected.
+    #[test]
+    fn an_answer_without_devices_says_the_service_gave_no_list() {
+        for answer in [r#"{"devices":null}"#, "{}"] {
+            let error = parse(answer.as_bytes()).err().unwrap().to_string();
+            assert!(error.contains("answered without its list"), "{error}");
+        }
+        let error = parse(b"not json").err().unwrap().to_string();
+        assert!(!error.contains("answered without its list"), "{error}");
     }
 
     #[test]
