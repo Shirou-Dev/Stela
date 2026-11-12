@@ -302,7 +302,8 @@ pub(super) unsafe fn ehci(
     }
 }
 
-/// Attach a Tigon3 adapter: BAR0 holds the MAC registers, BAR2 the APE.
+/// Attach a Tigon3 adapter: BAR0 holds the MAC registers, BAR2 the APE
+/// of a chip that has one.
 ///
 /// # Safety
 /// [`NativeServices`]' contract holds for `services`, and `clock` is the
@@ -328,16 +329,21 @@ pub(super) unsafe fn tg3(
         Ok(mac) => mac,
         Err(error) => return Err(keep_error(Error::Native(error), (requester, minimum))),
     };
-    let ape = match map(services, address, &bars, 2) {
-        Ok(ape) => ape,
-        Err(error) => return Err(keep_error(Error::Native(error), (requester, mac, minimum))),
+    // Only a chip with an APE has BAR 2 (Linux maps it for those alone).
+    let ape = if tg3::ape(requester.function_mut().device) {
+        match map(services, address, &bars, 2) {
+            Ok(ape) => Some(ape),
+            Err(error) => return Err(keep_error(Error::Native(error), (requester, mac, minimum))),
+        }
+    } else {
+        None
     };
     let window = |mapping: &Mapping| {
         let bytes = mapping.bytes()?;
         Ok((mapping.address(0, bytes)?, bytes))
     };
-    let ((mac_window, mac_bytes), (ape_window, ape_bytes)) =
-        match window(&mac).and_then(|mac| Ok((mac, window(&ape)?))) {
+    let ((mac_window, mac_bytes), ape_window) =
+        match window(&mac).and_then(|mac| Ok((mac, ape.as_ref().map(window).transpose()?))) {
             Ok(windows) => windows,
             Err(error) => {
                 return Err(keep_error(
@@ -350,9 +356,7 @@ pub(super) unsafe fn tg3(
     // SAFETY: original preparation keeps configuration/root/inherited backing
     // and prior IRQ/work exclusions. Both UC mappings belong to that function.
     let registers = unsafe {
-        tg3::io::Cold::from_owned_windows(
-            requester, mac_window, mac_bytes, ape_window, ape_bytes, windows,
-        )
+        tg3::io::Cold::from_owned_windows(requester, mac_window, mac_bytes, ape_window, windows)
     }
     .map_err(|(error, requester, windows)| {
         (

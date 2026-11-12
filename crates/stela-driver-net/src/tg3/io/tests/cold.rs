@@ -142,7 +142,7 @@ fn cold(state: Arc<State>, counts: Arc<Counts>) -> Cold {
     let (mac, ape) = pointers(&owner.lock().unwrap());
     // SAFETY: this fixture holds exact host RAM windows and exclusive symbolic
     // configuration. All device engines are absent; no native permission exists.
-    unsafe { Cold::from_owned_windows(preparing(state), mac, 0x8000, ape, 0x8440, owner) }
+    unsafe { Cold::from_owned_windows(preparing(state), mac, 0x8000, Some((ape, 0x8440)), owner) }
         .unwrap_or_else(|_| panic!("valid cold windows"))
 }
 
@@ -210,4 +210,26 @@ fn failed_old_drain_or_private_bind_keeps_original_root_and_windows() {
         assert_eq!(state.root_drops.load(Ordering::Relaxed), 0);
         assert_eq!(counts.mapping_drops.load(Ordering::Relaxed), 0);
     }
+}
+
+#[test]
+fn a_chip_without_an_ape_has_no_ape_window_to_reach() {
+    let owner = windows(Arc::new(Counts::default()));
+    let (mac, _) = pointers(&owner.lock().unwrap());
+    // SAFETY: this fixture holds an exact host RAM window and exclusive
+    // symbolic configuration. No device engine or native permission exists.
+    let mut cold = unsafe {
+        Cold::from_owned_windows(
+            preparing(Arc::new(State::default())),
+            mac,
+            0x8000,
+            None,
+            owner,
+        )
+    }
+    .unwrap_or_else(|_| panic!("valid cold MAC window"));
+    cold.write32(0x7ffc, 0x5a5a_a5a5).unwrap();
+    assert_eq!(cold.read32(0x7ffc), Ok(0x5a5a_a5a5));
+    assert_eq!(cold.ape_read32(0x2c), Err(Error::Bounds));
+    assert_eq!(cold.ape_write32(0x2c, 0x1000), Err(Error::Bounds));
 }

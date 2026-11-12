@@ -10,7 +10,7 @@ use core::mem::ManuallyDrop;
 struct Resources {
     requester: PreparingRequester,
     mac: Window,
-    ape: Window,
+    ape: Option<Window>,
     owner: ManuallyDrop<Arc<dyn core::any::Any>>,
 }
 
@@ -35,29 +35,24 @@ pub struct Bound {
 pub struct BindFailure {
     pub error: preparation::Error,
     _root: preparation::Failure,
-    _windows: ManuallyDrop<(Window, Window, Arc<dyn core::any::Any>)>,
+    _windows: ManuallyDrop<(Window, Option<Window>, Arc<dyn core::any::Any>)>,
 }
 
 impl Cold {
     /// # Safety
-    /// The original requester and both complete UC windows name the same
-    /// exclusively owned, powered function. `owner` keeps both windows and
+    /// The original requester and the complete UC windows name the same
+    /// exclusively owned, powered function: BAR 0, and BAR 2 exactly when
+    /// the chip has an APE ([`super::super::ape`]). `owner` keeps them and
     /// all inherited DMA backing. Prior firmware/IRQ/work and competing PCI
     /// owners are excluded throughout preparation. No new DMA may be started.
     pub unsafe fn from_owned_windows(
         mut requester: PreparingRequester,
         mac: NonNull<u8>,
         mac_bytes: usize,
-        ape: NonNull<u8>,
-        ape_bytes: usize,
+        ape: Option<(NonNull<u8>, usize)>,
         owner: Arc<dyn core::any::Any>,
     ) -> Result<Self, (Error, PreparingRequester, Arc<dyn core::any::Any>)> {
-        let windows = (|| {
-            Ok((
-                Window::new(mac, mac_bytes, 0x8000)?,
-                Window::new(ape, ape_bytes, 0x8440)?,
-            ))
-        })();
+        let windows = (|| Ok((Window::new(mac, mac_bytes, 0x8000)?, ape_window(ape)?)))();
         match windows {
             Ok((mac, ape)) => {
                 let function = requester.function_mut().address.function;
@@ -189,9 +184,9 @@ unsafe impl Registers for Cold {
         self.r().mac.write(at, value)
     }
     fn ape_read32(&mut self, at: u32) -> Result<u32, Error> {
-        self.r().ape.read(at)
+        ape(&mut self.r().ape)?.read(at)
     }
     fn ape_write32(&mut self, at: u32, value: u32) -> Result<(), Error> {
-        self.r().ape.write(at, value)
+        ape(&mut self.r().ape)?.write(at, value)
     }
 }

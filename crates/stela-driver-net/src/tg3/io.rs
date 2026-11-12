@@ -38,10 +38,20 @@ impl Window {
     }
 }
 
+/// The APE window of a chip that has one ([`super::ape`]).
+fn ape_window(ape: Option<(NonNull<u8>, usize)>) -> Result<Option<Window>, Error> {
+    ape.map(|(base, bytes)| Window::new(base, bytes, 0x8440))
+        .transpose()
+}
+/// A chip without an APE has no APE space to reach.
+fn ape(window: &mut Option<Window>) -> Result<&mut Window, Error> {
+    window.as_mut().ok_or(Error::Bounds)
+}
+
 pub struct Mmio<C: ConfigSpace> {
     function: Function<C>,
     mac: Window,
-    ape: Window,
+    ape: Option<Window>,
     _owner: Arc<dyn core::any::Any>,
 }
 /// Validation failure and the same original configuration and mapping/power
@@ -76,7 +86,7 @@ impl<C: ConfigSpace> Mmio<C> {
             Ok((mac, ape)) => Ok(Self {
                 function,
                 mac,
-                ape,
+                ape: Some(ape),
                 _owner: owner,
             }),
             Err(error) => Err((error, function, owner)),
@@ -141,10 +151,10 @@ unsafe impl<C: ConfigSpace> Registers for Mmio<C> {
         self.mac.write(at, value)
     }
     fn ape_read32(&mut self, at: u32) -> Result<u32, Error> {
-        self.ape.read(at)
+        ape(&mut self.ape)?.read(at)
     }
     fn ape_write32(&mut self, at: u32, value: u32) -> Result<(), Error> {
-        self.ape.write(at, value)
+        ape(&mut self.ape)?.write(at, value)
     }
 }
 
