@@ -42,7 +42,9 @@
 //! The descriptor datapath and Stela integration are independent Rust code.
 //! This is not a match for the I217/I218/I219 integrated PHYs.
 //!
-//! DMA allocations live until reboot, including after a transmit timeout;
+//! Drop stops the controller and hands it back to manageability firmware;
+//! DMA allocations live until reboot when the stop is not observed,
+//! including after a transmit timeout;
 //! a descriptor is never reused until the device writes its done bit.
 pub mod pch;
 
@@ -61,7 +63,10 @@ use crate::{
     registers,
 };
 use alloc::{format, string::String, vec::Vec};
-use core::sync::atomic::{Ordering, fence};
+use core::{
+    mem::ManuallyDrop,
+    sync::atomic::{Ordering, fence},
+};
 
 const VENDOR: u16 = 0x8086;
 const DEVICE: u16 = 0x10d3;
@@ -205,6 +210,17 @@ const TX_REPORT: u32 = 1 << 27;
 const MASTER_WAIT_US: u64 = 160_000;
 const RESET_WAIT_US: u64 = 20_000;
 const OWNERSHIP_WAIT_US: u64 = 200_000;
+/// The bounds a stop at drop waits within: it can run inside a processor's
+/// exit, which must end well inside half a second. Linux's own: 800 master
+/// polls 100 us apart, and MDIO ownership in ten 2 ms tries.
+const STOP_WAITS: Waits = Waits {
+    master_us: 80_000,
+    ownership_us: 20_000,
+    phy_configuration: false,
+};
+/// After receive and transmit are disabled, for frames in flight (Linux
+/// `e1000e_down`).
+const STOP_SETTLE_US: u64 = 10_000;
 const MDIC_WAIT_US: u64 = 20_000;
 const PHY_WAIT_US: u64 = 500_000;
 /// Linux runs the e1000e watchdog every two seconds.
@@ -262,7 +278,15 @@ impl Timer for crate::timing::Timing {
 }
 
 fn ownership(device: &impl Registers, clock: &impl Timer) -> Result<(), BlockError> {
-    if clock.wait(OWNERSHIP_WAIT_US, || {
+    ownership_within(device, clock, OWNERSHIP_WAIT_US)
+}
+
+fn ownership_within(
+    device: &impl Registers,
+    clock: &impl Timer,
+    wait_us: u64,
+) -> Result<(), BlockError> {
+    if clock.wait(wait_us, || {
         device.write(EXTCNF_CTRL, device.read(EXTCNF_CTRL) | MDIO_OWN);
         device.read(EXTCNF_CTRL) & MDIO_OWN != 0
     }) {
@@ -277,27 +301,71 @@ fn release(device: &impl Registers) {
     device.write(EXTCNF_CTRL, device.read(EXTCNF_CTRL) & !MDIO_OWN);
 }
 
+/// How long a reset waits for the bus master and MDIO ownership, and
+/// whether it waits for the PHY's configuration after the NVM load.
+struct Waits {
+    master_us: u64,
+    ownership_us: u64,
+    phy_configuration: bool,
+}
+
+/// What an attachment and a reinitialization wait.
+const START_WAITS: Waits = Waits {
+    master_us: MASTER_WAIT_US,
+    ownership_us: OWNERSHIP_WAIT_US,
+    phy_configuration: true,
+};
+
 fn reset(device: &impl Registers, clock: &impl Timer) -> Result<(), BlockError> {
+    reset_within(device, clock, &START_WAITS)
+}
+
+fn reset_within(
+    device: &impl Registers,
+    clock: &impl Timer,
+    waits: &Waits,
+) -> Result<(), BlockError> {
     device.write(IMC, u32::MAX);
     device.write(RCTL, 0);
     device.write(TCTL, device.read(TCTL) & !TCTL_EN);
     device.write(CTRL, device.read(CTRL) | CTRL_MASTER_DISABLE);
-    if !clock.wait(MASTER_WAIT_US, || device.read(STATUS) & STATUS_MASTER == 0) {
+    if !clock.wait(waits.master_us, || device.read(STATUS) & STATUS_MASTER == 0) {
         return Err(BlockError::Timeout);
     }
     device.read(STATUS); // flush posted PCIe writes before the settle time
     clock.delay(MASTER_SETTLE_US)?;
-    ownership(device, clock)?;
+    ownership_within(device, clock, waits.ownership_us)?;
     device.write(CTRL, device.read(CTRL) | CTRL_RST);
     let reset_done = clock.wait(RESET_WAIT_US, || device.read(CTRL) & CTRL_RST == 0);
     release(device);
     if !reset_done || !clock.wait(RESET_WAIT_US, || device.read(EECD) & EECD_AUTO_RD != 0) {
         return Err(BlockError::Timeout);
     }
-    clock.delay(PHY_CONFIGURATION_US)?;
+    if waits.phy_configuration {
+        clock.delay(PHY_CONFIGURATION_US)?;
+    }
     device.write(IMC, u32::MAX);
     device.read(ICR);
     Ok(())
+}
+
+/// Linux `e1000e_down`'s register sequence: receive, then transmit, off,
+/// 10 ms for frames in flight, then `e1000_reset_hw_82571`'s bus master
+/// drain and MAC reset. Only a completed reset proves the controller writes
+/// no ring. Every wait fits a processor's exit ([`STOP_WAITS`]); the PHY is
+/// not waited for, as nothing configures it after a stop.
+fn stop(device: &impl Registers, clock: &impl Timer) -> Result<(), BlockError> {
+    device.write(RCTL, device.read(RCTL) & !RCTL_EN);
+    device.write(TCTL, device.read(TCTL) & !TCTL_EN);
+    device.read(STATUS);
+    clock.delay(STOP_SETTLE_US)?;
+    reset_within(device, clock, &STOP_WAITS)
+}
+
+/// `e1000e_release_hw_control`: hand the controller back to manageability
+/// firmware once the driver no longer owns it.
+fn release_control(device: &impl Registers) {
+    device.write(CTRL_EXT, device.read(CTRL_EXT) & !CTRL_EXT_DRIVER);
 }
 
 fn mdic(
@@ -403,8 +471,8 @@ fn phy_hung(device: &impl Registers, clock: &impl Timer) -> bool {
 /// cable to be connected; [`Link::carrier`] reports autonegotiation's result.
 pub struct E1000e {
     device: Mmio,
-    receive: Ring,
-    transmit: Ring,
+    receive: ManuallyDrop<Ring>,
+    transmit: ManuallyDrop<Ring>,
     dropping_receive: bool,
     mac: Mac,
     clock: crate::timing::Timing,
@@ -473,8 +541,8 @@ impl E1000e {
         configure_phy(&device, &clock)?;
         let mut net = Self {
             device,
-            receive: Ring::new(dma)?,
-            transmit: Ring::new(dma)?,
+            receive: ManuallyDrop::new(Ring::new(dma)?),
+            transmit: ManuallyDrop::new(Ring::new(dma)?),
             dropping_receive: false,
             mac,
             clock,
@@ -657,6 +725,30 @@ impl E1000e {
 /// Whether the controller wrote back the transmit descriptor at `base`.
 fn transmitted(descriptors: &DmaBuffer, base: usize) -> bool {
     descriptors.read::<u8>(base + 12) & TX_DONE != 0
+}
+
+impl Drop for E1000e {
+    /// Linux `e1000e_down` then `e1000e_release_hw_control`. The rings are
+    /// freed only once the controller verifiably stopped; otherwise they
+    /// stay allocated. A lost function, or one whose minimum delays
+    /// failed, gets no register access.
+    ///
+    /// This drives the controller's registers, so the owner drops it where
+    /// its MMIO window is mapped; anywhere else the first read faults.
+    fn drop(&mut self) {
+        if self.faulted || self.timing_failure.is_some() || self.device.read32(STATUS) == u32::MAX {
+            return;
+        }
+        if stop(&self.device, &self.clock).is_ok() {
+            release_control(&self.device);
+            // SAFETY: the completed MAC reset stopped every descriptor and
+            // buffer access, and neither ring is used after this.
+            unsafe {
+                ManuallyDrop::drop(&mut self.receive);
+                ManuallyDrop::drop(&mut self.transmit);
+            }
+        }
+    }
 }
 
 impl Link for E1000e {

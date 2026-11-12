@@ -73,6 +73,15 @@ impl Registers for Model {
 #[derive(Default)]
 struct ModelTimer {
     delays: RefCell<Vec<u64>>,
+    /// Each bounded wait's limit.
+    waits: RefCell<Vec<u64>>,
+}
+
+impl ModelTimer {
+    /// The longest the calls so far could have waited in all.
+    fn bound_us(&self) -> u64 {
+        self.delays.borrow().iter().sum::<u64>() + self.waits.borrow().iter().sum::<u64>()
+    }
 }
 
 impl Timer for ModelTimer {
@@ -81,9 +90,95 @@ impl Timer for ModelTimer {
         Ok(())
     }
 
-    fn wait(&self, _: u64, mut ready: impl FnMut() -> bool) -> bool {
+    fn wait(&self, microseconds: u64, mut ready: impl FnMut() -> bool) -> bool {
+        self.waits.borrow_mut().push(microseconds);
         (0..4).any(|_| ready())
     }
+}
+
+#[test]
+fn a_stop_drains_the_bus_master_resets_the_mac_and_hands_control_back() {
+    let model = Model::ready();
+    model.registers.borrow_mut().insert(STATUS, STATUS_MASTER);
+    model
+        .registers
+        .borrow_mut()
+        .insert(RCTL, RCTL_EN | RCTL_BAM);
+    model
+        .registers
+        .borrow_mut()
+        .insert(TCTL, TCTL_EN | TCTL_PSP);
+    model
+        .registers
+        .borrow_mut()
+        .insert(CTRL_EXT, CTRL_EXT_DRIVER | CTRL_EXT_LINK_82574);
+    let timer = ModelTimer::default();
+    assert_eq!(stop(&model, &timer), Ok(()));
+    release_control(&model);
+    let writes = model.writes.borrow();
+    let at = |found: &dyn Fn(usize, u32) -> bool| {
+        writes
+            .iter()
+            .position(|&(offset, value)| found(offset, value))
+            .unwrap()
+    };
+    // e1000e_down: receive, then transmit, off before the reset drains the
+    // bus master and resets the MAC.
+    let receive = at(&|offset, value| offset == RCTL && value == RCTL_BAM);
+    let transmit = at(&|offset, value| offset == TCTL && value == TCTL_PSP);
+    let master = at(&|offset, value| offset == CTRL && value & CTRL_MASTER_DISABLE != 0);
+    let reset = at(&|offset, value| offset == CTRL && value & CTRL_RST != 0);
+    assert!(receive < transmit && transmit < master && master < reset);
+    // e1000e_release_hw_control, and MDIO ownership given back.
+    assert_eq!(model.read(CTRL_EXT), CTRL_EXT_LINK_82574);
+    assert_eq!(model.read(EXTCNF_CTRL) & MDIO_OWN, 0);
+    // Every wait fits a processor's exit, well inside half a second.
+    assert!(timer.bound_us() <= 200_000, "{}", timer.bound_us());
+    // A bus master that never drains fails the stop before any reset, so
+    // the owner keeps the rings.
+    let stuck = Model {
+        master_stuck: true,
+        ..Model::ready()
+    };
+    stuck.registers.borrow_mut().insert(STATUS, STATUS_MASTER);
+    assert_eq!(
+        stop(&stuck, &ModelTimer::default()),
+        Err(BlockError::Timeout)
+    );
+    assert!(
+        !stuck
+            .writes
+            .borrow()
+            .iter()
+            .any(|&(offset, value)| offset == CTRL && value & CTRL_RST != 0)
+    );
+}
+
+#[test]
+fn dropping_an_adapter_stops_it_and_a_lost_one_gets_no_write() {
+    // A running adapter: its drop disables receive and asks for the reset.
+    let mut fixture = Fixture::new();
+    fixture.registers[STATUS / 4] = STATUS_LU;
+    let Fixture {
+        net,
+        registers,
+        _memory,
+    } = fixture;
+    drop(net);
+    assert_eq!(registers[RCTL / 4] & RCTL_EN, 0);
+    assert_eq!(registers[TCTL / 4] & TCTL_EN, 0);
+    assert_ne!(registers[CTRL / 4] & CTRL_MASTER_DISABLE, 0);
+    // A lost function reads all ones: nothing is written.
+    let mut fixture = Fixture::new();
+    fixture.registers[STATUS / 4] = u32::MAX;
+    let Fixture {
+        net,
+        registers,
+        _memory,
+    } = fixture;
+    let before = registers.clone();
+    drop(net);
+    assert_eq!(registers, before);
 }
 
 #[test]
@@ -231,8 +326,8 @@ impl Fixture {
             unsafe { Mmio::new(registers.as_mut_ptr() as u64, size_of_val(&registers[..])) };
         let mut net = E1000e {
             device,
-            receive: Ring::new(&mut allocator).unwrap(),
-            transmit: Ring::new(&mut allocator).unwrap(),
+            receive: ManuallyDrop::new(Ring::new(&mut allocator).unwrap()),
+            transmit: ManuallyDrop::new(Ring::new(&mut allocator).unwrap()),
             dropping_receive: false,
             mac: Mac([2, 0, 0, 0, 0, 1]),
             clock: crate::timing::model(Clock {
