@@ -5,16 +5,18 @@
 // Copyright (C) 2005-2018 Broadcom
 //! Broadcom Tigon3 hardware transport for the named BCM5720/5761/5762 cohort.
 //!
-//! `Packet::attach` composes one polled BCM5720/5761/5762 A0 unmanaged copper
-//! queue with requester-domain DMA and explicit retirement. BCM5761 requires
+//! `Packet::attach` composes one polled BCM5720/5761/5762 A0 copper queue
+//! with requester-domain DMA and explicit retirement. BCM5761 requires
 //! function-zero NIC wiring and recognized NVM; its original CLKREQ setting
 //! selects the source per-speed send-BD workaround. These
 //! bounded source-reviewed packet profiles have native model validation;
-//! hardware remains unchecked. See NOTICE. Managed, SerDes and
-//! all other ASIC/revision profiles explicitly refuse.
+//! hardware remains unchecked. See NOTICE. SerDes and all other
+//! ASIC/revision profiles explicitly refuse.
 //!
 //! All named chips have an APE window. MDIO takes the per-function APE
-//! PHY grant, even when management firmware is not running. Linux's ignored
+//! PHY grant, even when management firmware is not running. Management
+//! firmware (ASF, APE) is told of the driver's start and stop as Linux
+//! tells it, and keeps its PHY, receive rules and address slot. Linux's ignored
 //! lock failures, firmware timeout fallback and silent stop timeout are
 //! errors here. An uncertain operation poisons and keeps the
 //! register owner, never permitting a new epoch by object reconstruction.
@@ -44,8 +46,9 @@ pub enum Error {
     MdioReadFailed,
     FirmwareTimeout,
     StopTimeout(u32),
-    UnsupportedManaged,
-    UnmanagedNotObserved,
+    /// The board configuration in NIC SRAM is not signed, so neither its
+    /// media nor its management setting can be trusted.
+    UnsignedBoard,
     UnsupportedPcie,
     ConfigDidNotLatch,
     NvramTimeout,
@@ -90,12 +93,7 @@ impl core::fmt::Display for Error {
             Self::StopTimeout(register) => {
                 write!(f, "its engine at {register:#x} did not stop")
             }
-            Self::UnsupportedManaged => {
-                f.write_str("its management firmware runs a mode Stela does not support")
-            }
-            Self::UnmanagedNotObserved => {
-                f.write_str("Stela could not confirm that no management firmware runs")
-            }
+            Self::UnsignedBoard => f.write_str("its board configuration in NIC SRAM is not signed"),
             Self::UnsupportedPcie => f.write_str("its PCIe setup is unsupported"),
             Self::ConfigDidNotLatch => f.write_str("a setting did not take"),
             Self::NvramTimeout => f.write_str("its NVRAM did not answer"),

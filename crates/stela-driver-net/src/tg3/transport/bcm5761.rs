@@ -3,7 +3,7 @@
 // Copyright (C) 2001-2003 Jeff Garzik
 // Copyright (C) 2004 Sun Microsystems Inc.
 // Copyright (C) 2005-2018 Broadcom
-//! Exact BCM5761 A0 unmanaged function-zero copper NIC NVM/board profile.
+//! Exact BCM5761 A0 function-zero copper NIC NVM/board profile.
 use super::{
     board::{Board, decode_mac, valid_mac},
     regs::*,
@@ -20,7 +20,7 @@ pub(in crate::tg3) struct Profile {
 
 impl<R: Registers, D: Delay> Hardware<R, D> {
     pub(super) fn bcm5761_board(&mut self) -> Result<Board, Error> {
-        self.unmanaged()?;
+        self.observe_management()?;
         let identity = self.identity.ok_or(Error::NotIdentified)?;
         if identity.chip_revision != 0x0576_1000 || identity.bdf_function != 0 {
             return Err(Error::UnsupportedRevision);

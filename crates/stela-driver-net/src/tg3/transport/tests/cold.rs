@@ -101,11 +101,26 @@ fn live_bus_master_or_failed_decode_never_reaches_vendor_engines() {
 }
 
 #[test]
-fn managed_firmware_cannot_authorize_a_cold_stop_receipt() {
+fn managed_firmware_stops_inherited_engines_and_an_unsigned_board_refuses() {
+    // ASF firmware no longer refuses containment: the engines it shares
+    // still stop, as tg3_init_one halts a chip a previous driver left on.
     let (hardware, model) = cold(Asic::Bcm5720);
     model.borrow_mut().sram.insert(0xb58, 0x80);
-    let (error, hardware) = hardware.quiesce_cold().err().expect("managed firmware");
-    assert_eq!(error, Error::UnsupportedManaged);
+    let registers = hardware
+        .quiesce_cold()
+        .unwrap_or_else(|(error, _)| panic!("{error:?}"));
+    assert!(
+        model
+            .borrow()
+            .trace
+            .iter()
+            .any(|event| matches!(event, Event::Write(FTQ_RESET, _)))
+    );
+    drop(registers);
+    let (hardware, model) = cold(Asic::Bcm5720);
+    model.borrow_mut().sram.insert(0xb54, 0);
+    let (error, hardware) = hardware.quiesce_cold().err().expect("unsigned board");
+    assert_eq!(error, Error::UnsignedBoard);
     assert!(
         !model
             .borrow()

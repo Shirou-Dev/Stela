@@ -40,6 +40,8 @@ struct Model {
     ignored_config_write: Option<u16>,
     delay_count: usize,
     fail_delay: Option<usize>,
+    /// The APE firmware never takes a posted event.
+    ape_busy: bool,
 }
 impl Model {
     fn event(&mut self, event: Event) -> Result<(), Error> {
@@ -204,8 +206,18 @@ unsafe impl Registers for Reg {
                 value
             };
             m.ape.insert(grant, value);
+        } else if (APE_LOCK_GRANT..APE_LOCK_GRANT + 32).contains(&at)
+            || (APE_PER_LOCK_GRANT..APE_PER_LOCK_GRANT + 32).contains(&at)
+        {
+            m.ape.insert(at, 0); // Writing the owner's bit releases the grant.
+        } else if at == 0x0c {
+            // The APE firmware takes the posted event.
+            if value == 1 && !m.ape_busy {
+                let status = m.ape.get(&0x4300).copied().unwrap_or(0);
+                m.ape.insert(0x4300, status & !0x8000_0000);
+            }
         } else {
-            m.ape.insert(at, 0);
+            m.ape.insert(at, value);
         }
         Ok(())
     }
@@ -621,10 +633,10 @@ fn reset_model(asic: Asic) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>) {
 }
 
 #[test]
-fn unmanaged_core_reset_uses_config_while_mmio_decode_is_gone() {
+fn core_reset_uses_config_while_mmio_decode_is_gone() {
     for asic in [Asic::Bcm5761, Asic::Bcm5720, Asic::Bcm5762] {
         let (mut hardware, m) = reset_model(asic);
-        hardware.reset_unmanaged_core().unwrap();
+        hardware.reset_core().unwrap();
         assert!(hardware.core_reset_completed());
         assert_eq!(m.borrow().config[&4] & 0xffff, 2); // No unsolicited bus mastering/MWI.
         assert_eq!(m.borrow().config[&0x48] & 0xffff, 0); // Relaxed/no-snoop disabled.
@@ -651,27 +663,123 @@ fn unmanaged_core_reset_uses_config_while_mmio_decode_is_gone() {
     }
 }
 
+fn running_ape(m: &Rc<RefCell<Model>>) {
+    m.borrow_mut().ape.insert(0x4000, 0x4150_4521);
+    m.borrow_mut().ape.insert(0x400c, 0x100);
+}
+fn ape_writes(m: &Rc<RefCell<Model>>) -> Vec<(u32, u32)> {
+    m.borrow()
+        .trace
+        .iter()
+        .filter_map(|e| match e {
+            Event::ApeWrite(at, value) => Some((*at, *value)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
-fn management_ownership_refuses_before_engines_or_reset_are_touched() {
-    for managed in [0, 0x80, 0x0020_0000] {
-        let (mut hardware, m) = reset_model(Asic::Bcm5761);
-        if managed == 0 {
-            m.borrow_mut().ape.insert(0x4000, 0x4150_4521);
-        } else {
-            m.borrow_mut().sram.insert(0xb54, FIRMWARE_MAGIC);
-            m.borrow_mut().sram.insert(0xb58, managed);
+fn management_firmware_hears_the_driver_start_and_the_reset_carries_asf_state() {
+    for (asic, function, lock, bit) in [
+        (Asic::Bcm5761, 0, 0x2c + 16, 0x1000),
+        (Asic::Bcm5720, 0, 0x8400 + 16, 0x1000),
+        (Asic::Bcm5720, 2, 0x8400 + 16, 1 << 2),
+        (Asic::Bcm5762, 0, 0x8400 + 16, 0x1000),
+    ] {
+        let (mut hardware, m) = identified(asic, function);
+        for (at, value) in [(4, 0x0010_0016), (0x34, 0x40), (0x40, 0x10), (0x48, 0x0810)] {
+            m.borrow_mut().config.insert(at, value);
         }
+        m.borrow_mut().reset_firmware_ack = true;
+        m.borrow_mut().sram.insert(0xb54, FIRMWARE_MAGIC);
+        // ASF, and the APE bit Linux ignores for chips it knows have one.
+        m.borrow_mut().sram.insert(0xb58, 0x0020_0080);
+        m.borrow_mut().ape.insert(0x4208, 6);
+        running_ape(&m);
+        hardware.ape_driver_start().unwrap();
+        // tg3_ape_driver_state_change(RESET_KIND_INIT), then the event under
+        // the memory lock once the previous one was taken.
         assert_eq!(
-            hardware.reset_unmanaged_core(),
-            Err(Error::UnsupportedManaged)
+            ape_writes(&m),
+            [
+                (0x4218, 0),
+                (0x4200, 0x484f_5354),
+                (0x4204, 0x20),
+                (0x4208, 7),
+                (0x420c, 0xf003_8900),
+                (0x4210, 1),
+                (0x421c, 1),
+                (lock, bit),
+                (0x4300, 0x8001_0510),
+                (lock + 0x20, bit),
+                (0x0c, 1),
+            ]
         );
-        assert!(!hardware.core_reset_completed());
-        assert!(
-            !m.borrow()
-                .trace
-                .iter()
-                .any(|e| matches!(e, Event::Write(0x6804, _) | Event::Write(MAC_RX_MODE, _)))
-        );
+        // A second start in the same epoch tells the APE nothing new.
+        m.borrow_mut().trace.clear();
+        hardware.ape_driver_start().unwrap();
+        assert!(ape_writes(&m).is_empty());
+        hardware.reset_core().unwrap();
+        assert!(hardware.core_reset_completed());
+        assert!(hardware.management().asf);
+        // tg3_write_sig_pre_reset: the ASF START state precedes the reset.
+        let trace = m.borrow().trace.clone();
+        let state = trace
+            .iter()
+            .position(|e| *e == Event::Write(MEM_BASE, 0xc04))
+            .unwrap();
+        let reset = trace
+            .iter()
+            .position(|e| *e == Event::Write(0x6804, 0x2000_0001))
+            .unwrap();
+        assert!(state < reset);
+        assert_eq!(m.borrow().sram[&0xc04], 1);
+        hardware.ape_driver_unload().unwrap();
+        assert_eq!(m.borrow().ape[&0x421c], 2);
+        assert_eq!(m.borrow().ape[&0x4300], 0x0002_0510);
+    }
+}
+
+#[test]
+fn an_event_the_ape_never_takes_is_dropped_after_twenty_milliseconds() {
+    let (mut hardware, m) = identified(Asic::Bcm5720, 0);
+    running_ape(&m);
+    m.borrow_mut().ape.insert(0x4300, 0x8001_0510);
+    m.borrow_mut().ape_busy = true;
+    hardware.ape_driver_start().unwrap();
+    let writes = ape_writes(&m);
+    assert!(!writes.iter().any(|&(at, _)| at == 0x0c || at == 0x4300));
+    // The lock is given back after every look, the last one included.
+    let requests = writes.iter().filter(|&&w| w == (0x8410, 0x1000)).count();
+    let releases = writes.iter().filter(|&&w| w == (0x8430, 0x1000)).count();
+    assert_eq!((requests, releases), (2001, 2001));
+    let waits = m
+        .borrow()
+        .trace
+        .iter()
+        .filter(|e| **e == Event::Delay(10))
+        .count();
+    assert_eq!(waits, 2000);
+    assert_eq!(hardware.failure(), None);
+    // An ungranted memory lock drops the event too, as Linux does.
+    let (mut hardware, m) = identified(Asic::Bcm5720, 0);
+    running_ape(&m);
+    m.borrow_mut().no_grant = true;
+    hardware.ape_driver_start().unwrap();
+    assert!(!ape_writes(&m).iter().any(|&(at, _)| at == 0x0c));
+    assert_eq!(hardware.failure(), None);
+}
+
+#[test]
+fn without_running_ape_firmware_only_the_host_state_is_written() {
+    for (signature, status) in [(0, 0x100), (0x4150_4521, 0)] {
+        let (mut hardware, m) = identified(Asic::Bcm5762, 0);
+        m.borrow_mut().ape.insert(0x4000, signature);
+        m.borrow_mut().ape.insert(0x400c, status);
+        hardware.ape_driver_start().unwrap();
+        let writes = ape_writes(&m);
+        assert_eq!(writes.last(), Some(&(0x421c, 1)));
+        assert!(!writes.iter().any(|&(at, _)| at == 0x8410 || at == 0x0c));
     }
 }
 
@@ -679,13 +787,13 @@ fn management_ownership_refuses_before_engines_or_reset_are_touched() {
 fn nvram_and_firmware_timeouts_never_produce_reset_completion() {
     let (mut hardware, m) = reset_model(Asic::Bcm5720);
     m.borrow_mut().no_nvram_grant = true;
-    assert_eq!(hardware.reset_unmanaged_core(), Err(Error::NvramTimeout));
+    assert_eq!(hardware.reset_core(), Err(Error::NvramTimeout));
     assert!(!hardware.core_reset_completed());
     assert!(!m.borrow().reset_pending);
     assert!(m.borrow().trace.contains(&Event::Write(0x7020, 0x20)));
     let (mut hardware, m) = reset_model(Asic::Bcm5762);
     m.borrow_mut().reset_firmware_ack = false;
-    assert_eq!(hardware.reset_unmanaged_core(), Err(Error::FirmwareTimeout));
+    assert_eq!(hardware.reset_core(), Err(Error::FirmwareTimeout));
     assert!(!hardware.core_reset_completed());
     drop(hardware);
     assert_eq!(m.borrow().dropped, 0);
@@ -695,14 +803,14 @@ fn nvram_and_firmware_timeouts_never_produce_reset_completion() {
 fn every_core_reset_access_fault_keeps_the_epoch() {
     let (mut hardware, m) = reset_model(Asic::Bcm5720);
     let before = m.borrow().io_count;
-    hardware.reset_unmanaged_core().unwrap();
+    hardware.reset_core().unwrap();
     let count = m.borrow().io_count - before;
     for fail in 1..=count {
         let (mut hardware, m) = reset_model(Asic::Bcm5720);
         let before = m.borrow().io_count;
         m.borrow_mut().fail_at = Some(before + fail);
         assert_eq!(
-            hardware.reset_unmanaged_core(),
+            hardware.reset_core(),
             Err(Error::Access),
             "reset I/O {fail}"
         );
@@ -719,7 +827,7 @@ fn ignored_mandatory_reset_controls_never_count_as_completion() {
         let (mut hardware, m) = reset_model(Asic::Bcm5720);
         m.borrow_mut().ignored_config_write = Some(at);
         assert_eq!(
-            hardware.reset_unmanaged_core(),
+            hardware.reset_core(),
             Err(Error::ConfigDidNotLatch),
             "config {at:x}"
         );
@@ -727,10 +835,7 @@ fn ignored_mandatory_reset_controls_never_count_as_completion() {
     }
     let (mut hardware, m) = reset_model(Asic::Bcm5720);
     m.borrow_mut().stuck_stop = Some(MEMARB_MODE);
-    assert_eq!(
-        hardware.reset_unmanaged_core(),
-        Err(Error::ConfigDidNotLatch)
-    );
+    assert_eq!(hardware.reset_core(), Err(Error::ConfigDidNotLatch));
     assert!(!hardware.core_reset_completed());
 }
 
@@ -739,10 +844,7 @@ fn absent_or_invalid_board_ownership_evidence_refuses_before_reset() {
     for signature in [0, 1, u32::MAX, !FIRMWARE_MAGIC] {
         let (mut hardware, m) = reset_model(Asic::Bcm5762);
         m.borrow_mut().sram.insert(0xb54, signature);
-        assert_eq!(
-            hardware.reset_unmanaged_core(),
-            Err(Error::UnmanagedNotObserved)
-        );
+        assert_eq!(hardware.reset_core(), Err(Error::UnsignedBoard));
         assert!(!hardware.core_reset_completed());
         assert!(
             !m.borrow()
@@ -847,7 +949,7 @@ fn every_core_reset_wait_failure_prevents_completion_and_keeps_original_epoch() 
     for asic in [Asic::Bcm5761, Asic::Bcm5720, Asic::Bcm5762] {
         let (mut hardware, model) = reset_model(asic);
         let before = model.borrow().delay_count;
-        hardware.reset_unmanaged_core().unwrap();
+        hardware.reset_core().unwrap();
         let count = model.borrow().delay_count - before;
         assert!(count > 2);
         for failing in 1..=count {
@@ -855,7 +957,7 @@ fn every_core_reset_wait_failure_prevents_completion_and_keeps_original_epoch() 
             let fail_at = model.borrow().delay_count + failing;
             model.borrow_mut().fail_delay = Some(fail_at);
             assert_eq!(
-                hardware.reset_unmanaged_core(),
+                hardware.reset_core(),
                 Err(Error::Timing(crate::bus::pci::power::Error::Clock)),
                 "{asic:?} wait {failing}"
             );

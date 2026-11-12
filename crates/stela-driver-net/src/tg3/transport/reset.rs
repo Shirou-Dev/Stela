@@ -3,7 +3,7 @@
 // Copyright (C) 2001-2003 Jeff Garzik
 // Copyright (C) 2004 Sun Microsystems Inc.
 // Copyright (C) 2005-2018 Broadcom
-//! Unmanaged core reset: no DMA rings or packet-ready state is implied.
+//! Core reset: no DMA rings or packet-ready state is implied.
 use super::*;
 use crate::block::BlockError;
 use crate::bus::pci::regs;
@@ -25,14 +25,6 @@ const CPMU_CLOCK_OVERRIDE: u32 = 0x3624;
 const CPMU_CLOCK_OVERRIDE_ENABLE: u32 = 0x3628;
 const CLOCK_OVERRIDE: u32 = 1 << 31;
 const MAC_OVERRIDE_ENABLE: u32 = 1 << 13;
-const APE_SIGNATURE: u32 = 0x4000;
-const APE_FIRMWARE_STATUS: u32 = 0x400c;
-const APE_SIGNATURE_MAGIC: u32 = 0x4150_4521;
-const APE_READY: u32 = 0x100;
-const SRAM_DATA_SIGNATURE: u32 = 0xb54;
-const SRAM_DATA_CONFIG: u32 = 0xb58;
-const ASF_ENABLE: u32 = 0x80;
-const APE_ENABLE: u32 = 0x0020_0000;
 const MAC_DATA_SWAP: u32 = 0x34;
 const RESET_PCIE_CLOCK: u32 = 1 << 29;
 const CORE_RESET: u32 = 1;
@@ -98,25 +90,6 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             })
         })
     }
-    pub(super) fn unmanaged(&mut self) -> Result<(), Error> {
-        // The managed APE/ASF handshake is not inferred from an
-        // absent NCSI feature bit or from firmware which has not finished boot.
-        if self.ape_read(APE_SIGNATURE)? == APE_SIGNATURE_MAGIC
-            || self.ape_read(APE_FIRMWARE_STATUS)? & APE_READY != 0
-        {
-            return Err(Error::UnsupportedManaged);
-        }
-        // Signature/ready absence alone does not establish ownership while
-        // management firmware may still be booting. Require positive signed
-        // board configuration showing that neither manager is enabled.
-        if self.sram(SRAM_DATA_SIGNATURE, None)? != FIRMWARE_MAGIC {
-            return Err(Error::UnmanagedNotObserved);
-        }
-        if self.sram(SRAM_DATA_CONFIG, None)? & (ASF_ENABLE | APE_ENABLE) != 0 {
-            return Err(Error::UnsupportedManaged);
-        }
-        Ok(())
-    }
     pub(super) fn nvram_lock(&mut self) -> Result<(), Error> {
         self.write(NVRAM_SWARB, SWARB_REQUEST)?;
         let result = (|| {
@@ -144,11 +117,13 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         Err(Error::FirmwareTimeout)
     }
     /// Execute the Linux tg3_chip_reset ordinary PCIe/CPMU sequence for
-    /// an unmanaged named ASIC. Bus mastering stays disabled: no rings exist.
-    /// The firmware inversion, config restoration and APE release must all be
-    /// observed before `core_reset_completed` is true. Any failure is terminal
-    /// and keeps the config/BAR owner, including uncertain held locks.
-    pub fn reset_unmanaged_core(&mut self) -> Result<(), Error> {
+    /// a named ASIC, with `tg3_write_sig_pre_reset`'s firmware signature and
+    /// ASF START state before it. Bus mastering stays disabled: no rings
+    /// exist. The firmware inversion, config restoration and APE release
+    /// must all be observed before `core_reset_completed` is true. Any
+    /// failure is terminal and keeps the config/BAR owner, including
+    /// uncertain held locks.
+    pub fn reset_core(&mut self) -> Result<(), Error> {
         if self.failure.is_some() {
             return Err(Error::Poisoned);
         }
@@ -156,7 +131,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let identity = self.identity.ok_or(Error::NotIdentified)?;
         self.core_reset_complete = false;
         let result = (|| {
-            self.unmanaged()?;
+            self.observe_management()?;
             let pcie = self.pcie_capability()?;
             let command = Self::checked(self.regs().config_read32(regs::COMMAND)?)? as u16;
             if command & regs::COMMAND_MEMORY == 0 {
@@ -174,6 +149,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 return Err(Error::ConfigDidNotLatch);
             }
             self.sram(FIRMWARE_MBOX, Some(FIRMWARE_MAGIC))?;
+            self.asf_driver_state(management::DRV_STATE_START)?;
             self.nvram_lock()?;
             if let Err(error) = self.lock(1) {
                 let cleanup = self.flush(NVRAM_SWARB, SWARB_RELEASE);
@@ -249,9 +225,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 let value = self.read(CPMU_CLOCK_OVERRIDE_ENABLE)?;
                 self.write(CPMU_CLOCK_OVERRIDE_ENABLE, value | MAC_OVERRIDE_ENABLE)?;
             }
-            // Bootcode can change management state. Do not claim an unmanaged
-            // reset epoch if that state changed while firmware was running.
-            self.unmanaged()?;
+            // tg3_chip_reset reprobes the ASF setting bootcode left.
+            self.observe_management()?;
             Ok(())
         })();
         if result.is_ok() {

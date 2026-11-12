@@ -27,6 +27,8 @@ const RX_END: u32 = 4;
 const RX_STANDARD: u32 = 0x0001_0000;
 const RX_INVALID_RING_FLAGS: u32 = 0x0820;
 const RX_ERROR: u32 = 0x0400;
+/// RXD_FLAG_VLAN: the MAC stripped a VLAN tag into the descriptor.
+const RX_FLAG_VLAN: u32 = 0x0040;
 const RX_ERRORS: u32 = 0x01ff_0000;
 struct Buffer {
     cpu: CpuMapping,
@@ -186,11 +188,14 @@ impl Memory {
         Ok(())
     }
     /// Takes return descriptor `index`: its packet slot, and whether a good
-    /// frame was copied into `frame` (left unchanged otherwise).
+    /// frame was copied into `frame` (left unchanged otherwise). With
+    /// `restore_tag`, a VLAN tag the MAC stripped is put back, as tg3_rx
+    /// hands it on with the frame.
     pub(super) fn receive(
         &mut self,
         index: usize,
         frame: &mut Vec<u8>,
+        restore_tag: bool,
     ) -> Result<(usize, bool), Error> {
         let at = index * RX_DESCRIPTOR_BYTES;
         // Producer publication orders all BD words before status. The host
@@ -215,23 +220,31 @@ impl Memory {
                 .sync_for_cpu(slot * BUFFER..(slot + 1) * BUFFER)?;
         }
         self.active_rx[slot] = false;
+        let tag = (restore_tag && kind & RX_FLAG_VLAN != 0).then_some(error as u16);
+        let restored = if tag.is_some() { 4 } else { 0 };
         // A damaged frame in a slot this driver offered is dropped and its
         // slot reoffered, as `tg3_rx` does; only a return naming no offered
         // slot means the ring itself is corrupt.
         if error & RX_ERRORS != 0
             || kind & (RX_ERROR | RX_END) != RX_END
             || !(4..=RX_BYTES).contains(&length)
-            || !(HEADER..=MAX_FRAME).contains(&(length - 4))
+            || !(HEADER..=MAX_FRAME).contains(&(length - 4 + restored))
         {
             return Ok((slot, false));
         }
         let length = length - 4; // device includes the Ethernet FCS.
         let source = self.buffers[RX_DATA].cpu.address(slot * BUFFER, length)?;
         frame
-            .try_reserve(length.saturating_sub(frame.len()))
+            .try_reserve((length + restored).saturating_sub(frame.len()))
             .map_err(|_| Error::Memory(MemoryError::OutOfMemory))?;
         frame.clear();
         for i in 0..length {
+            if i == 12
+                && let Some(tag) = tag
+            {
+                frame.extend_from_slice(&[0x81, 0x00]);
+                frame.extend_from_slice(&tag.to_be_bytes());
+            }
             // SAFETY: completed and bounds checked RX page.
             frame.push(unsafe { source.as_ptr().add(i).read_volatile() });
         }

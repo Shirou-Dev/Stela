@@ -198,7 +198,7 @@ fn actual_5762_static_revision_and_dell_denials_precede_any_mmio_effect() {
     }
 }
 #[test]
-fn actual_5762_unknown_managed_lom_nvm_and_phy_never_publish_dma() {
+fn actual_5762_unknown_unsigned_lom_nvm_and_phy_never_publish_dma() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -220,10 +220,10 @@ fn actual_5762_unknown_managed_lom_nvm_and_phy_never_publish_dma() {
                     p.nvram.insert(0, 0);
                 }
                 4 => {
-                    p.sram.insert(0xb58, 0x80);
-                }
+                    p.sram.insert(0xb54, 0);
+                } // unsigned board.
                 5 => {
-                    p.sram.insert(0xb58, 0x0020_0000);
+                    p.sram.insert(0xb54, !0x4b65_7654);
                 }
                 6 => {
                     p.sram.insert(0xb58, 0x110);

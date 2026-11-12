@@ -633,7 +633,10 @@ impl Device {
             DmaPath::Rx => {
                 self.require_bits(0x4400, 3, 2);
                 self.require_bits(0x400, 0xc0_0000, 0xc0_0000); // RX/frame engines.
-                self.require_bits(0x468, 0x403, 0x402); // RX and intact VLAN bytes.
+                // RX, with raw VLAN tags unless ASF has the MAC strip them.
+                let asf = self.sram.get(&0xb58).copied().unwrap_or(0) & 0x80 != 0;
+                let keep = if asf { 0 } else { 0x400 };
+                self.require_bits(0x468, 0x403, 0x2 | keep);
                 self.require_bits(0x4c00, 3, 2);
                 self.require_bits(0x2400, 0x10003, if self.is_5761() { 2 } else { 0x10002 });
                 for at in [0x2c00, 0x2000, 0x2800, 0x3000] {
@@ -941,8 +944,14 @@ unsafe impl Registers for Reg {
         let mut p = self.peer.lock().unwrap();
         if (0x8400..0x8420).contains(&at) || (0x2c..0x4c).contains(&at) {
             p.ape.insert(at + 0x20, value);
+        } else if (0x8420..0x8440).contains(&at) || (0x4c..0x6c).contains(&at) {
+            p.ape.insert(at, 0); // Writing the owner's bit releases the grant.
+        } else if at == 0x0c {
+            // Running APE firmware takes the posted event.
+            let status = p.ape.get(&0x4300).copied().unwrap_or(0);
+            p.ape.insert(0x4300, status & !0x8000_0000);
         } else {
-            p.ape.insert(at, 0);
+            p.ape.insert(at, value);
         }
         Ok(())
     }
@@ -1807,6 +1816,7 @@ mod timing;
 
 mod clkreq;
 
+mod management;
 mod receive_filter;
 
 mod attachment;

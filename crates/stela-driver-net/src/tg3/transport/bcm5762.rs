@@ -3,7 +3,7 @@
 // Copyright (C) 2001-2003 Jeff Garzik
 // Copyright (C) 2004 Sun Microsystems Inc.
 // Copyright (C) 2005-2018 Broadcom
-//! Exact BCM5762 A0 unmanaged NIC board profile. No caller supplies a profile.
+//! Exact BCM5762 A0 NIC board profile. No caller supplies a profile.
 use super::{
     board::{Board, decode_mac, valid_mac},
     regs::*,
@@ -40,7 +40,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         Ok(())
     }
     pub(super) fn bcm5762_board(&mut self) -> Result<Board, Error> {
-        self.unmanaged()?;
+        self.observe_management()?;
         let subsystem = self.bcm5762_subsystem()?;
         let config = self.sram(NIC_SRAM_DATA_CFG, None)?;
         if config & NIC_SRAM_DATA_CFG_PHY_TYPE_MASK != NIC_SRAM_DATA_CFG_PHY_TYPE_COPPER {

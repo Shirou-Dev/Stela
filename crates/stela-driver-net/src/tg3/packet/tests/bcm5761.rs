@@ -174,7 +174,7 @@ fn actual_5761_all_source_flash_straps_and_device_ids_use_direct_mac_offset() {
 }
 
 #[test]
-fn actual_5761_unsupported_board_media_management_clock_or_nvram_never_publish_dma() {
+fn actual_5761_unsupported_or_unsigned_board_media_clock_or_nvram_never_publish_dma() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -198,11 +198,13 @@ fn actual_5761_unsupported_board_media_management_clock_or_nvram_never_publish_d
                 4 => {
                     p.sram.insert(0xb58, 0);
                 }
+                // ASF and running APE firmware no longer refuse; an
+                // unsigned board still does.
                 5 => {
-                    p.sram.insert(0xb58, 0x90);
+                    p.sram.insert(0xb54, 0);
                 }
                 6 => {
-                    p.ape.insert(0x400c, 0x100);
+                    p.sram.insert(0xb54, !0x4b65_7654);
                 }
                 7 => {
                     p.mac.insert(0x7014, 0x0800_0000);

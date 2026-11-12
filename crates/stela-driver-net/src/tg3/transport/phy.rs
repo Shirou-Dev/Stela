@@ -31,8 +31,12 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             return Err(Error::Poisoned);
         }
         let bcm5761 = self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5761;
-        let unmanaged = self.unmanaged();
-        self.record(unmanaged)?;
+        let management = self.observe_management();
+        // tg3_power_down_prepare: ASF firmware keeps using the PHY, so it
+        // stays powered.
+        if self.record(management)?.asf {
+            return Ok(());
+        }
         // The source's KEEP_LINK_ON_PWRDN policy forbids this operation.
         // Observe the signed board word again before any PHY effect.
         // A policy refusal has made no PHY mutation and need not quarantine

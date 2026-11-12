@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! tg3's raw-tag, unmanaged receive-mode policy.
+//! tg3's receive-mode policy.
 use super::Error;
 use crate::Mac;
 use alloc::vec::Vec;
 
 /// Requested hardware receive policy. The station address always remains.
 /// Multicast uses the source 128-bit hash and can admit hash collisions. Up to
-/// three additional unicast addresses use exact slots; larger lists select
-/// promiscuous mode, as the pinned driver does. Lists are additional to the
+/// three additional unicast addresses (two when ASF firmware keeps a slot)
+/// use exact slots; larger lists select promiscuous mode, as the pinned
+/// driver does. Lists are additional to the
 /// station address, not a replacement MAC or a device ownership grant.
 ///
 /// As in the source helper, shortening `unicast` leaves old unused slots until
@@ -42,8 +43,10 @@ impl ReceiveFilter {
             Ok(())
         }
     }
-    pub(super) fn promiscuous(&self) -> bool {
-        self.promiscuous || self.unicast.len() > 3
+    /// Whether the hardware must accept everything: asked for, or more
+    /// additional unicast addresses than `slots` exact slots hold.
+    pub(super) fn promiscuous(&self, slots: usize) -> bool {
+        self.promiscuous || self.unicast.len() > slots
     }
     pub(super) fn hashes(&self) -> [u32; 4] {
         if self.all_multicast {

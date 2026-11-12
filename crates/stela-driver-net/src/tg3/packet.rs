@@ -252,12 +252,24 @@ impl<R: Registers, D: Delay> Packet<R, D> {
         if !self.identified {
             return Err(self.failure.unwrap_or(Error::NotIdentified));
         }
+        // The management firmware hears of the stop only from an epoch
+        // whose every operation was observed.
+        let clean = self.failure.is_none() && self.hardware.failure().is_none();
         let result = (|| {
+            let unload = if clean {
+                self.hardware.packet_unload_begin()
+            } else {
+                Ok(())
+            };
             self.hardware.packet_stop()?;
             // SAFETY: real engines acknowledged stopped, original BME clear;
             // isolated domain and every packet/status target remain.
             unsafe {
                 self.domain.drain_posted_writes()?;
+            }
+            unload?;
+            if clean {
+                self.hardware.packet_unload_end()?;
             }
             Ok(())
         })();
@@ -384,16 +396,17 @@ impl<R: Registers, D: Delay> Packet<R, D> {
     /// Whether a frame arrived; it is left in `self.received`.
     fn receive_inner(&mut self) -> Result<bool, Error> {
         let producer = self.poll()?;
+        let restore_tag = self.hardware.management().asf;
         // A finite pass drops damaged frames without blocking on new traffic.
         for _ in 0..self.geometry.returns {
             if self.rx_consumer == producer {
                 return Ok(false);
             }
-            let (_, frame) = self
-                .memory
-                .as_mut()
-                .unwrap()
-                .receive(self.rx_consumer, &mut self.received)?;
+            let (_, frame) = self.memory.as_mut().unwrap().receive(
+                self.rx_consumer,
+                &mut self.received,
+                restore_tag,
+            )?;
             // The next spare producer slot must really be CPU-owned; the
             // memory layer refuses an out-of-order return which violates it.
             self.memory.as_mut().unwrap().offer(self.rx_producer)?;

@@ -20,8 +20,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         // PHY/config access is legal in the stopped packet epoch. No packet
         // engine is enabled by reopening this serialized register transport.
         self.stopped = false;
+        // tg3_start: the APE hears of the driver before tg3_init_hw.
+        self.ape_driver_start()?;
         self.initialize_phy(board)?;
-        self.reset_unmanaged_core()?;
+        self.reset_core()?;
         // Re-observe post-bootcode signed board identity; never keep a
         // guessed MAC/management setting across reset.
         let observed = self.board()?;
@@ -262,6 +264,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 | MAC_MODE_TDE_ENABLE
                 | MAC_MODE_RDE_ENABLE
                 | MAC_MODE_FHDE_ENABLE
+                // ENABLE_APE: the APE sends and receives through the MAC.
+                | MAC_MODE_APE_TX_EN
+                | MAC_MODE_APE_RX_EN
                 | MAC_MODE_RXSTAT_CLEAR
                 | MAC_MODE_TXSTAT_CLEAR,
         )?;
@@ -377,7 +382,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         // Restore the requested table/mode before any new receive DMA can
         // start; the same policy survives full restart and held-D0 PHY resume.
         self.packet_filter_tables(filter)?;
-        let rx_mode = Self::receive_mode(
+        let rx_mode = self.receive_mode(
             RX_MODE_ENABLE
                 | RX_MODE_IPV6_CSUM_ENABLE
                 | if bcm5762 { RX_MODE_IPV4_FRAG_FIX } else { 0 },
@@ -398,11 +403,15 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.write(MAC_RCV_VALUE_0, RCV_RULE_DISABLE_MASK)?;
         self.write(MAC_RCV_RULE_1, 0x8600_0004 & RCV_RULE_DISABLE_MASK)?;
         self.write(MAC_RCV_VALUE_1, RCV_RULE_DISABLE_MASK)?;
-        for index in 4..8 {
+        // tg3_reset_hw clears the rules up to its limit, eight on 5705_PLUS
+        // parts, less the four ASF firmware keeps for itself.
+        let limit = if self.management.asf { 4 } else { 8 };
+        for index in 4..limit {
             self.write(MAC_RCV_RULE_0 + index * 8, 0)?;
             self.write(MAC_RCV_VALUE_0 + index * 8, 0)?;
         }
         self.initialize_phy(board)?;
+        self.management_started()?;
         self.stopped = false;
         Ok(())
     }
@@ -477,6 +486,18 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     }
     pub(in crate::tg3) fn rx_consumer(&mut self, index: usize) -> Result<(), Error> {
         self.flush(MAILBOX_RCVRET_CON_IDX_0 + 4, index as u32)
+    }
+    /// tg3_halt's `tg3_write_sig_pre_reset(RESET_KIND_SHUTDOWN)`, before
+    /// the engines stop.
+    pub(in crate::tg3) fn packet_unload_begin(&mut self) -> Result<(), Error> {
+        self.asf_driver_state(super::management::DRV_STATE_UNLOAD)
+    }
+    /// tg3_halt's `tg3_write_sig_post_reset(RESET_KIND_SHUTDOWN)` and
+    /// `tg3_power_down_prepare`'s APE UNLOAD, after the engines stopped: the
+    /// management firmware has the port to itself again.
+    pub(in crate::tg3) fn packet_unload_end(&mut self) -> Result<(), Error> {
+        self.asf_driver_state(super::management::DRV_STATE_UNLOAD_DONE)?;
+        self.ape_driver_unload()
     }
     pub(in crate::tg3) fn packet_stop(&mut self) -> Result<(), Error> {
         // A poisoned submission epoch cannot use normal helpers, but

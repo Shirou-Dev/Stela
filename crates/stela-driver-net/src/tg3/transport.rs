@@ -3,7 +3,8 @@
 // Copyright (C) 2001-2003 Jeff Garzik
 // Copyright (C) 2004 Sun Microsystems Inc.
 // Copyright (C) 2005-2018 Broadcom
-//! Linux tg3's APE, SRAM, MDIO and engine-stop protocols, with checked failures.
+//! Linux tg3's APE, SRAM, MDIO, management handshake and engine-stop
+//! protocols, with checked failures.
 use super::{Asic, Delay, Error, Registers, candidate};
 
 const MISC_HOST_CTRL: u16 = 0x68;
@@ -77,6 +78,13 @@ pub struct Hardware<R: Registers, D: Delay> {
     /// The address `tg3_get_device_address`'s fallback chose, kept so the
     /// board read again after the core reset finds the same one.
     fallback_mac: Option<crate::Mac>,
+    /// What the signed board configuration last said the management
+    /// firmware owns.
+    management: management::Management,
+    /// Linux's `ape_hb`: the next APE host heartbeat count.
+    ape_heartbeat: u32,
+    /// Whether the APE was last told the driver started.
+    ape_started: bool,
 }
 impl<R: Registers, D: Delay> Drop for Hardware<R, D> {
     fn drop(&mut self) {
@@ -107,6 +115,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             core_reset_complete: false,
             clkreq_bug: None,
             fallback_mac: None,
+            management: management::Management::default(),
+            ape_heartbeat: 0,
+            ape_started: false,
         }
     }
     /// Stop inherited packet engines while the original configuration/root
@@ -627,3 +638,4 @@ mod reset;
 mod clkreq;
 
 mod filter;
+pub(super) mod management;

@@ -46,7 +46,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if id.chip_revision & 0xfff != 0 {
             return Err(Error::UnsupportedRevision);
         }
-        self.unmanaged()?;
+        self.observe_management()?;
         self.read_phy_identity()?;
         Ok(id)
     }
@@ -57,7 +57,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5762 {
             return self.bcm5762_board();
         }
-        self.unmanaged()?;
+        self.observe_management()?;
         let config = self.sram(NIC_SRAM_DATA_CFG, None)?;
         if config & NIC_SRAM_DATA_CFG_PHY_TYPE_MASK == NIC_SRAM_DATA_CFG_PHY_TYPE_FIBER {
             return Err(Error::UnsupportedMedia);

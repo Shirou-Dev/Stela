@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Original unmanaged __tg3_set_rx_mode/tg3_set_multi and unicast-slot policy.
+//! Original __tg3_set_rx_mode/tg3_set_multi and unicast-slot policy.
 use super::super::ReceiveFilter;
 use super::{regs::*, *};
 const PROMISCUOUS: u32 = 0x100;
@@ -38,9 +38,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 }
             }
         }
-        if !filter.promiscuous && filter.unicast.len() <= 3 {
+        let (first, slots) = self.unicast_slots();
+        if !filter.promiscuous && filter.unicast.len() <= slots {
             for (index, mac) in filter.unicast.iter().enumerate() {
-                let at = MAC_ADDR_0_HIGH + (index as u32 + 1) * 8;
+                let at = MAC_ADDR_0_HIGH + (first + index as u32) * 8;
                 let high = u32::from(u16::from_be_bytes([mac.0[0], mac.0[1]]));
                 let low = u32::from_be_bytes([mac.0[2], mac.0[3], mac.0[4], mac.0[5]]);
                 self.write(at, high)?;
@@ -63,7 +64,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             if previous & RX_MODE_ENABLE == 0 {
                 return Err(Error::ConfigDidNotLatch);
             }
-            let value = Self::receive_mode(previous, filter);
+            let value = self.receive_mode(previous, filter);
             self.packet_filter_tables(filter)?;
             if value != previous {
                 self.write(MAC_RX_MODE, value)?;
@@ -77,9 +78,26 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         // Partial hash/address/mode effects cannot become an acknowledged policy.
         self.record(result)
     }
-    pub(super) fn receive_mode(previous: u32, filter: &ReceiveFilter) -> u32 {
+    /// TG3_UCAST_ADDR_IDX and TG3_MAX_UCAST_ADDR: the first additional
+    /// unicast slot and how many there are. ASF firmware keeps slot 1.
+    fn unicast_slots(&self) -> (u32, usize) {
+        if self.management.asf { (2, 2) } else { (1, 3) }
+    }
+    /// Raw VLAN tags are kept, as a build without VLAN offload does, except
+    /// under ASF, which needs them stripped; the receive path then puts the
+    /// stripped tag back.
+    pub(super) fn receive_mode(&self, previous: u32, filter: &ReceiveFilter) -> u32 {
+        let (_, slots) = self.unicast_slots();
         (previous & !(PROMISCUOUS | RX_MODE_KEEP_VLAN_TAG))
-            | RX_MODE_KEEP_VLAN_TAG
-            | if filter.promiscuous() { PROMISCUOUS } else { 0 }
+            | if self.management.asf {
+                0
+            } else {
+                RX_MODE_KEEP_VLAN_TAG
+            }
+            | if filter.promiscuous(slots) {
+                PROMISCUOUS
+            } else {
+                0
+            }
     }
 }
