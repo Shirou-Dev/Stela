@@ -15,18 +15,6 @@ use stela_loader::host_firmware::{
     requirements::{self, Inventory, Request},
 };
 
-pub(super) fn read_inventory(path: &Path) -> Result<Inventory> {
-    let file = File::open(path)?;
-    ensure!(
-        file.metadata()?.is_file() && file.metadata()?.len() <= MAX_MANIFEST_BYTES as u64,
-        "firmware requirement inventory exceeds its file budget"
-    );
-    let mut bytes = Vec::new();
-    file.take(MAX_MANIFEST_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    Ok(Inventory::parse(&bytes)?)
-}
-
 fn read_cached(path: &Path, artifact: &Artifact) -> Result<Vec<u8>> {
     ensure!(
         !fs::symlink_metadata(path)?.is_symlink(),
@@ -569,21 +557,6 @@ fn client() -> Result<Client> {
         .build()?)
 }
 
-/// Firmware inputs, cache and destination for one provisioning request.
-pub(super) struct ProvisionOptions<'a> {
-    pub(super) requirements: Option<&'a Path>,
-    /// A chip to add nouveau's files for, to what the destination holds.
-    pub(super) gpu: Option<&'a str>,
-    /// The setup computer's network adapters, when a Wi-Fi network is set:
-    /// add the regulatory database and their files to what the destination
-    /// holds.
-    pub(super) wifi: Option<&'a [(u16, u16)]>,
-    pub(super) destination: &'a Path,
-    pub(super) cache: &'a Path,
-    pub(super) dry_run: bool,
-    pub(super) mount_image: &'a [u8],
-}
-
 /// The firmware manifest in `destination`, when it has one.
 fn installed_manifest(destination: &Path) -> Result<Option<Vec<u8>>> {
     let previous = destination.join("manifest.json");
@@ -775,33 +748,6 @@ fn keep_installed(inventory: &mut Inventory, destination: &Path, add: bool) -> R
         }
     }
     Ok(())
-}
-
-pub(super) fn provision(options: ProvisionOptions<'_>) -> Result<String> {
-    let ProvisionOptions {
-        requirements,
-        gpu,
-        wifi,
-        destination,
-        cache,
-        dry_run,
-        mount_image,
-    } = options;
-    let mut inventory = match requirements {
-        Some(path) => read_inventory(path)?,
-        None => Inventory::default(),
-    };
-    keep_installed(&mut inventory, destination, gpu.is_some() || wifi.is_some())?;
-    if let Some(chip) = gpu {
-        recipes::require_gsp(&mut inventory, chip)?;
-    }
-    if let Some(adapters) = wifi {
-        recipes::require_regulatory(&mut inventory)?;
-        for &(vendor, device) in adapters {
-            recipes::require_wifi(&mut inventory, vendor, device)?;
-        }
-    }
-    publish_plan(&inventory, destination, cache, dry_run, mount_image)
 }
 
 /// Plan `inventory`'s pinned files and, unless `dry_run`, download them into
@@ -1198,79 +1144,27 @@ mod tests {
         let inventory = dir.path().join("requests.json");
         fs::write(&inventory, br#"{"schema":1,"complete":true,"requirements":[{"name":"rtl_nic/rtl8168d-1.fw","target":{"driver":"realtek","hardware":"10ec:8168","revision":"xid-281","board":null},"minimum_bytes":4}]}"#).unwrap();
         let cache = dir.path().join("cache");
-        let destination = dir.path().join("destination");
-        let text = provision(ProvisionOptions {
-            requirements: Some(&inventory),
-            gpu: None,
-            wifi: None,
-            destination: &destination,
-            cache: &cache,
-            dry_run: true,
-            mount_image: &host_firmware::MOUNT_CAPABILITY,
-        })
-        .unwrap();
+        let esp = dir.path().join("esp");
+        let text = pinned(&inventory)
+            .plan(&esp, &host_firmware::MOUNT_CAPABILITY, &cache, true)
+            .unwrap()
+            .unwrap();
         assert!(text.contains("1492 bytes"));
         assert!(!cache.exists());
-        assert!(!destination.exists());
-        fs::write(
-            &inventory,
-            br#"{"schema":1,"complete":false,"requirements":[]}"#,
-        )
-        .unwrap();
-        assert!(
-            provision(ProvisionOptions {
-                requirements: Some(&inventory),
-                gpu: None,
-                wifi: None,
-                destination: &destination,
-                cache: &cache,
-                dry_run: true,
-                mount_image: &host_firmware::MOUNT_CAPABILITY
-            })
-            .is_err()
-        );
+        assert!(!esp.exists());
     }
 
-    #[test]
-    fn a_wifi_network_plans_the_regulatory_database_and_the_host_adapters_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let plan = |adapters: &[(u16, u16)]| {
-            provision(ProvisionOptions {
-                requirements: None,
-                gpu: None,
-                wifi: Some(adapters),
-                destination: &dir.path().join("destination"),
-                cache: &dir.path().join("cache"),
-                dry_run: true,
-                mount_image: &host_firmware::MOUNT_CAPABILITY,
-            })
-            .unwrap()
-        };
-        // An Intel Ethernet controller and an MT7925.
-        let text = plan(&[(0x8086, 0x125c), (0x14c3, 0x7925)]);
-        for name in [
-            "regulatory.db",
-            "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin",
-            "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin",
-        ] {
-            assert!(text.contains(name), "{name}: {text}");
+    /// An inventory file's requests as the files a boot asked for.
+    fn pinned(inventory: &Path) -> Requested {
+        let file = File::open(inventory).unwrap();
+        let mut bytes = Vec::new();
+        file.take(MAX_MANIFEST_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        Requested {
+            pinned: Inventory::parse(&bytes).unwrap().requests().to_vec(),
+            ..Requested::default()
         }
-        assert!(text.contains("3 exact observed bindings"), "{text}");
-        // An AX210 and an RTL8822CE.
-        let text = plan(&[(0x8086, 0x2725), (0x10ec, 0xc822)]);
-        for name in [
-            "regulatory.db",
-            "iwlwifi-ty-a0-gf-a0-89.ucode",
-            "iwlwifi-ty-a0-gf-a0.pnvm",
-            "rtw88/rtw8822c_fw.bin",
-        ] {
-            assert!(text.contains(name), "{name}: {text}");
-        }
-        assert!(text.contains("4 exact observed bindings"), "{text}");
-        // No adapter setup knows: the database alone.
-        let text = plan(&[(0x8086, 0x125c)]);
-        assert!(text.contains("1 exact observed bindings"), "{text}");
-        assert!(!dir.path().join("destination").exists());
     }
 
     #[test]
@@ -1428,39 +1322,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_gpu_joins_what_is_installed() {
-        let dir = tempfile::tempdir().unwrap();
-        let destination = dir.path().join("firmware");
-        fs::create_dir_all(&destination).unwrap();
-        let manifest = serde_json::json!({"schema":1,"images":[{
-            "name":"rtl_nic/rtl8168e-3.fw", "path":"rtl/one.bin",
-            "target":{"driver":"realtek","hardware":"10ec:8168","revision":"xid-2c8","board":null},
-            "provenance":{"source":"synthetic-fixture","revision":"v1","member":"one.bin","license":"CC0-1.0"},
-            "length":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}]});
-        fs::write(
-            destination.join("manifest.json"),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
-        let provision = |gpu| {
-            provision(ProvisionOptions {
-                requirements: None,
-                gpu,
-                wifi: None,
-                destination: &destination,
-                cache: &dir.path().join("cache"),
-                dry_run: true,
-                mount_image: &host_firmware::MOUNT_CAPABILITY,
-            })
-        };
-        let report = provision(Some("tu104")).unwrap();
-        assert!(report.contains("rtl_nic/rtl8168e-3.fw"));
-        assert!(report.contains("nvidia/tu104/gsp/gsp-570.144.bin"));
-        assert!(provision(None).is_err(), "nothing covers what is installed");
-        assert!(provision(Some("gp104")).is_err());
-    }
-
     /// A boot log on `esp` whose boots print `lines`.
     fn boot_log(esp: &Path, boots: &[&str]) {
         fs::create_dir_all(esp.join("EFI/stela")).unwrap();
@@ -1605,22 +1466,21 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let destination = output.join("firmware");
+        let esp = output.join("esp");
+        let destination = esp.join(host_firmware::DIRECTORY);
         let cache = output.join("cache");
-        let report = provision(ProvisionOptions {
-            requirements: Some(&inventory),
-            gpu: None,
-            wifi: None,
-            destination: &destination,
-            cache: &cache,
-            dry_run: false,
-            mount_image: &host_firmware::MOUNT_CAPABILITY,
-        })
-        .unwrap();
+        let requested = pinned(&inventory);
+        let report = requested
+            .plan(&esp, &host_firmware::MOUNT_CAPABILITY, &cache, false)
+            .unwrap()
+            .unwrap();
         fs::write(output.join("provisioning.txt"), report).unwrap();
         let manifest_bytes = fs::read(destination.join("manifest.json")).unwrap();
         let manifest = host_firmware::Manifest::parse(&manifest_bytes).unwrap();
-        let observed = read_inventory(&inventory).unwrap();
+        let mut observed = Inventory::default();
+        for request in &requested.pinned {
+            observed.observe(request.view()).unwrap();
+        }
         assert_eq!(manifest.images.len(), 23);
         for (image, request) in manifest.images.iter().zip(observed.requests()) {
             assert_eq!(image.name, request.name);
@@ -1657,16 +1517,10 @@ mod tests {
                 .inventory(),
             (23, 115_404)
         );
-        let again = provision(ProvisionOptions {
-            requirements: Some(&inventory),
-            gpu: None,
-            wifi: None,
-            destination: &destination,
-            cache: &cache,
-            dry_run: false,
-            mount_image: &host_firmware::MOUNT_CAPABILITY,
-        })
-        .unwrap();
+        let again = requested
+            .plan(&esp, &host_firmware::MOUNT_CAPABILITY, &cache, false)
+            .unwrap()
+            .unwrap();
         assert!(again.contains("Published pinned firmware"));
         assert_eq!(
             fs::read(destination.join("manifest.json")).unwrap(),

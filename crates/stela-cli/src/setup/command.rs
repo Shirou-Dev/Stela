@@ -1,238 +1,284 @@
-//! `stela setup`'s command line: creating a setup takes `stela setup`'s own
-//! flags, and each action on an existing setup is a subcommand with only
-//! the options it takes, so the parser refuses every other combination.
-//! Each form becomes one [`Request`] for the action it names.
+//! `stela`'s command line. Plain `stela` looks at the plugged-in sticks and
+//! offers the next step; each explicit command is what that menu runs, with
+//! only the options it takes, so the parser refuses every other combination.
+//! Each form becomes one [`Request`] for the action it names. Options for
+//! developers and for recovering a lost stick stay hidden but working.
 use super::{Action, NextBoot, Request, builds, ecid::Ecid, wifi};
 use clap::{Args, Subcommand, builder::TypedValueParser};
 use std::path::PathBuf;
 use stela_boot_core::options::Uuid;
 
-/// `stela setup`.
-#[derive(Args)]
-#[command(args_conflicts_with_subcommands = true)]
-pub(crate) struct Setup {
-    #[command(subcommand)]
-    action: Option<Command>,
-    #[command(flatten)]
-    create: Create,
+/// The options every command takes.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Global {
+    pub(crate) dry_run: bool,
+    pub(crate) yes: bool,
 }
 
-impl Setup {
-    pub(crate) fn run(self) -> anyhow::Result<()> {
-        self.request().run()
-    }
-
-    /// The request the command line names.
-    pub(super) fn request(self) -> Request {
-        match self.action {
-            None => self.create.request(),
-            Some(command) => command.request(),
-        }
-    }
-}
-
+/// One of `stela`'s commands.
 #[derive(Subcommand)]
-enum Command {
-    /// Report everything about the setup and check it, changing nothing;
-    /// fails when something needs fixing.
-    Status(Found),
-    /// Put back what the setup record says (stela.cfg, the startup choices,
-    /// damaged boot files and install medium, from `--ipsw`, an image
-    /// already downloaded, the USB's own copy or Apple's servers); with
-    /// `--fetch` or `--ipsw`, also prepare every restore bundle again and
-    /// give a machine without an ECID one.
-    Repair(Repair),
-    /// Update an existing setup in place.
-    #[command(subcommand)]
+pub(crate) enum Command {
+    /// Erase a stick and make a macOS installer on it
+    #[command(
+        long_about = "Erase a stick and make a macOS installer on it. Without a terminal, \
+                      erasing needs --confirm-disk."
+    )]
+    Create(Box<Create>),
+    /// Bring a stick to this version of Stela
+    #[command(
+        long_about = "Replace the stick's Stela with this version and prepare its boot files \
+                      again when needed. Downloads only the boot files it needs."
+    )]
     Update(Update),
-    /// Remove everything a previous setup wrote to this USB.
-    Uninstall(Plain),
-    /// Change an install's NVRAM on its machine-state partition.
-    #[command(subcommand)]
+    /// Fix what is damaged or missing on a stick, and finish an interrupted
+    /// create or update
+    #[command(
+        long_about = "Check the stick and put back what is damaged or missing: settings, boot \
+                      files, macOS pieces, firmware the last boot asked for. Finishes an \
+                      interrupted create or update."
+    )]
+    Repair(Repair),
+    /// Show what is on a stick and whether it is healthy; changes nothing
+    #[command(
+        long_about = "Show what is on the stick and whether it is healthy. Changes nothing. \
+                      Exits 1 when something needs doing, and names the command."
+    )]
+    Status(Status),
+    /// Change a stick's Wi-Fi, network addresses and approved USB4 devices
+    #[command(long_about = "Without options, asks for each setting on a terminal.")]
+    Settings(Settings),
+    /// Save the boot logs for a bug report
+    #[command(
+        long_about = "Read every boot log on this computer's disks: the stick's and each \
+                      install's. PATH limits it to one disk, volume, disk image or boot.log \
+                      copy. On a terminal the logs are saved to stela-boot-log-DATE.txt in this \
+                      folder; otherwise they are printed."
+    )]
+    Log(Log),
+    /// Remove everything Stela wrote to a stick.
+    #[command(hide = true)]
+    Uninstall(Stick),
+    /// Change an install's NVRAM on its machine-state partition, which is
+    /// on the PC's own disk.
+    #[command(hide = true, subcommand)]
     Nvram(Nvram),
     /// Back up an install's machine state, or write a backup back.
-    #[command(subcommand)]
+    #[command(hide = true, subcommand)]
     State(State),
-    /// Print the boot logs: the USB's own, then the one stela.efi keeps in
-    /// the install's machine state. Without --usb, every disk of this
-    /// computer is read directly.
-    BootLog(BootLog),
-    /// Change the settings of an existing setup.
-    Configure(Configure),
-    /// Install host-device firmware for the PC onto an existing USB.
-    #[command(subcommand)]
-    HostFirmware(HostFirmware),
+    /// Install an authorized local host-device firmware package
+    /// (manifest.json and resources) onto the stick.
+    #[command(hide = true)]
+    HostFirmware {
+        #[arg(value_name = "DIRECTORY")]
+        directory: PathBuf,
+        #[command(flatten)]
+        stick: Stick,
+    },
 }
 
 impl Command {
-    fn request(self) -> Request {
-        match self {
-            Self::Status(usb) => usb.request(Action::Status),
-            Self::Repair(command) => command.request(),
+    /// The request the command line names.
+    pub(crate) fn request(self, global: Global) -> Result<Request, clap::Error> {
+        let mut request = match self {
+            Self::Create(command) => command.request(),
             Self::Update(command) => command.request(),
-            Self::Uninstall(command) => command.request(Action::Uninstall),
+            Self::Repair(command) => command.request(),
+            Self::Status(command) => Request {
+                full: command.full,
+                ..command.stick.request(Action::Status)
+            },
+            Self::Settings(command) => command.request()?,
+            Self::Log(command) => command.request(),
+            Self::Uninstall(stick) => stick.request(Action::Uninstall),
             Self::Nvram(command) => command.request(),
             Self::State(command) => command.request(),
-            Self::BootLog(command) => command.request(),
-            Self::Configure(command) => command.request(),
-            Self::HostFirmware(command) => command.request(),
-        }
+            Self::HostFirmware { directory, stick } => {
+                stick.request(Action::HostFirmwareInstall(directory))
+            }
+        };
+        request.dry_run = global.dry_run;
+        request.yes = global.yes;
+        Ok(request)
     }
 }
 
 /// A partition's name, given as is or by its device path (`/dev/disk1s2`,
-/// `/dev/sdb1`), as `--usb` takes a whole disk.
+/// `/dev/sdb1`), as STICK takes a whole disk.
 fn partition_name(value: &str) -> Result<String, String> {
     Ok(value.strip_prefix("/dev/").unwrap_or(value).to_owned())
 }
 
-/// The USB a maintenance command acts on.
-#[derive(Args)]
-struct Usb {
-    /// The USB's EFI partition, or another mounted volume of the same USB.
-    #[arg(long, value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from))]
-    usb: PathBuf,
+fn path() -> impl TypedValueParser<Value = PathBuf> {
+    clap::builder::OsStringValueParser::new().map(PathBuf::from)
 }
 
-impl Usb {
+/// The stick a command acts on: without it, the one plugged-in stick that
+/// holds Stela.
+#[derive(Args)]
+pub(crate) struct Stick {
+    /// The stick's whole disk or one of its mounted volumes. It can be left
+    /// out when only one stick fits.
+    #[arg(value_name = "STICK", value_parser = path())]
+    stick: Option<PathBuf>,
+}
+
+impl Stick {
     fn request(self, action: Action) -> Request {
         Request {
             action,
-            usb: self.usb,
+            usb: self.stick.unwrap_or_default(),
             ..Request::default()
         }
     }
 }
 
-/// The USB a command that changes nothing it cannot put back acts on:
-/// without `--usb`, the one mounted volume of this computer's disks that
-/// holds a Stela setup (`find_setups`).
-#[derive(Args)]
-struct Found {
-    /// The USB's EFI partition, or another mounted volume of the same USB.
-    /// Without it, the USB is found when exactly one disk holds a setup.
-    #[arg(long, value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from))]
-    usb: Option<PathBuf>,
-}
-
-impl Found {
-    fn request(self, action: Action) -> Request {
-        Request {
-            action,
-            usb: self.usb.unwrap_or_default(),
-            ..Request::default()
-        }
+/// The macOS a stick installs, by version (27.2), build (26B123) or
+/// `latest`, as the build.
+fn macos(value: &str) -> Result<String, String> {
+    if value.eq_ignore_ascii_case("latest") {
+        return Ok(builds::DEFAULT.build.into());
     }
-}
-
-/// The USB and `--dry-run`.
-#[derive(Args)]
-struct Plain {
-    #[command(flatten)]
-    usb: Usb,
-    /// Show what would change, and change nothing.
-    #[arg(long)]
-    dry_run: bool,
-}
-
-impl Plain {
-    fn request(self, action: Action) -> Request {
-        Request {
-            dry_run: self.dry_run,
-            ..self.usb.request(action)
-        }
+    if let Some(entry) = builds::SUPPORTED
+        .iter()
+        .find(|entry| entry.version == value)
+    {
+        return Ok(entry.build.into());
     }
+    if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+        return Err("a macOS version such as 27.2, a build such as 26B123, or latest".into());
+    }
+    Ok(value.to_ascii_uppercase())
 }
 
-/// Where the restore image comes from: `--ipsw`, or else a download from
-/// Apple.
-#[derive(Args)]
-struct Image {
-    /// A macOS 27 restore image (IPSW) on this computer. Without it, setup
-    /// downloads the image from Apple.
-    #[arg(long)]
-    ipsw: Option<PathBuf>,
-    /// Where downloaded images are kept: Stela's per-user cache by default.
-    #[arg(long)]
-    download_dir: Option<PathBuf>,
-    /// The macOS 27 build to download, such as 26B123: the newest tested
-    /// one by default. Maintenance commands download the setup's own build.
-    #[arg(long, default_value = builds::DEFAULT.build)]
-    build: String,
+/// `--wifi`: a network's name, or `none`.
+#[derive(Clone)]
+enum Join {
+    None,
+    Network(String),
 }
 
-impl Image {
-    /// A command that always needs the image downloads it without `--ipsw`.
-    fn apply(self, request: &mut Request) {
-        request.fetch = self.ipsw.is_none();
-        self.apply_optional(request, false);
+fn join(value: &str) -> Result<Join, String> {
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(Join::None);
     }
-
-    /// A command that needs the image only for some repairs downloads it
-    /// with `--fetch`.
-    fn apply_optional(self, request: &mut Request, fetch: bool) {
-        request.fetch |= fetch;
-        request.ipsw = self.ipsw;
-        request.download_dir = self.download_dir;
-        request.build = self.build;
-    }
+    wifi::ssid(value).map(Join::Network)
 }
 
 /// The Wi-Fi network `stela.efi` joins.
 #[derive(Args)]
 struct Wifi {
-    /// Join this Wi-Fi network for the install's network, beside or instead
-    /// of Ethernet. Setup asks for its passphrase and writes it to the USB in
-    /// plaintext (`EFI/stela/wifi.key`).
-    #[arg(long, value_name = "SSID", value_parser = wifi::ssid)]
-    wifi: Option<String>,
-    /// Read the Wi-Fi passphrase (8 to 63 characters, or a 64-digit hex PSK)
-    /// from this file instead of asking.
-    #[arg(long, value_name = "FILE", requires = "wifi")]
+    /// Wi-Fi to join during the install, or none. The passphrase is asked
+    /// for and stored in plaintext on the stick.
+    #[arg(long, value_name = "SSID|none", value_parser = join)]
+    wifi: Option<Join>,
+    /// Read the Wi-Fi passphrase from FILE
+    #[arg(long, value_name = "FILE")]
     wifi_passphrase_file: Option<PathBuf>,
     /// The country whose Wi-Fi rules apply, as an ISO 3166 code such as US
-    /// or DE.
-    #[arg(long, value_name = "CODE", requires = "wifi", value_parser = wifi::country)]
+    /// or DE: this computer's by default.
+    #[arg(long, value_name = "CODE", value_parser = wifi::country, hide = true)]
     wifi_country: Option<String>,
 }
 
 impl Wifi {
     fn apply(self, request: &mut Request) {
-        request.wifi = self.wifi;
+        match self.wifi {
+            Some(Join::Network(ssid)) => request.wifi = Some(ssid),
+            Some(Join::None) => request.no_wifi = true,
+            None => {}
+        }
         request.wifi_passphrase_file = self.wifi_passphrase_file;
         request.wifi_country = self.wifi_country;
     }
 }
 
-/// A USB4 device's UUID, in the spelling the boot log prints.
+/// A USB4 device's UUID, in the spelling the boot log prints, or `none`.
 fn usb4_device(text: &str) -> Result<String, String> {
+    if text.eq_ignore_ascii_case("none") {
+        return Ok("none".into());
+    }
     Uuid::parse(text)
         .map(|uuid| uuid.to_string())
         .ok_or_else(|| "a USB4 device is named by its UUID, as the boot log prints it".into())
 }
 
+/// Apply `--usb4-allow`: `none` alone withdraws every approval.
+fn apply_usb4(request: &mut Request, devices: Vec<String>) -> Result<(), clap::Error> {
+    if devices.iter().any(|device| device == "none") {
+        if devices.len() > 1 {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--usb4-allow none cannot be given with a device\n",
+            ));
+        }
+        request.no_usb4_approve = true;
+    } else {
+        request.usb4_approve = devices;
+    }
+    Ok(())
+}
+
+/// `--ipv4` or `--dns`: a value, or `auto` for DHCP's.
+#[derive(Clone)]
+enum Automatic<T> {
+    Auto,
+    Set(T),
+}
+
+fn ipv4(word: &str) -> Result<Automatic<stela_boot_core::options::StaticIpv4>, String> {
+    if word.eq_ignore_ascii_case("auto") {
+        return Ok(Automatic::Auto);
+    }
+    super::addresses::ipv4(word).map(Automatic::Set)
+}
+
+fn dns(word: &str) -> Result<Automatic<Vec<std::net::IpAddr>>, String> {
+    if word.eq_ignore_ascii_case("auto") {
+        return Ok(Automatic::Auto);
+    }
+    super::addresses::servers(word).map(|servers| Automatic::Set(servers.0))
+}
+
 /// The addresses `stela.efi`'s network uses instead of DHCP's.
 #[derive(Args)]
 struct Addressing {
-    /// Give the PC this IPv4 address and prefix length, such as
-    /// 192.168.1.20/24, instead of asking DHCP.
-    #[arg(long, value_name = "ADDRESS/PREFIX", value_parser = super::addresses::ipv4)]
-    ipv4: Option<stela_boot_core::options::StaticIpv4>,
-    /// The IPv4 default router: another address of --ipv4's subnet.
+    /// Static IPv4 address, or DHCP
+    #[arg(long, value_name = "ADDRESS/PREFIX|auto", value_parser = ipv4)]
+    ipv4: Option<Automatic<stela_boot_core::options::StaticIpv4>>,
+    /// IPv4 router, with --ipv4
     #[arg(long, value_name = "ADDRESS", requires = "ipv4")]
-    ipv4_gateway: Option<std::net::Ipv4Addr>,
-    /// Resolve names with these servers (up to 3, comma-separated, IPv4 or
-    /// IPv6) instead of the ones DHCP and the router announce.
-    #[arg(long, value_name = "SERVERS", value_parser = super::addresses::servers)]
-    dns: Option<super::addresses::Servers>,
+    gateway: Option<std::net::Ipv4Addr>,
+    /// Up to 3 DNS servers, comma-separated
+    #[arg(long, value_name = "SERVERS|auto", value_parser = dns)]
+    dns: Option<Automatic<Vec<std::net::IpAddr>>>,
 }
 
 impl Addressing {
     fn apply(self, request: &mut Request) {
-        request.ipv4 = self.ipv4;
-        request.ipv4_gateway = self.ipv4_gateway;
-        request.dns = self.dns.map(|servers| servers.0);
+        match self.ipv4 {
+            Some(Automatic::Set(ipv4)) => request.ipv4 = Some(ipv4),
+            Some(Automatic::Auto) => request.automatic_ipv4 = true,
+            None => {}
+        }
+        request.ipv4_gateway = self.gateway;
+        match self.dns {
+            Some(Automatic::Set(servers)) => request.dns = Some(servers),
+            Some(Automatic::Auto) => request.automatic_dns = true,
+            None => {}
+        }
     }
+}
+
+/// The same addresses, hidden: a new installer takes DHCP's unless a
+/// script names them; `stela settings` changes them.
+#[derive(Args)]
+struct HiddenAddressing {
+    #[arg(long, value_name = "ADDRESS/PREFIX", value_parser = super::addresses::ipv4, hide = true)]
+    ipv4: Option<stela_boot_core::options::StaticIpv4>,
+    #[arg(long, value_name = "ADDRESS", requires = "ipv4", hide = true)]
+    gateway: Option<std::net::Ipv4Addr>,
+    #[arg(long, value_name = "SERVERS", value_parser = super::addresses::servers, hide = true)]
+    dns: Option<super::addresses::Servers>,
 }
 
 /// How long the startup choices wait.
@@ -253,17 +299,21 @@ fn wait(value: &str) -> Result<Wait, String> {
         .map_err(|_| "a number of seconds, or auto".into())
 }
 
+fn ecid(value: &str) -> Result<Ecid, String> {
+    Ecid::parse(value).map_err(|e| e.to_string())
+}
+
 /// An install's machine state.
 #[derive(Args)]
-struct Machine {
+pub(crate) struct Machine {
     #[command(flatten)]
-    usb: Usb,
+    stick: Stick,
     /// The install to act on (the default install otherwise).
     #[arg(long)]
     install: Option<String>,
     /// The install's machine-state partition, when this computer names it
     /// differently than setup found it by its GUID and disk serial.
-    #[arg(long, value_parser = partition_name, hide = true)]
+    #[arg(long, value_parser = partition_name)]
     nor: Option<String>,
 }
 
@@ -272,70 +322,49 @@ impl Machine {
         Request {
             install: self.install,
             nor: self.nor,
-            ..self.usb.request(action)
+            ..self.stick.request(action)
         }
     }
 }
 
-/// `boot-log`: the setup and install to read, and where the report goes.
+/// `stela create`.
 #[derive(Args)]
-struct BootLog {
-    /// The USB's EFI partition, or another mounted volume of the same USB.
-    /// Without it, every disk of this computer is read directly, so the USB
-    /// only needs to be plugged in.
-    #[arg(long, value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from))]
-    usb: Option<PathBuf>,
-    /// With --usb: the install to read (the default install otherwise).
-    #[arg(long, requires = "usb")]
-    install: Option<String>,
-    /// The install's machine-state partition, when this computer names it
-    /// differently than setup found it by its GUID and disk serial.
-    #[arg(long, value_parser = partition_name, requires = "usb", hide = true)]
-    nor: Option<String>,
-    /// Write the logs to this file instead of the terminal, to attach to a
-    /// report.
-    #[arg(short, long, value_name = "FILE")]
-    output: Option<PathBuf>,
-}
-
-impl BootLog {
-    fn request(self) -> Request {
-        Request {
-            action: Action::BootLog,
-            usb: self.usb.unwrap_or_default(),
-            install: self.install,
-            nor: self.nor,
-            output: self.output,
-            ..Request::default()
-        }
-    }
-}
-
-/// Create a setup: the wizard without `--usb`.
-#[derive(Args)]
-struct Create {
-    /// The USB's EFI partition, another mounted volume of the same USB, or
-    /// the whole USB disk (such as disk5 on macOS, /dev/sdb on Linux or
-    /// PhysicalDrive2 on Windows), which setup erases first into an EFI
-    /// partition and a FAT32 volume. Without it, setup asks.
-    #[arg(long, default_value = "", value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from))]
-    usb: PathBuf,
-    /// The installer to make: offline by default when the USB is 32 GB or
-    /// more, else online.
-    #[arg(long, value_enum, value_name = "KIND")]
+pub(crate) struct Create {
+    /// The stick's whole disk (/dev/sdb, disk5 or PhysicalDrive2), which is
+    /// erased, or one of its mounted volumes. Without it, stela asks.
+    #[arg(value_name = "STICK", value_parser = path())]
+    stick: Option<PathBuf>,
+    /// Offline copies macOS to the stick (32 GB or more); the install needs
+    /// no internet. Online downloads macOS during the install. Default:
+    /// offline when it fits.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "offline|online",
+        hide_possible_values = true
+    )]
     installer: Option<super::InstallImage>,
-    #[command(flatten)]
-    image: Image,
+    /// macOS to install [default: latest tested]
+    #[arg(long, value_name = "VERSION|BUILD|latest", value_parser = macos)]
+    macos: Option<String>,
+    /// Use this IPSW instead of downloading
+    #[arg(long, value_name = "FILE")]
+    ipsw: Option<PathBuf>,
     #[command(flatten)]
     wifi: Wifi,
+    /// The stick's model or size, typed back: needed without a terminal,
+    /// and for disks that are not USB sticks
+    #[arg(long, value_name = "MODEL|SIZE")]
+    confirm_disk: Option<String>,
+    /// Where downloaded images are kept: Stela's per-user cache by default.
+    #[arg(long, hide = true)]
+    download_dir: Option<PathBuf>,
     /// Give this USB4 device a PCIe tunnel on PCs without an IOMMU that
-    /// confines it, where it can reach all of memory. Repeat for more
-    /// devices. The boot log prints each refused device's UUID, which a
-    /// device can claim falsely.
-    #[arg(long, value_name = "UUID", value_parser = usb4_device)]
-    usb4_approve: Vec<String>,
+    /// confines it.
+    #[arg(long, value_name = "UUID", value_parser = usb4_device, hide = true)]
+    usb4_allow: Vec<String>,
     #[command(flatten)]
-    addressing: Addressing,
+    addressing: HiddenAddressing,
     /// The `stela.efi` to install instead of the one built into `stela`.
     #[arg(long, hide = true)]
     efi: Option<PathBuf>,
@@ -343,81 +372,60 @@ struct Create {
     /// supported now.
     #[arg(long, hide = true)]
     model: Option<String>,
-    /// Show what would change, and change nothing.
-    #[arg(long)]
-    dry_run: bool,
-    /// The PC's partition that becomes the Mac's internal SSD, such as
-    /// disk1s2 on macOS, /dev/nvme0n1p2 on Linux or disk1p2 on Windows:
-    /// Install macOS restores macOS onto it, and it is booted from it.
-    /// Without --nor its last 16.8 MB keep the machine state (NVRAM, the
-    /// SEP's state and the boot log), which macOS never sees. On an existing
-    /// setup, it adds another install.
-    #[arg(long, value_parser = partition_name)]
+    /// The PC's partition that becomes the Mac's internal SSD, when stela
+    /// runs on the PC itself; on an existing setup it adds another install.
+    #[arg(long, value_parser = partition_name, hide = true)]
     target: Option<String>,
-    /// Optional: a separate PC partition for the machine state instead of
-    /// the target's last bytes. 8.5 MB holds NVRAM and the SEP's state,
-    /// 12.6 MB also stela.efi's boot log, and 14.7 MB also the board
-    /// devices' firmware, which boots of the installed disk need: use at
-    /// least 14.7 MB.
-    #[arg(long, value_parser = partition_name, requires = "target")]
+    /// A separate PC partition for the machine state instead of the
+    /// target's last bytes (at least 14.7 MB).
+    #[arg(long, value_parser = partition_name, requires = "target", hide = true)]
     nor: Option<String>,
     /// The serial number of the disk holding `--target` and `--nor`, when
     /// this computer cannot read it.
     #[arg(long, requires = "target", hide = true)]
     disk_serial: Option<String>,
-    /// Erase the other file system a `--target` holds, unmounting it first:
-    /// the PC's own OS would mount it and clear Stela's machine state.
-    #[arg(long, requires = "target")]
+    /// Erase the other file system a `--target` holds.
+    #[arg(long, requires = "target", hide = true)]
     erase_target: bool,
     /// Write fresh machine state over bytes that are neither blank nor
-    /// Stela's machine state, as another program or an interrupted setup
-    /// leaves them.
-    #[arg(long, requires = "target")]
+    /// Stela's machine state.
+    #[arg(long, requires = "target", hide = true)]
     initialize_nor: bool,
     /// The new install's name (macOS by default).
-    #[arg(long)]
+    #[arg(long, hide = true)]
     install: Option<String>,
     /// The ECID of the machine being set up, in hexadecimal: reuse a known
-    /// machine's (from `status` of its old USB or a `state backup` file).
-    #[arg(long, value_parser = |value: &str| Ecid::parse(value).map_err(|e| e.to_string()))]
+    /// machine's (from `status` of its old stick or a `state backup` file).
+    #[arg(long, value_parser = ecid, hide = true)]
     ecid: Option<Ecid>,
     /// Give the machine a new ECID although its machine state belongs to
-    /// another one. Its LocalPolicy and SEP state are then orphaned.
-    #[arg(long)]
+    /// another one.
+    #[arg(long, hide = true)]
     new_ecid: bool,
-    /// Have every startup choice time the engine (its `--profile`): each
-    /// heartbeat of the boot log then reports where the engine's time goes
-    /// between translated blocks, by phase and by exit kind.
+    /// Have every startup choice time the engine (its `--profile`).
     #[arg(long, hide = true)]
     profile: bool,
-    /// Have the install refuse an IPSW without recorded block hashes, which
-    /// it otherwise reads whole before the restore starts; with them it
-    /// checks each block as the restore reads it either way. It adds the
-    /// engine's `--verify-on-read` to the Install macOS choice.
+    /// Have the install refuse an IPSW without recorded block hashes.
     #[arg(long, requires = "target", hide = true)]
     verify_on_read: bool,
-    /// The bound of each translation pack `stela.efi` keeps on the USB, in
-    /// bytes (64 MiB to the FAT32 file limit; 0 for none). Defaults to 1 GiB
-    /// or what fits. The mount uses up to 1 GiB of each allocation.
+    /// The bound of each translation pack `stela.efi` keeps on the stick,
+    /// in bytes (64 MiB to the FAT32 file limit; 0 for none).
     #[arg(long, value_name = "BYTES", hide = true)]
     translation_store_bytes: Option<u64>,
-    /// The model or size, as setup shows it, of the whole disk `--usb`
-    /// names, which erasing a removable disk other than a USB (an SD card,
-    /// a FireWire or Thunderbolt disk), or any disk without a terminal to
-    /// ask at, needs typed back.
-    #[arg(long, value_name = "MODEL|SIZE")]
-    confirm_disk: Option<String>,
 }
 
 impl Create {
     fn request(self) -> Request {
         let mut request = Request {
             action: Action::Create,
-            usb: self.usb,
+            usb: self.stick.unwrap_or_default(),
             install_image: self.installer,
+            fetch: self.ipsw.is_none(),
+            ipsw: self.ipsw,
+            build: self.macos.unwrap_or_else(|| builds::DEFAULT.build.into()),
+            download_dir: self.download_dir,
             efi: self.efi,
             model: self.model,
-            dry_run: self.dry_run,
             target: self.target,
             nor: self.nor,
             disk_serial: self.disk_serial,
@@ -430,184 +438,231 @@ impl Create {
             verify_on_read: self.verify_on_read,
             translation_store_bytes: self.translation_store_bytes,
             confirm_disk: self.confirm_disk,
+            usb4_approve: self
+                .usb4_allow
+                .into_iter()
+                .filter(|device| device != "none")
+                .collect(),
+            ipv4: self.addressing.ipv4,
+            ipv4_gateway: self.addressing.gateway,
+            dns: self.addressing.dns.map(|servers| servers.0),
             ..Request::default()
         };
-        self.image.apply(&mut request);
-        request.usb4_approve = self.usb4_approve;
         self.wifi.apply(&mut request);
-        self.addressing.apply(&mut request);
         request
     }
 }
 
+/// `stela update`.
 #[derive(Args)]
-struct Repair {
+pub(crate) struct Update {
     #[command(flatten)]
-    usb: Found,
-    #[command(flatten)]
-    image: Image,
-    /// Prepare every restore bundle again, and give a machine without an
-    /// ECID one, from wherever the image is found.
-    #[arg(long, conflicts_with = "ipsw")]
-    fetch: bool,
-    /// Read every piece of the install medium and put right those whose
-    /// bytes differ; repair does it by itself when an install found one
-    /// damaged.
-    #[arg(long)]
-    verify: bool,
-    /// Erase the other file system an install's SSD partition holds: the
-    /// PC's own OS would mount it and clear Stela's machine state.
-    #[arg(long)]
-    erase_target: bool,
-    /// Write fresh machine state over an install's that stela.efi would
-    /// refuse, as an interrupted `--target` leaves it. A SEP area is blanked
-    /// only on a machine that never booted.
-    #[arg(long)]
-    initialize_nor: bool,
-    /// The machine's ECID, in hexadecimal, when its machine state cannot
-    /// name it.
-    #[arg(long, value_parser = |value: &str| Ecid::parse(value).map_err(|e| e.to_string()))]
-    ecid: Option<Ecid>,
-    /// Give the machine a new ECID although its machine state belongs to
-    /// another one. Its LocalPolicy and SEP state are then orphaned.
-    #[arg(long)]
-    new_ecid: bool,
-    /// Show what would change, and change nothing.
-    #[arg(long)]
-    dry_run: bool,
-}
-
-impl Repair {
-    fn request(self) -> Request {
-        let mut request = Request {
-            erase_target: self.erase_target,
-            initialize_nor: self.initialize_nor,
-            ecid: self.ecid,
-            new_ecid: self.new_ecid,
-            dry_run: self.dry_run,
-            verify: self.verify,
-            ..self.usb.request(Action::Repair)
-        };
-        self.image.apply_optional(&mut request, self.fetch);
-        request
-    }
-}
-
-#[derive(Subcommand)]
-enum Update {
-    /// Replace `stela.efi` (`--efi`, or the one built into `stela`). When it
-    /// reads a new bundle schema or this `stela` prepares a new bundle
-    /// revision, the boot bundles are prepared again from `--ipsw`, an image
-    /// already downloaded, the USB's own copy of macOS, or else the image's
-    /// boot files downloaded alone.
-    Stela(UpdateStela),
-    /// Replace Install macOS's build with a new one (`--build` or `--ipsw`):
-    /// its install medium and restore bundles replace the old build's.
-    Os(UpdateOs),
+    stick: Stick,
+    /// Also change the macOS the stick installs. The installed macOS is not
+    /// changed; it updates itself.
+    #[arg(long, value_name = "VERSION|BUILD|latest", value_parser = macos)]
+    macos: Option<String>,
+    /// Use this IPSW instead of downloading
+    #[arg(long, value_name = "FILE")]
+    ipsw: Option<PathBuf>,
+    /// Where downloaded images are kept: Stela's per-user cache by default.
+    #[arg(long, hide = true)]
+    download_dir: Option<PathBuf>,
+    /// The `stela.efi` to install instead of the one built into `stela`.
+    #[arg(long, hide = true)]
+    efi: Option<PathBuf>,
 }
 
 impl Update {
     fn request(self) -> Request {
-        match self {
-            Self::Stela(command) => {
-                let mut request = Request {
-                    efi: command.efi,
-                    dry_run: command.dry_run,
-                    ..command.usb.request(Action::UpdateStela)
-                };
-                command.image.apply_optional(&mut request, command.fetch);
-                request
-            }
-            Self::Os(command) => {
-                let mut request = Request {
-                    dry_run: command.dry_run,
-                    ..command.usb.request(Action::UpdateOs)
-                };
-                command.image.apply(&mut request);
-                request
-            }
+        Request {
+            ipsw: self.ipsw,
+            download_dir: self.download_dir,
+            efi: self.efi,
+            macos: self.macos,
+            ..self.stick.request(Action::UpdateStela)
         }
     }
 }
 
+/// `stela repair`.
 #[derive(Args)]
-struct UpdateStela {
+pub(crate) struct Repair {
     #[command(flatten)]
-    usb: Found,
-    /// The `stela.efi` to install instead of the one built into `stela`.
-    #[arg(long, hide = true)]
-    efi: Option<PathBuf>,
-    #[command(flatten)]
-    image: Image,
-    /// Accepted for older instructions: the update downloads what it needs
-    /// by itself.
-    #[arg(long, conflicts_with = "ipsw", hide = true)]
-    fetch: bool,
-    /// Show what would change, and change nothing.
+    stick: Stick,
+    /// Read every macOS piece (slow). Done by itself when the last install
+    /// reported a damaged piece.
     #[arg(long)]
-    dry_run: bool,
+    full: bool,
+    /// Use this IPSW instead of downloading
+    #[arg(long, value_name = "FILE")]
+    ipsw: Option<PathBuf>,
+    /// For finishing a create without a terminal
+    #[arg(long, value_name = "FILE")]
+    wifi_passphrase_file: Option<PathBuf>,
+    /// Where downloaded images are kept: Stela's per-user cache by default.
+    #[arg(long, hide = true)]
+    download_dir: Option<PathBuf>,
+    /// Erase the other file system an install's SSD partition holds.
+    #[arg(long, hide = true)]
+    erase_target: bool,
+    /// Write fresh machine state over an install's that stela.efi would
+    /// refuse.
+    #[arg(long, hide = true)]
+    initialize_nor: bool,
+    /// The machine's ECID, in hexadecimal, when its machine state cannot
+    /// name it.
+    #[arg(long, value_parser = ecid, hide = true)]
+    ecid: Option<Ecid>,
+    /// Give the machine a new ECID although its machine state belongs to
+    /// another one.
+    #[arg(long, hide = true)]
+    new_ecid: bool,
 }
 
+impl Repair {
+    fn request(self) -> Request {
+        Request {
+            full: self.full,
+            ipsw: self.ipsw,
+            wifi_passphrase_file: self.wifi_passphrase_file,
+            download_dir: self.download_dir,
+            erase_target: self.erase_target,
+            initialize_nor: self.initialize_nor,
+            ecid: self.ecid,
+            new_ecid: self.new_ecid,
+            ..self.stick.request(Action::Repair)
+        }
+    }
+}
+
+/// `stela status`.
 #[derive(Args)]
-struct UpdateOs {
+pub(crate) struct Status {
     #[command(flatten)]
-    usb: Found,
-    #[command(flatten)]
-    image: Image,
-    /// Show what would change, and change nothing.
+    stick: Stick,
+    /// Also read every macOS piece (slow)
     #[arg(long)]
-    dry_run: bool,
+    full: bool,
+}
+
+/// `stela settings`.
+#[derive(Args)]
+pub(crate) struct Settings {
+    #[command(flatten)]
+    stick: Stick,
+    #[command(flatten)]
+    wifi: Wifi,
+    #[command(flatten)]
+    addressing: Addressing,
+    /// Allow a USB4 device on PCs without an IOMMU that confines it; repeat
+    /// for more
+    #[arg(long, value_name = "UUID|none", value_parser = usb4_device)]
+    usb4_allow: Vec<String>,
+    /// Boot this install by default.
+    #[arg(long, hide = true)]
+    default_install: Option<String>,
+    /// Remove this install from the setup; its partitions are kept.
+    #[arg(long, hide = true)]
+    remove_install: Option<String>,
+    /// Seconds `stela.efi`'s startup choices wait (0: only when a key is
+    /// held), or `auto`.
+    #[arg(long, value_name = "SECONDS|auto", value_parser = wait, hide = true)]
+    chooser_timeout: Option<Wait>,
+    /// Turn the engine profile on or off for every startup choice.
+    #[arg(long, value_name = "on|off", value_parser = clap::builder::BoolishValueParser::new(), hide = true)]
+    profile: Option<bool>,
+}
+
+impl Settings {
+    fn request(self) -> Result<Request, clap::Error> {
+        let mut request = Request {
+            default_install: self.default_install,
+            remove_install: self.remove_install,
+            chooser_timeout: self.chooser_timeout,
+            profile: self.profile == Some(true),
+            no_profile: self.profile == Some(false),
+            ..self.stick.request(Action::Configure)
+        };
+        self.wifi.apply(&mut request);
+        self.addressing.apply(&mut request);
+        apply_usb4(&mut request, self.usb4_allow)?;
+        Ok(request)
+    }
+}
+
+/// `stela log`.
+#[derive(Args)]
+pub(crate) struct Log {
+    /// One disk, volume, disk image or boot.log copy to read instead of
+    /// every disk of this computer.
+    #[arg(value_name = "PATH", value_parser = path())]
+    path: Option<PathBuf>,
+    /// Save to FILE
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<PathBuf>,
+    /// With a mounted volume of a stick: the install to read.
+    #[arg(long, requires = "path", hide = true)]
+    install: Option<String>,
+    /// Only the machine-state partition with this unique GUID in PATH's
+    /// GPT.
+    #[arg(long, conflicts_with = "offset", requires = "path", hide = true)]
+    partition: Option<String>,
+    /// Only the machine-state partition at this byte offset in PATH (0 for
+    /// a raw partition).
+    #[arg(long, value_parser = crate::args::parse_address, requires = "path", hide = true)]
+    offset: Option<u64>,
+    /// With --partition or --offset: the partition is a Mac's SSD partition
+    /// whose last bytes hold the machine state.
+    #[arg(long, hide = true)]
+    in_target: bool,
+}
+
+impl Log {
+    fn request(self) -> Request {
+        Request {
+            action: Action::BootLog,
+            usb: self.path.unwrap_or_default(),
+            install: self.install,
+            output: self.output,
+            log_place: crate::boot_log::Place {
+                partition: self.partition,
+                offset: self.offset,
+                in_target: self.in_target,
+            },
+            ..Request::default()
+        }
+    }
 }
 
 #[derive(Subcommand)]
-enum Nvram {
+pub(crate) enum Nvram {
     /// Choose the next boot of the installed disk in its NVRAM.
     NextBoot {
         #[arg(value_enum)]
         choice: NextBoot,
         #[command(flatten)]
-        usb: Usb,
-        /// The install to act on (the default install otherwise).
-        #[arg(long)]
-        install: Option<String>,
-        /// Show what would change, and change nothing.
-        #[arg(long)]
-        dry_run: bool,
+        machine: Machine,
     },
     /// Write a fresh NVRAM to the install's machine-state partition; its
     /// SEP state is kept.
     Reset {
         #[command(flatten)]
         machine: Machine,
-        /// Show what would change, and change nothing.
-        #[arg(long)]
-        dry_run: bool,
     },
 }
 
 impl Nvram {
     fn request(self) -> Request {
         match self {
-            Self::NextBoot {
-                choice,
-                usb,
-                install,
-                dry_run,
-            } => Request {
-                install,
-                dry_run,
-                ..usb.request(Action::NextBoot(choice))
-            },
-            Self::Reset { machine, dry_run } => Request {
-                dry_run,
-                ..machine.request(Action::ResetNvram)
-            },
+            Self::NextBoot { choice, machine } => machine.request(Action::NextBoot(choice)),
+            Self::Reset { machine } => machine.request(Action::ResetNvram),
         }
     }
 }
 
 #[derive(Subcommand)]
-enum State {
+pub(crate) enum State {
     /// Copy the install's machine state (NVRAM and SEP state, with its keys)
     /// to a new private file.
     Backup {
@@ -615,9 +670,6 @@ enum State {
         file: PathBuf,
         #[command(flatten)]
         machine: Machine,
-        /// Show what would change, and change nothing.
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Write a `state backup` file back to the install it came from.
     Restore {
@@ -625,159 +677,14 @@ enum State {
         file: PathBuf,
         #[command(flatten)]
         machine: Machine,
-        /// Show what would change, and change nothing.
-        #[arg(long)]
-        dry_run: bool,
     },
 }
 
 impl State {
     fn request(self) -> Request {
-        let (action, machine, dry_run) = match self {
-            Self::Backup {
-                file,
-                machine,
-                dry_run,
-            } => (Action::BackupState(file), machine, dry_run),
-            Self::Restore {
-                file,
-                machine,
-                dry_run,
-            } => (Action::RestoreState(file), machine, dry_run),
-        };
-        Request {
-            dry_run,
-            ..machine.request(action)
-        }
-    }
-}
-
-#[derive(Args)]
-struct Configure {
-    #[command(flatten)]
-    usb: Usb,
-    /// Boot this install by default.
-    #[arg(long)]
-    default_install: Option<String>,
-    /// Remove this install from the setup; its partitions are kept.
-    #[arg(long)]
-    remove_install: Option<String>,
-    /// Seconds `stela.efi`'s startup choices wait (0: only when a key is
-    /// held), or `auto` for setup's choice.
-    #[arg(long, value_name = "SECONDS|auto", value_parser = wait)]
-    chooser_timeout: Option<Wait>,
-    /// Turn the engine profile on for every startup choice.
-    #[arg(long, conflicts_with = "no_profile", hide = true)]
-    profile: bool,
-    /// Turn the engine profile off.
-    #[arg(long, hide = true)]
-    no_profile: bool,
-    #[command(flatten)]
-    wifi: Wifi,
-    /// Give this USB4 device a PCIe tunnel on PCs without an IOMMU that
-    /// confines it, where it can reach all of memory. Repeat for more
-    /// devices; the list replaces the last one. The boot log prints each
-    /// refused device's UUID, which a device can claim falsely.
-    #[arg(long, value_name = "UUID", value_parser = usb4_device)]
-    usb4_approve: Vec<String>,
-    /// Approve no USB4 device.
-    #[arg(long, conflicts_with = "usb4_approve")]
-    no_usb4_approve: bool,
-    /// Join no Wi-Fi network, and remove the key file.
-    #[arg(long, conflicts_with = "wifi")]
-    no_wifi: bool,
-    #[command(flatten)]
-    addressing: Addressing,
-    /// Take the IPv4 address and router from DHCP again.
-    #[arg(long = "no-ipv4", alias = "automatic-ipv4", conflicts_with = "ipv4")]
-    automatic_ipv4: bool,
-    /// Take the DNS servers from DHCP and the router again.
-    #[arg(long = "no-dns", alias = "automatic-dns", conflicts_with = "dns")]
-    automatic_dns: bool,
-    /// Show what would change, and change nothing.
-    #[arg(long)]
-    dry_run: bool,
-}
-
-impl Configure {
-    fn request(self) -> Request {
-        let mut request = Request {
-            default_install: self.default_install,
-            remove_install: self.remove_install,
-            chooser_timeout: self.chooser_timeout,
-            profile: self.profile,
-            no_profile: self.no_profile,
-            no_wifi: self.no_wifi,
-            usb4_approve: self.usb4_approve,
-            no_usb4_approve: self.no_usb4_approve,
-            automatic_ipv4: self.automatic_ipv4,
-            automatic_dns: self.automatic_dns,
-            dry_run: self.dry_run,
-            ..self.usb.request(Action::Configure)
-        };
-        self.wifi.apply(&mut request);
-        self.addressing.apply(&mut request);
-        request
-    }
-}
-
-#[derive(Subcommand)]
-enum HostFirmware {
-    /// Install an authorized local host-device firmware package
-    /// (manifest.json and resources) onto the USB; independent of Apple boot
-    /// bundles.
-    Install {
-        #[arg(value_name = "DIRECTORY")]
-        directory: PathBuf,
-        #[command(flatten)]
-        usb: Found,
-        /// Show what would change, and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Download pinned vendor firmware for exact requirements captured by
-    /// native drivers. The inventory must come from the target PC, not this
-    /// setup host.
-    Fetch {
-        #[arg(value_name = "REQUIREMENTS")]
-        requirements: Option<PathBuf>,
-        /// Kept for older instructions: the firmware bundle holds every
-        /// supported chip's files, which this command completes.
-        #[arg(long, value_name = "CHIP")]
-        gpu: Option<String>,
-        #[command(flatten)]
-        usb: Found,
-        /// Cache for pinned host firmware images and redistribution notices.
-        #[arg(long, value_name = "DIRECTORY")]
-        cache: Option<PathBuf>,
-        /// Show what would change, and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
-
-impl HostFirmware {
-    fn request(self) -> Request {
         match self {
-            Self::Install {
-                directory,
-                usb,
-                dry_run,
-            } => Request {
-                dry_run,
-                ..usb.request(Action::HostFirmwareInstall(directory))
-            },
-            Self::Fetch {
-                requirements,
-                gpu,
-                usb,
-                cache,
-                dry_run,
-            } => Request {
-                dry_run,
-                host_firmware_cache: cache,
-                ..usb.request(Action::HostFirmwareFetch { requirements, gpu })
-            },
+            Self::Backup { file, machine } => machine.request(Action::BackupState(file)),
+            Self::Restore { file, machine } => machine.request(Action::RestoreState(file)),
         }
     }
 }

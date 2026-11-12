@@ -38,23 +38,16 @@ fn mark_sparse(file: &fs::File) {
 
 #[test]
 fn partitions_are_named_alone_or_by_device_path() {
-    use clap::Parser as _;
-    let crate::Command::Setup(setup) = crate::Cli::try_parse_from([
-        "stela",
-        "setup",
-        "--usb",
+    let setup = crate::tests::parse(&[
+        "create",
         "/dev/sdb",
         "--target",
         "/dev/nvme0n1p2",
         "--nor",
         "sdc3",
     ])
-    .unwrap()
-    .command
-    else {
-        panic!("not a setup");
-    };
-    let setup = setup.request();
+    .unwrap();
+    assert_eq!(setup.usb, Path::new("/dev/sdb"));
     assert_eq!(setup.target.as_deref(), Some("nvme0n1p2"));
     assert_eq!(setup.nor.as_deref(), Some("sdc3"));
 }
@@ -291,43 +284,11 @@ fn command(f: &Fixture, usb: &Path) -> Request {
         efi: Some(f.efi.clone()),
         model: Some(restore::payload::SYNTHETIC_MODEL.into()),
         build: restore::payload::SYNTHETIC_BUILD.into(),
-        dry_run: false,
-        target: None,
-        nor: None,
-        disk_serial: None,
-        erase_target: false,
-        verify: false,
-        initialize_nor: false,
-        install: None,
-        ecid: None,
-        new_ecid: false,
-        profile: false,
-        no_profile: false,
-        verify_on_read: false,
-        install_volume: None,
-        default_install: None,
-        remove_install: None,
-        chooser_timeout: None,
         // The smallest store: its spare is allocated at the bound, and
         // `snapshot` reads every file it compares. The default bound's
         // shrinking to fit is `translations::choose`'s to test.
         translation_store_bytes: Some(translations::MIN_PACK_BYTES),
-        host_firmware_cache: None,
-        confirm_disk: None,
-        confirmed: false,
-        wifi: None,
-        wifi_passphrase_file: None,
-        wifi_country: None,
-        no_wifi: false,
-        usb4_approve: Vec::new(),
-        no_usb4_approve: false,
-        wifi_passphrase: None,
-        ipv4: None,
-        ipv4_gateway: None,
-        dns: None,
-        automatic_ipv4: false,
-        automatic_dns: false,
-        output: None,
+        ..Request::default()
     }
 }
 
@@ -2800,7 +2761,7 @@ fn a_piece_an_install_found_damaged_is_named_by_status_and_put_right_by_repair()
     let repair = |verify: bool, dry_run: bool| {
         let mut request = update_request(&f, &cache);
         request.action = Action::Repair;
-        request.verify = verify;
+        request.full = verify;
         request.dry_run = dry_run;
         request.dispatch(&environment(&f.host)).unwrap()
     };
@@ -4758,55 +4719,6 @@ fn wifi_configuration_applies_to_all_boot_choices() {
 }
 
 #[test]
-fn firmware_action_checks_capability_and_dry_run() {
-    let mut f = fixture(64 * GIB, false);
-    add_stela(&mut f);
-    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
-    let inventory = f._dir.path().join("observed-firmware.json");
-    fs::write(&inventory, br#"{"schema":1,"complete":true,"requirements":[{"name":"rtl_nic/rtl8168e-3.fw","target":{"driver":"realtek","hardware":"10ec:8168","revision":"xid-2c8","board":null},"minimum_bytes":4}]}"#).unwrap();
-    let before = snapshot(&f.esp);
-    assert!(
-        rerun(&f, |c| {
-            c.action = Action::HostFirmwareFetch {
-                requirements: Some(inventory.clone()),
-                gpu: None,
-            };
-            c.dry_run = true;
-        })
-        .unwrap_err()
-        .to_string()
-        .contains("cannot load host firmware")
-    );
-    assert_eq!(snapshot(&f.esp), before);
-    let capable = f._dir.path().join("firmware-capable.efi");
-    let mut image = efi_image(b"observed-firmware-capable");
-    let mut legacy_marker = stela_loader::host_firmware::MOUNT_CAPABILITY;
-    legacy_marker[20] = 1;
-    image.extend_from_slice(&legacy_marker);
-    fs::write(&capable, image).unwrap();
-    rerun(&f, |c| {
-        c.action = Action::UpdateStela;
-        c.efi = Some(capable.clone());
-    })
-    .unwrap();
-    let before = snapshot(&f.esp);
-    let cache = f._dir.path().join("firmware-cache");
-    let report = rerun(&f, |c| {
-        c.action = Action::HostFirmwareFetch {
-            requirements: Some(inventory.clone()),
-            gpu: None,
-        };
-        c.host_firmware_cache = Some(cache.clone());
-        c.dry_run = true;
-    })
-    .unwrap();
-    assert!(report.contains("1 exact observed bindings"));
-    assert!(report.contains("3872 bytes"));
-    assert_eq!(snapshot(&f.esp), before);
-    assert!(!cache.exists());
-}
-
-#[test]
 fn legacy_operations_reject_oversized_firmware() {
     use sha2::{Digest, Sha256};
     use stela_loader::host_firmware::{DIRECTORY, MOUNT_CAPABILITY, Package};
@@ -5485,7 +5397,6 @@ fn a_new_setup_makes_the_installer_asked_for_or_else_offline_where_it_fits() {
 
 #[test]
 fn installer_flag_offline_on_a_small_usb_is_refused_before_anything_changes() {
-    use clap::Parser as _;
     let mut f = fixture(64 * GIB, false);
     add_stela(&mut f);
     for disk in f.host.disks.iter_mut().filter(|d| d.identifier == "disk5") {
@@ -5493,20 +5404,9 @@ fn installer_flag_offline_on_a_small_usb_is_refused_before_anything_changes() {
     }
     let volume = stela_volume(&f);
     let parse = |kind: &str| {
-        let crate::Command::Setup(parsed) = crate::Cli::try_parse_from([
-            "stela".as_ref(),
-            "setup".as_ref(),
-            "--usb".as_ref(),
-            volume.as_os_str(),
-            "--installer".as_ref(),
-            kind.as_ref(),
-        ])
-        .unwrap()
-        .command
-        else {
-            panic!("not a setup command");
-        };
-        let mut request = parsed.request();
+        let mut request =
+            crate::tests::parse(&["create", volume.to_str().unwrap(), "--installer", kind])
+                .unwrap();
         assert!(matches!(request.action, Action::Create));
         (request.ipsw, request.efi) = (Some(f.ipsw.clone()), Some(f.efi.clone()));
         request.fetch = false;
@@ -5577,24 +5477,10 @@ fn the_offline_promise_says_the_install_checks_the_answers_first() {
 
 #[test]
 fn boot_log_report_goes_to_the_output_file() {
-    use clap::Parser as _;
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("boot-log.txt");
-    let crate::Command::Setup(setup) = crate::Cli::try_parse_from([
-        "stela".as_ref(),
-        "setup".as_ref(),
-        "boot-log".as_ref(),
-        "--usb".as_ref(),
-        "/Volumes/EFI".as_ref(),
-        "-o".as_ref(),
-        output.as_os_str(),
-    ])
-    .unwrap()
-    .command
-    else {
-        panic!("not a setup");
-    };
-    let request = setup.request();
+    let request =
+        crate::tests::parse(&["log", "/Volumes/EFI", "-o", output.to_str().unwrap()]).unwrap();
     assert!(matches!(request.action, Action::BootLog));
     assert_eq!(request.output.as_deref(), Some(output.as_path()));
     save_report(&output, "=== STELA BOOT 1 ===\nline\n").unwrap();
@@ -5607,22 +5493,20 @@ fn boot_log_report_goes_to_the_output_file() {
 
 #[test]
 fn boot_log_without_a_usb_reads_every_disk() {
-    use clap::Parser as _;
     let parse = |words: &[&str]| {
-        crate::Cli::try_parse_from(["stela", "setup", "boot-log"].iter().chain(words)).map(|cli| {
-            match cli.command {
-                crate::Command::Setup(setup) => setup.request(),
-                _ => panic!("not a setup"),
-            }
-        })
+        crate::tests::parse(
+            &std::iter::once("log")
+                .chain(words.iter().copied())
+                .collect::<Vec<_>>(),
+        )
     };
     let request = parse(&["-o", "log.txt"]).unwrap();
     assert!(matches!(request.action, Action::BootLog));
     assert!(request.usb.as_os_str().is_empty());
     assert_eq!(request.output.as_deref(), Some(Path::new("log.txt")));
-    // An install is chosen on a setup's USB only.
+    // An install is chosen on a setup's stick only.
     assert!(parse(&["--install", "macOS"]).is_err());
-    let request = parse(&["--usb", "E:\\", "--install", "macOS"]).unwrap();
+    let request = parse(&["E:\\", "--install", "macOS"]).unwrap();
     assert_eq!(request.usb, Path::new("E:\\"));
     assert_eq!(request.install.as_deref(), Some("macOS"));
 }
@@ -5829,24 +5713,43 @@ fn without_usb_the_one_disk_holding_a_setup_is_used_and_two_are_never_guessed() 
 
 #[test]
 fn maintenance_commands_parse_without_usb() {
-    use clap::Parser as _;
     for args in [
-        &["stela", "setup", "status"][..],
-        &["stela", "setup", "repair"],
-        &["stela", "setup", "update", "stela"],
-        &["stela", "setup", "update", "os"],
-        &["stela", "setup", "host-firmware", "fetch"],
+        &["status"][..],
+        &["repair"],
+        &["update"],
+        &["update", "--macos", "latest"],
+        &["settings"],
+        &["uninstall"],
+        &["nvram", "reset"],
+        &["state", "backup", "state.bin"],
     ] {
-        let crate::Command::Setup(setup) = crate::Cli::try_parse_from(args)
-            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
-            .command
-        else {
-            panic!("not a setup");
-        };
-        let request = setup.request();
+        let request = crate::tests::parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         assert!(request.usb.as_os_str().is_empty(), "{args:?}");
         assert!(finds_usb(&request.action), "{args:?}");
     }
-    // Uninstall still names its USB.
-    assert!(crate::Cli::try_parse_from(["stela", "setup", "uninstall"]).is_err());
+    // Create finds a stick to erase, and log reads every disk.
+    for args in [&["create"][..], &["log"]] {
+        let request = crate::tests::parse(args).unwrap();
+        assert!(!finds_usb(&request.action), "{args:?}");
+    }
+}
+
+#[test]
+fn a_stick_named_by_its_whole_disk_is_read_through_its_stela_volume() {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    // The whole disk and its device path name the volume that holds the
+    // record; a volume names itself.
+    assert_eq!(stick_volume(&f.host, Path::new("disk5")).unwrap(), f.esp);
+    assert_eq!(
+        stick_volume(&f.host, Path::new("/dev/disk5")).unwrap(),
+        f.esp
+    );
+    assert_eq!(stick_volume(&f.host, &f.data).unwrap(), f.data);
+    // A disk without Stela says how to make an installer on it.
+    let error = stick_volume(&f.host, Path::new("disk0"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("`stela create disk0`"), "{error}");
 }

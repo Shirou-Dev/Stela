@@ -594,15 +594,4 @@ mod tests {
         );
         assert_eq!(INSTALLERS[initial], InstallImage::Network);
     }
-
-    #[test]
-    fn maintenance_without_a_usb_is_refused_before_opening_prompts() {
-        use clap::Parser;
-        // Status, repair, update and host-firmware find their USB instead
-        // (`setup::tests::maintenance_commands_parse_without_usb`).
-        for words in [&["uninstall"][..], &["configure", "--no-profile"]] {
-            let line = ["stela", "setup"].into_iter().chain(words.iter().copied());
-            assert!(crate::Cli::try_parse_from(line).is_err(), "{words:?}");
-        }
-    }
 }

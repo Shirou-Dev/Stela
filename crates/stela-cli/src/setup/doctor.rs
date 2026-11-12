@@ -296,7 +296,7 @@ fn image_fix(environment: &Environment<'_>, record: &Record, report: &Report) ->
     }
 }
 
-fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Report) {
+fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Report, full: bool) {
     let repair = report.fix("repair");
     let image = image_fix(environment, record, report);
     for kept in &record.bundles {
@@ -382,6 +382,18 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
                      says so)",
                     medium.directory().join(&piece).display()
                 ));
+            }
+            // `--full`: every piece read back and checked now.
+            if full && problems.is_empty() {
+                match medium.damaged_pieces() {
+                    Ok(damaged) => problems.extend(damaged.into_iter().map(|piece| {
+                        format!(
+                            "{} differs from what was written (read back now)",
+                            medium.directory().join(piece).display()
+                        )
+                    })),
+                    Err(error) => problems.push(format!("its pieces cannot be read: {error:#}")),
+                }
             }
         }
         if medium.build != record.build {
@@ -658,7 +670,7 @@ fn foreign_problem(install: &str, region: &str) -> String {
 }
 
 /// `status`.
-pub(super) fn status(environment: &Environment<'_>, usb: &Path) -> Result<String> {
+pub(super) fn status(environment: &Environment<'_>, usb: &Path, full: bool) -> Result<String> {
     let record = read_record(environment, usb)?;
     let mut report = Report {
         text: String::new(),
@@ -678,7 +690,7 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path) -> Result<String
     report.line("macOS build", &record.build);
     efi_status(environment, &record, &mut report);
     firmware_status(&record, &mut report);
-    bundle_status(environment, &record, &mut report);
+    bundle_status(environment, &record, &mut report, full);
     if record.installs_media() {
         let restore_bundles: Vec<PathBuf> = record
             .bundles
@@ -783,11 +795,13 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     // The firmware the last boot asked for and the USB lacks.
     let requested = super::firmware::requested(&esp, &tool)?;
     record.install_image = command.install_image.or(record.install_image);
-    // With --ipsw or --fetch every restore bundle is prepared again and
+    // With --ipsw, or when a machine has no ECID yet (a setup older than
+    // per-machine identities), every restore bundle is prepared again and
     // machines without an ECID get one; else the damaged and missing
     // bundles and medium are put back. What that needs of the restore image,
     // and where it comes from, is decided before anything is downloaded.
-    let rebuild = command.ipsw.is_some() || command.fetch;
+    let rebuild = command.ipsw.is_some()
+        || (record.installs_media() && record.installs.iter().any(|i| i.ecid.is_none()));
     let has_media = record.installs_media();
     // The full medium's bytes, read whole when asked or when an install
     // found a piece damaged since it was last checked: a damaged piece is
@@ -801,7 +815,7 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     {
         let reported =
             super::medium::reported_damage(&record.esp, record.medium_checked.unwrap_or(0));
-        if command.verify || !reported.is_empty() {
+        if command.full || !reported.is_empty() {
             let damaged = medium.damaged_pieces()?;
             match damaged.is_empty() {
                 true => writeln!(
@@ -830,7 +844,7 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
             }
             checked = Some(super::medium::log_head(&record.esp));
         }
-    } else if command.verify {
+    } else if command.full {
         writeln!(
             text,
             "  install medium {}",

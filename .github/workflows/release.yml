@@ -308,7 +308,7 @@ jobs:
           "$python" -c 'import sys; sys.exit(open(sys.argv[1], "rb").read() not in open(sys.argv[2], "rb").read())' efi/stela.efi "$binary" \
             || { echo "::error::$binary does not hold the stela.efi the efi job built"; exit 1; }
           size="$(wc -c < "$binary")"
-          "$binary" setup --help >/dev/null
+          "$binary" create --help >/dev/null
           echo "$ARCHIVE: $size bytes" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package

@@ -14,7 +14,6 @@
 //! instead. `stela setup boot-log` reads the same places of a setup.
 use crate::setup::host::{self, Disk, Host};
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use clap::Args;
 use std::{
     fmt::Write as _,
     fs::File,
@@ -30,30 +29,31 @@ use stela_runtime::pc::{
     machine_state,
 };
 
-#[derive(Args)]
-pub(crate) struct BootLog {
-    /// A whole-disk image or device, a raw partition, or a copied boot.log
-    /// file: every boot log on it is printed. Without it, every disk of this
-    /// computer is read directly (with sudo for disks only root may read),
-    /// so the USB Stela booted from only needs to be plugged in.
-    file: Option<PathBuf>,
-    /// Write the logs to this file instead of the terminal, as the boot
-    /// wrote them, to attach to a report.
-    #[arg(short, long, value_name = "FILE")]
-    output: Option<PathBuf>,
-    /// Only the machine-state partition with this unique GUID in FILE's
+/// One machine-state place in a file, which the hidden `log` options name
+/// instead of finding every log.
+#[derive(Default, Clone)]
+pub(crate) struct Place {
+    /// Only the machine-state partition with this unique GUID in the file's
     /// GPT.
-    #[arg(long, conflicts_with = "offset", requires = "file", hide = true)]
-    partition: Option<String>,
-    /// Only the machine-state partition at this byte offset in FILE (0 for
-    /// a raw partition).
-    #[arg(long, value_parser = crate::args::parse_address, requires = "file", hide = true)]
-    offset: Option<u64>,
-    /// With --partition or --offset: the partition is a Mac's SSD partition
-    /// whose last bytes hold the machine state; with --offset, FILE ends
-    /// where the partition does.
-    #[arg(long, hide = true)]
-    in_target: bool,
+    pub(crate) partition: Option<String>,
+    /// Only the machine-state partition at this byte offset in the file (0
+    /// for a raw partition).
+    pub(crate) offset: Option<u64>,
+    /// The partition is a Mac's SSD partition whose last bytes hold the
+    /// machine state; with an offset, the file ends where the partition
+    /// does.
+    pub(crate) in_target: bool,
+}
+
+/// `stela log`: the logs of a whole-disk image or device, a raw partition
+/// or a copied boot.log (`file`), or of every disk of this computer.
+pub(crate) struct BootLog {
+    pub(crate) file: Option<PathBuf>,
+    /// Where the logs go instead of standard output.
+    pub(crate) output: Option<PathBuf>,
+    pub(crate) partition: Option<String>,
+    pub(crate) offset: Option<u64>,
+    pub(crate) in_target: bool,
 }
 
 impl BootLog {

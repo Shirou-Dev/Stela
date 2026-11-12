@@ -1,7 +1,8 @@
-//! The `stela` command line prepares a USB that boots Stela to install macOS
-//! on a PC and reads the boot log. Research and development commands belong to
-//! `stela-dev`, which uses this library's boot-bundle and restore-image tools.
-use clap::{Parser, Subcommand};
+//! The `stela` command line makes and maintains the USB stick that boots
+//! Stela to install macOS on a PC, and reads its boot logs. Research and
+//! development commands belong to `stela-dev`, which uses this library's
+//! boot-bundle and restore-image tools.
+use clap::Parser;
 use std::process::ExitCode;
 
 pub mod apfs;
@@ -22,73 +23,81 @@ fn examples() -> String {
     let disk = setup::host::DISK_EXAMPLE;
     format!(
         "Examples:
-  stela setup                       Create a macOS installer USB, step by step
-  stela setup --usb {disk:<15} Erase that USB and write the installer, downloading macOS
-  stela setup status --usb VOLUME   Check an installer USB by its mounted STELA volume"
+  stela                 Choose what to do, step by step
+  stela update          Update the plugged-in stick
+  stela log             Save the boot logs to a file
+  stela create {disk} --confirm-disk 64GB --installer offline"
     )
 }
-const ABOUT: &str = "Prepare a USB that boots Stela to install macOS on a PC";
+
+/// The help's layout, with this computer's spelling of a whole disk.
+fn help_template() -> String {
+    let disk = setup::host::DISK_EXAMPLE;
+    format!(
+        "{{about}}
+
+{{usage-heading}} {{usage}}
+
+Run stela without a command to see the plugged-in sticks and choose what
+to do next.
+
+Commands:
+{{subcommands}}
+
+STICK is the stick's whole disk ({disk}) or one of its mounted volumes.
+It can be left out when only one stick fits.
+
+Options:
+{{options}}
+
+{{after-help}}"
+    )
+}
+
+const ABOUT: &str = "Make and maintain the USB stick that installs macOS on a PC with Stela";
 
 #[derive(Parser)]
 #[command(
     name = "stela",
     version,
     about = ABOUT,
+    override_usage = "stela [COMMAND] [STICK] [OPTIONS]",
+    help_template = help_template(),
     after_help = examples(),
-    arg_required_else_help = true
-)]
-#[cfg_attr(
-    windows,
-    allow(
-        dead_code,
-        reason = "Windows runs Installer directly; the shared command grammar remains covered by tests"
-    )
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<setup::Command>,
+    /// Show what would change, and change nothing
+    #[arg(short = 'n', long, global = true)]
+    dry_run: bool,
+    /// Without a terminal, accept what a run on a terminal would ask about.
+    /// Never covers erasing a disk.
+    #[arg(short = 'y', long, global = true)]
+    yes: bool,
 }
 
-#[derive(Subcommand)]
-#[cfg_attr(
-    windows,
-    allow(
-        dead_code,
-        reason = "Windows runs Installer directly; the shared command grammar remains covered by tests"
-    )
-)]
-pub(crate) enum Command {
-    /// Create a macOS installer USB interactively, or manage an existing USB.
-    Setup(Box<setup::Setup>),
-    /// Print every boot log stela.efi kept: without FILE, the USB's own log
-    /// and each install's, read straight from this computer's disks; with
-    /// FILE, those on a disk image, device, raw partition or boot.log copy.
-    BootLog(boot_log::BootLog),
-}
-
-// Windows ships the direct installer; other hosts expose these subcommands.
-#[cfg_attr(
-    windows,
-    allow(
-        dead_code,
-        reason = "Windows runs Installer directly; the shared command grammar remains covered by tests"
-    )
-)]
-impl Command {
-    fn run(self) -> anyhow::Result<()> {
-        match self {
-            Self::Setup(command) => command.run(),
-            Self::BootLog(command) => command.run(),
+impl Cli {
+    /// The request the command line names: without a command, the home
+    /// screen, which looks at the sticks and offers the next step.
+    fn request(self) -> Result<setup::Request, clap::Error> {
+        let global = setup::Global {
+            dry_run: self.dry_run,
+            yes: self.yes,
+        };
+        match self.command {
+            Some(command) => command.request(global),
+            None => Ok(setup::Request::home(global)),
         }
     }
 }
 
 /// Parse the command line and run it, reporting errors on stderr.
 pub fn main() -> ExitCode {
-    #[cfg(windows)]
-    let result = installer();
-    #[cfg(not(windows))]
-    let result = commands();
+    let result = Cli::parse()
+        .request()
+        .unwrap_or_else(|error| error.exit())
+        .run();
     let code = match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -103,180 +112,165 @@ pub fn main() -> ExitCode {
     code
 }
 
-#[cfg(not(windows))]
-fn commands() -> anyhow::Result<()> {
-    Cli::parse().command.run()
-}
-
-/// `stela.exe` is the installer alone: running it opens the setup wizard, and
-/// its arguments are `stela setup`'s own flags and commands.
-#[cfg(windows)]
-#[derive(Parser)]
-#[command(name = "stela", version, about = ABOUT)]
-struct Installer {
-    #[command(flatten)]
-    setup: setup::Setup,
-}
-
-#[cfg(windows)]
-fn installer() -> anyhow::Result<()> {
-    Installer::parse_from(installer_arguments(std::env::args_os()))
-        .setup
-        .run()
-}
-
-/// `stela.exe`'s arguments without a leading `setup`, so the `stela setup
-/// ...` commands that messages and the docs name work as typed.
-#[cfg(any(windows, test))]
-fn installer_arguments(
-    arguments: impl IntoIterator<Item = std::ffi::OsString>,
-) -> Vec<std::ffi::OsString> {
-    let mut arguments: Vec<_> = arguments.into_iter().collect();
-    if arguments.get(1).is_some_and(|word| word == "setup") {
-        arguments.remove(1);
-    }
-    arguments
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    fn parse(words: &[&str]) -> Command {
-        Cli::try_parse_from(std::iter::once("stela").chain(words.iter().copied()))
-            .unwrap()
-            .command
+    pub(crate) fn parse(words: &[&str]) -> Result<setup::Request, clap::Error> {
+        Cli::try_parse_from(std::iter::once("stela").chain(words.iter().copied()))?.request()
     }
 
     #[test]
-    #[cfg(windows)]
-    fn windows_executable_exposes_installer_commands() {
-        // No arguments opens the wizard; setup's own flags and commands stay
-        // scriptable.
-        Installer::command()
-            .try_get_matches_from(["stela"])
-            .unwrap();
-        let scripted = Installer::command()
-            .try_get_matches_from(["stela", "--ipsw", "a.ipsw", "--profile"])
-            .unwrap();
-        assert!(scripted.get_flag("profile") && scripted.contains_id("ipsw"));
-        Installer::try_parse_from(["stela", "status", "--usb", "E:\\"]).unwrap();
-        Installer::try_parse_from(installer_arguments(
-            ["stela", "setup", "status", "--usb", "E:\\"].map(Into::into),
-        ))
-        .unwrap();
-        let help = Installer::command().render_help().to_string();
-        assert!(help.contains("status"), "{help}");
-        Installer::command().debug_assert();
-    }
-
-    #[test]
-    fn a_leading_setup_word_is_dropped_for_the_installer() {
-        let words =
-            |list: &[&str]| -> Vec<std::ffi::OsString> { list.iter().map(Into::into).collect() };
-        assert_eq!(
-            installer_arguments(words(&["stela", "setup", "status", "--usb", "E:\\"])),
-            words(&["stela", "status", "--usb", "E:\\"])
-        );
-        assert_eq!(installer_arguments(words(&["stela"])), words(&["stela"]));
-        assert_eq!(
-            installer_arguments(words(&["stela", "--usb", "setup"])),
-            words(&["stela", "--usb", "setup"])
-        );
-    }
-
-    #[test]
-    fn help_lists_shipped_commands() {
+    fn help_lists_the_six_commands_and_hides_the_rest() {
         let help = Cli::command().render_help().to_string();
-        assert!(
-            help.contains("setup") && help.contains("boot-log") && !help.contains("\n  gpu"),
-            "{help}"
-        );
-        for command in [
-            "compile-block",
-            "boot",
-            "efi",
-            "install-medium",
-            "cpu-info",
-            "gpu",
-        ] {
+        for command in ["create", "update", "repair", "status", "settings", "log"] {
             assert!(
-                Cli::try_parse_from(["stela", command, "--help"]).is_err(),
-                "{command}"
+                help.contains(&format!("\n  {command} ")),
+                "{command}: {help}"
             );
         }
+        for hidden in [
+            "uninstall",
+            "nvram",
+            "state",
+            "host-firmware",
+            "setup",
+            "boot-log",
+        ] {
+            assert!(!help.contains(hidden), "{hidden}: {help}");
+        }
+        assert!(
+            help.contains("-n, --dry-run") && help.contains("-y, --yes"),
+            "{help}"
+        );
+        assert!(help.starts_with(ABOUT), "{help}");
         Cli::command().debug_assert();
     }
 
     #[test]
-    fn portable_commands_dispatch() -> anyhow::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let missing = directory.path().join("missing.img");
-        let error = parse(&["boot-log", missing.to_str().unwrap()])
-            .run()
-            .unwrap_err();
-        assert!(error.to_string().contains("cannot open"), "{error:#}");
-        assert!(error.downcast_ref::<std::io::Error>().is_some());
-        assert!(matches!(
-            parse(&["setup", "--usb", missing.to_str().unwrap(), "--dry-run"]),
-            Command::Setup(_)
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn setup_without_a_usb_enters_the_wizard_and_preserves_test_options() {
-        assert!(matches!(parse(&["setup"]), Command::Setup(_)));
-        assert!(matches!(
-            parse(&["setup", "--ipsw", "local.ipsw", "--profile"]),
-            Command::Setup(_)
-        ));
-    }
-
-    #[test]
-    fn setup_actions_are_subcommands_that_take_only_their_own_options() {
-        let usb = ["--usb", "/Volumes/STELA"];
+    fn old_spellings_are_refused() {
+        // 0.4 drops the `setup` word and the commands and flags it replaced.
         for words in [
-            &["status"][..],
-            &["repair", "--ipsw", "a.ipsw", "--erase-target"],
-            &["update", "stela", "--efi", "stela.efi"],
-            &["update", "os", "--ipsw", "a.ipsw"],
-            &["update", "stela", "--fetch"],
-            &["uninstall"],
+            &["setup"][..],
+            &["setup", "status"],
+            &["boot-log"],
+            &["configure"],
+            &["status", "--usb", "/Volumes/STELA"],
+            &["repair", "--fetch"],
+            &["repair", "--verify"],
+            &["repair", "--build", "26B123"],
+            &["update", "--build", "26B123"],
+            &["create", "--build", "26B123"],
+            &["settings", "--no-wifi"],
+            &["settings", "--no-dns"],
+            &["settings", "--no-ipv4"],
+            &["settings", "--automatic-dns"],
+            &["settings", "--no-usb4-approve"],
+            &[
+                "settings",
+                "--usb4-approve",
+                "00000000-0000-0000-0000-000000000000",
+            ],
+            &["host-firmware", "fetch", "--gpu", "ga104"],
+            &["compile-block"],
+            &["gpu"],
+        ] {
+            assert!(parse(words).is_err(), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn each_command_takes_only_its_own_options() {
+        for words in [
+            &[][..],
+            &["-n"],
+            &["--yes"],
+            &["status"],
+            &["status", "/dev/sdb", "--full"],
+            &["repair", "--ipsw", "a.ipsw", "--full"],
+            &["repair", "--erase-target", "--initialize-nor", "-n"],
+            &["update", "/Volumes/STELA", "--macos", "27.2"],
+            &["update", "--efi", "stela.efi"],
+            &[
+                "create",
+                "/dev/sdb",
+                "--installer",
+                "online",
+                "--wifi",
+                "none",
+            ],
+            &[
+                "create",
+                "--ipsw",
+                "a.ipsw",
+                "--profile",
+                "--macos",
+                "latest",
+            ],
+            &[
+                "settings", "--wifi", "Home", "--ipv4", "auto", "--dns", "auto",
+            ],
+            &["settings", "--usb4-allow", "none", "--chooser-timeout", "0"],
+            &["settings", "--profile", "off"],
+            &["log"],
+            &["log", "disk.img", "--offset", "0", "--in-target"],
+            &["log", "-o", "report.txt"],
+            &["uninstall", "/Volumes/STELA"],
             &["nvram", "next-boot", "recovery", "--install", "macOS"],
             &["nvram", "reset", "--nor", "sdc3"],
             &["state", "backup", "state.bin"],
-            &["state", "restore", "state.bin", "--nor", "sdc3"],
-            &["boot-log"],
-            &["configure", "--no-profile", "--chooser-timeout", "0"],
-            &["host-firmware", "install", "package"],
             &[
-                "host-firmware",
-                "fetch",
-                "requests.json",
-                "--cache",
-                "cache",
+                "state",
+                "restore",
+                "state.bin",
+                "/Volumes/STELA",
+                "--nor",
+                "sdc3",
             ],
+            &["host-firmware", "package"],
         ] {
-            let line = ["stela", "setup"].into_iter().chain(words.iter().copied());
-            Cli::try_parse_from(line.chain(usb))
-                .unwrap_or_else(|error| panic!("{words:?}: {error}"));
+            parse(words).unwrap_or_else(|error| panic!("{words:?}: {error}"));
         }
-        // Each action takes neither creation's flags nor another action's.
         for words in [
             &["status", "--target", "sdc2"][..],
+            &["status", "--ipsw", "a.ipsw"],
             &["uninstall", "--ipsw", "a.ipsw"],
-            &["configure", "--profile", "--no-profile"],
-            &["state", "backup", "state.bin", "--chooser-timeout", "0"],
-            &["--target", "sdc2", "status"],
-            &["status", "repair"],
-            &["--fetch"],
-            &["update", "os", "--fetch"],
+            &["settings", "--installer", "online"],
+            &["update", "--full"],
+            &["log", "--partition", "x"],
+            &["create", "--gateway", "192.168.1.1"],
+            &[
+                "settings",
+                "--usb4-allow",
+                "none",
+                "--usb4-allow",
+                "00000000-0000-0000-0000-000000000001",
+            ],
+            &["create", "--macos", "27/2"],
             &["doctor"],
         ] {
-            let line = ["stela", "setup"].into_iter().chain(words.iter().copied());
-            assert!(Cli::try_parse_from(line.chain(usb)).is_err(), "{words:?}");
+            assert!(parse(words).is_err(), "{words:?}");
         }
+    }
+
+    #[test]
+    fn global_options_reach_every_command() {
+        let request = parse(&["repair", "-n", "--yes"]).unwrap();
+        assert!(request.dry_run && request.yes);
+        let request = parse(&["--dry-run", "status"]).unwrap();
+        assert!(request.dry_run && !request.yes);
+        let request = parse(&["-y"]).unwrap();
+        assert!(request.yes);
+    }
+
+    #[test]
+    fn macos_takes_a_version_a_build_or_latest() {
+        let build = |words: &[&str]| parse(words).unwrap().build;
+        let newest = stela_formats::builds::DEFAULT;
+        assert_eq!(build(&["create"]), newest.build);
+        assert_eq!(build(&["create", "--macos", "latest"]), newest.build);
+        assert_eq!(build(&["create", "--macos", newest.version]), newest.build);
+        assert_eq!(build(&["create", "--macos", "26a434"]), "26A434");
     }
 }
