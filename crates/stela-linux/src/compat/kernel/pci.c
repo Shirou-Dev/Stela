@@ -156,7 +156,9 @@ static void bind(struct pci_driver *driver, struct pci_dev *dev)
 		return;
 	dev->driver = driver;
 	dev->dev.driver = &driver->driver;
+	dev_info(&dev->dev, "%s: probe starting\n", driver->name);
 	int error = driver->probe(dev, id);
+	dev_info(&dev->dev, "%s: probe returned %d\n", driver->name, error);
 
 	if (!error)
 		return;

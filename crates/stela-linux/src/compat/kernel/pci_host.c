@@ -151,6 +151,7 @@ int pci_enable_msi(struct pci_dev *dev)
 	int error = function->enable_msi(function->context);
 
 	dev->msi_enabled = !error;
+	dev_info(&dev->dev, "pci_enable_msi result: %d\n", error);
 	return error;
 }
 
