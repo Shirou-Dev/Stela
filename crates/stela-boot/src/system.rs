@@ -834,6 +834,15 @@ fn load(
         map: core::mem::ManuallyDrop::new(map),
         ownership: Some(EbsOwnership { _private: () }),
     };
+    // The firmware's exception handlers ended with its boot services. Until
+    // the engine's root is entered a fault shows on the screen instead of
+    // resetting the PC with no record.
+    // SAFETY: boot services have ended; interrupts stay off from here to
+    // the engine's own tables, and no firmware handler runs again.
+    unsafe {
+        asm!("cli", options(nomem, nostack));
+        crate::paging::report_faults();
+    }
     // SAFETY: the firmware's identity map is still loaded, the APs idle in
     // firmware code, and no Stela driver or memory reuse has started.
     let inactive_firmware_units =

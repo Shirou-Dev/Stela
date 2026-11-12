@@ -371,6 +371,93 @@ fatal_handler!(fatal_interrupt, "'I'");
 fatal_handler!(fatal_nmi, "'N'");
 fatal_handler!(fatal_page_fault, "'P'");
 
+/// The handlers [`report_faults`] installs: each passes its vector and the
+/// processor's frame to [`early_fault`] on the interrupted stack.
+macro_rules! early_handlers {
+    ($($name:ident $vector:literal),*) => {
+        $(
+            #[unsafe(naked)]
+            extern "C" fn $name() {
+                naked_asm!(
+                    "mov rdi, {vector}",
+                    "mov rsi, rsp",
+                    "and rsp, -16",
+                    "call {report}",
+                    "2: cli",
+                    "hlt",
+                    "jmp 2b",
+                    vector = const $vector,
+                    report = sym early_fault,
+                )
+            }
+        )*
+        const EARLY_HANDLERS: [extern "C" fn(); 32] = [$($name),*];
+    };
+}
+early_handlers!(early_0 0, early_1 1, early_2 2, early_3 3, early_4 4, early_5 5, early_6 6, early_7 7, early_8 8, early_9 9, early_10 10, early_11 11, early_12 12, early_13 13, early_14 14, early_15 15, early_16 16, early_17 17, early_18 18, early_19 19, early_20 20, early_21 21, early_22 22, early_23 23, early_24 24, early_25 25, early_26 26, early_27 27, early_28 28, early_29 29, early_30 30, early_31 31);
+
+static mut EARLY_IDT: [Gate; 32] = [Gate::MISSING; 32];
+static EARLY_FAULT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// An exception between the end of boot services and [`take_over`], where
+/// the firmware's own handlers are gone and a fault would otherwise reset
+/// the PC with nothing on the screen. A second one, raised while this one
+/// is reported, stops where it is.
+extern "sysv64" fn early_fault(vector: u64, frame: *const u64) -> ! {
+    if EARLY_FAULT.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        loop {
+            // SAFETY: stops this processor; nothing else runs.
+            unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
+        }
+    }
+    // Vectors that push an error code under the return address (Intel SDM
+    // Vol. 3A table 6-1).
+    let coded = matches!(vector, 8 | 10..=14 | 17 | 21 | 29 | 30);
+    // SAFETY: the processor pushed the frame at `frame` on the stack in use.
+    let (error, rip) = unsafe {
+        if coded {
+            (frame.read(), frame.add(1).read())
+        } else {
+            (0, frame.read())
+        }
+    };
+    let cr2: u64;
+    // SAFETY: CPL0 read of the fault address register.
+    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+    unsafe extern "C" {
+        static __ImageBase: u8;
+    }
+    crate::output::fatal(format_args!(
+        "unexpected x86 exception while taking the PC over from the firmware: vector={vector} \
+         error={error:#x} rip={rip:#x} (image+{:#x}) cr2={cr2:#x}",
+        rip.wrapping_sub(&raw const __ImageBase as u64),
+    ))
+}
+
+/// Report the first 32 vectors on the screen until [`take_over`] installs
+/// the terminal handlers.
+///
+/// # Safety
+/// Boot services have ended and interrupts are disabled; nothing else runs,
+/// and no later code before [`take_over`] enables interrupts.
+pub unsafe fn report_faults() {
+    let selector: u16;
+    // SAFETY: ring 0 after boot services, with interrupts disabled; the
+    // table is image data with no other references.
+    unsafe {
+        asm!("mov {0:x}, cs", out(reg) selector, options(nomem, nostack, preserves_flags));
+        let idt = &raw mut EARLY_IDT;
+        for (gate, handler) in (*idt).iter_mut().zip(EARLY_HANDLERS) {
+            *gate = Gate::new(handler as usize, selector);
+        }
+        let descriptor = Descriptor {
+            limit: (size_of::<[Gate; 32]>() - 1) as u16,
+            base: idt as u64,
+        };
+        asm!("lidt [{}]", in(reg) &descriptor, options(readonly, nostack, preserves_flags));
+    }
+}
+
 /// Take over the machine: fatal handlers, the controls the runtime requires
 /// and the new page tables.
 ///
