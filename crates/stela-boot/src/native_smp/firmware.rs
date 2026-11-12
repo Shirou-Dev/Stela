@@ -393,6 +393,24 @@ unsafe fn observe_controls(snapshot: &mut Snapshot, configure_pat: bool) -> Resu
     Ok(())
 }
 
+/// CPUID leaf 0xb's level shifts on this processor: the APIC ID bits that
+/// name the thread, and those that name the thread and the core (Intel SDM
+/// Vol. 3A 9.9.3; AMD Zen reports the same leaf). `None` where the leaf or
+/// either level is absent.
+fn apic_id_shifts() -> Option<(u32, u32)> {
+    if __cpuid(0).eax < 0xb {
+        return None;
+    }
+    let level = |index| {
+        let leaf = __cpuid_count(0xb, index);
+        (leaf.ebx & 0xffff != 0).then_some(((leaf.ecx >> 8) & 0xff, leaf.eax & 0x1f))
+    };
+    match (level(0)?, level(1)?) {
+        ((1, thread), (2, core)) => Some((thread, core)),
+        _ => None,
+    }
+}
+
 struct Callback {
     observation: UnsafeCell<Option<Result<Snapshot, Error>>>,
     complete: AtomicBool,
@@ -484,6 +502,17 @@ pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
             location,
             thread,
         });
+    }
+    if topology::locations_collide(&processors) {
+        // Firmware that answers the query and fills no coordinates: every
+        // processor at one package, core and thread, with its own APIC ID.
+        let shifts = apic_id_shifts();
+        topology::place_by_apic_id(&mut processors, shifts);
+        crate::output::arguments(format_args!(
+            "HOST PROCESSORS firmware lists {} processors at one location; placed by APIC ID \
+             (CPUID 0xb shifts {shifts:?})\n",
+            processors.len()
+        ));
     }
     let logical = topology::select(&processors).map_err(Error::Topology)?;
     let assignable =

@@ -904,6 +904,56 @@ fn duplicate_physical_thread_refuses() {
     assert_eq!(select(&cores), Err(Refusal::DuplicateThreadLocation));
 }
 
+/// Firmware that lists every processor at one package, core and thread
+/// with distinct APIC IDs: the IDs place them, by CPUID leaf 0xb's shifts
+/// where the processor has them and as one core each where it does not.
+#[test]
+fn processors_the_firmware_puts_at_one_location_are_placed_by_apic_id() {
+    let listed = || {
+        let mut cores: Vec<_> = (0..6).map(|number| processor(number, 0, 0, 0)).collect();
+        cores[0].flags |= BSP;
+        for (core, apic) in cores.iter_mut().zip([0u64, 1, 2, 3, 0x10, 0x11]) {
+            core.apic_id = apic;
+        }
+        cores
+    };
+    let mut cores = listed();
+    assert!(locations_collide(&cores));
+    // One thread bit, four bits of thread and core: two packages.
+    place_by_apic_id(&mut cores, Some((1, 4)));
+    assert!(!locations_collide(&cores));
+    let placed: Vec<_> = cores
+        .iter()
+        .map(|core| (core.location.package, core.location.core, core.thread))
+        .collect();
+    assert_eq!(
+        placed,
+        [
+            (0, 0, 0),
+            (0, 0, 1),
+            (0, 1, 0),
+            (0, 1, 1),
+            (1, 0, 0),
+            (1, 0, 1)
+        ]
+    );
+    assert_eq!(physical_cores(&cores), 3);
+    // The BSP, then one thread of each other core, then the second threads.
+    assert_eq!(select(&cores), Ok(vec![0, 2, 4, 1, 3, 5]));
+
+    for shifts in [None, Some((5, 4)), Some((0, 32))] {
+        let mut cores = listed();
+        place_by_apic_id(&mut cores, shifts);
+        assert_eq!(physical_cores(&cores), 6, "{shifts:?}");
+        assert_eq!(select(&cores), Ok(vec![0, 1, 2, 3, 4, 5]));
+    }
+    // A duplicate APIC ID is not a location fault and is not placed over.
+    let mut cores = listed();
+    cores[1].apic_id = 0;
+    assert!(!locations_collide(&cores));
+    assert_eq!(select(&cores), Err(Refusal::DuplicateApicId));
+}
+
 #[test]
 fn a_missing_floor_names_each_feature() {
     let baseline = native_snapshot();

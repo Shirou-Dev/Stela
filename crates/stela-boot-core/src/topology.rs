@@ -621,6 +621,40 @@ pub enum Refusal {
     InvalidAssignment,
 }
 
+/// Whether two listed processors share one package, core and thread while
+/// every APIC ID is distinct: firmware that fills no usable coordinates.
+pub fn locations_collide(processors: &[Processor]) -> bool {
+    bootstrap_index(processors) == Err(Refusal::DuplicateThreadLocation)
+}
+
+/// Place every processor by its APIC ID, as Linux does, for firmware whose
+/// coordinates [`locations_collide`]. `shifts` are CPUID leaf 0xb's two
+/// level shifts from the bootstrap processor: the bits of an APIC ID that
+/// name the thread, and those that name the thread and the core. Without
+/// them every APIC ID is a core of its own. The records become the
+/// three-level kind, which these coordinates are.
+pub fn place_by_apic_id(processors: &mut [Processor], shifts: Option<(u32, u32)>) {
+    let shifts = shifts.filter(|&(thread, core)| thread <= core && core < 32);
+    for processor in processors {
+        let id = processor.apic_id;
+        let (package, core, thread) = match shifts {
+            Some((thread, core)) => (
+                id >> core,
+                (id >> thread) & ((1 << (core - thread)) - 1),
+                id & ((1 << thread) - 1),
+            ),
+            None => (0, id, 0),
+        };
+        processor.location = Location {
+            package: package as u32,
+            core: core as u32,
+            ..Location::default()
+        };
+        processor.thread = thread as u32;
+        processor.topology_version = 1;
+    }
+}
+
 fn bootstrap_index(processors: &[Processor]) -> Result<usize, Refusal> {
     let mut bsp = None;
     for (index, processor) in processors.iter().enumerate() {
