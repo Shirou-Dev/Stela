@@ -1084,6 +1084,14 @@ impl Request {
             Action::UpdateOs => self.update_os(environment, record),
             Action::NextBoot(next) => self.next_boot(environment, &record, next),
             Action::Configure => {
+                // Without a terminal nothing is asked, so a run that names
+                // no setting has nothing to write.
+                ensure!(
+                    environment.ui.interactive() || settings::named(&self),
+                    "name a setting to change, such as --wifi SSID, --ipv4 ADDRESS/PREFIX, \
+                     --dns SERVERS or --usb4-allow UUID; on a terminal, {} asks for each",
+                    fix(&self.usb, "settings")
+                );
                 self.read_wifi_passphrase(environment.ui)?;
                 machines::configure(environment, &self)
             }

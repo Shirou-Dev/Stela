@@ -6243,6 +6243,21 @@ fn journey_settings_change_the_wifi_and_cancel_changes_nothing() {
 }
 
 #[test]
+fn settings_without_a_terminal_and_without_a_setting_change_nothing() {
+    let f = made_by(Some(release::CURRENT));
+    let before = stick_files(&f);
+    let error = rerun(&f, |c| c.action = Action::Configure)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with("name a setting to change, such as --wifi SSID"),
+        "{error}"
+    );
+    assert!(error.contains("`stela settings` asks"), "{error}");
+    assert_eq!(stick_files(&f), before);
+}
+
+#[test]
 fn journey_several_sticks_are_chosen_from_and_quit_changes_nothing() {
     let mut f = made_by(Some(release::CURRENT));
     let mut second = disk("disk6", &[("EFI", None)]);
