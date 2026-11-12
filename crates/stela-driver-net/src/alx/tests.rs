@@ -573,6 +573,75 @@ fn stop_resets_the_mac_and_refuses_further_frames() {
     assert!(matches!(alx.receive(), Err(LinkError::Adapter(_))));
 }
 
+/// A dropped adapter halts: queues and MAC off before the MAC and DMA
+/// reset, within 2 ms of waits. A reset that never completes keeps the
+/// rings; a function that left the bus gets no write.
+#[test]
+fn dropping_an_adapter_halts_it_within_an_exit_and_a_lost_one_gets_no_write() {
+    let mut fixture = Fixture::new();
+    let (clock, elapsed) = crate::timing::counted_model(Clock {
+        ticks_per_microsecond: 1,
+    });
+    let alx = Alx::bring_up(
+        Peer(fixture.model.clone()),
+        clock,
+        Fixture::chip(0x1091, 0),
+        &mut fixture.dma,
+        1,
+        String::from("peer"),
+    )
+    .unwrap();
+    fixture.model.borrow_mut().writes.clear();
+    let before = elapsed.get();
+    drop(alx);
+    assert!(elapsed.get() - before < 2_000, "{}", elapsed.get() - before);
+    {
+        let model = fixture.model.borrow();
+        let at = |found: &dyn Fn(usize, u32) -> bool| {
+            model
+                .writes
+                .iter()
+                .position(|&(offset, value)| found(offset, value))
+                .unwrap()
+        };
+        let receive = at(&|offset, value| offset == RXQ0 && value & RXQ0_EN == 0);
+        let transmit = at(&|offset, value| offset == TXQ0 && value & TXQ0_EN == 0);
+        let mac = at(&|offset, value| {
+            offset == MAC_CTRL && value & (MAC_CTRL_RX_EN | MAC_CTRL_TX_EN) == 0
+        });
+        let reset = at(&|offset, value| offset == MASTER && value & MASTER_DMA_MAC_RST != 0);
+        assert!(receive < transmit && transmit < mac && mac < reset);
+    }
+    // A MAC that never goes idle fails the halt before any reset.
+    let alx = fixture.attach(Fixture::chip(0x1091, 0)).unwrap();
+    fixture
+        .model
+        .borrow_mut()
+        .registers
+        .insert(MAC_STS, MAC_STS_IDLE);
+    fixture.model.borrow_mut().writes.clear();
+    drop(alx);
+    assert!(
+        !fixture
+            .model
+            .borrow()
+            .writes
+            .iter()
+            .any(|&(offset, value)| offset == MASTER && value & MASTER_DMA_MAC_RST != 0)
+    );
+    // A lost function reads all ones.
+    fixture.model.borrow_mut().registers.remove(&MAC_STS);
+    let alx = fixture.attach(Fixture::chip(0x1091, 0)).unwrap();
+    fixture
+        .model
+        .borrow_mut()
+        .registers
+        .insert(MASTER, u32::MAX);
+    fixture.model.borrow_mut().writes.clear();
+    drop(alx);
+    assert!(fixture.model.borrow().writes.is_empty());
+}
+
 #[test]
 fn revision_a_cr_parts_keep_aspm_off_across_the_mac_reset() {
     let mut fixture = Fixture::new();

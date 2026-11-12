@@ -37,6 +37,39 @@ pub(crate) fn model(nominal: Clock) -> Timing {
     .expect("isolated timing model")
 }
 
+/// [`model`], with the virtual microseconds its minimum delays waited.
+#[cfg(test)]
+pub(crate) fn counted_model(nominal: Clock) -> (Timing, Rc<core::cell::Cell<u64>>) {
+    use core::cell::Cell;
+    struct ModelMinimum {
+        elapsed: Rc<Cell<u64>>,
+    }
+    // SAFETY: explicit isolated virtual-time model, never native timing permission.
+    unsafe impl Timer for ModelMinimum {
+        fn check(&self) -> Result<(), crate::bus::pci::power::Error> {
+            Ok(())
+        }
+        fn wait_us(&self, us: u64) -> Result<(), crate::bus::pci::power::Error> {
+            let next = self
+                .elapsed
+                .get()
+                .checked_add(us)
+                .ok_or(crate::bus::pci::power::Error::Clock)?;
+            self.elapsed.set(next);
+            Ok(())
+        }
+    }
+    let elapsed = Rc::new(Cell::new(0));
+    let timing = Timing::checked(
+        nominal,
+        Rc::new(ModelMinimum {
+            elapsed: elapsed.clone(),
+        }),
+    )
+    .expect("isolated timing model");
+    (timing, elapsed)
+}
+
 #[cfg(test)]
 pub(crate) struct RefusedMinimum {
     _nominal: Clock,
