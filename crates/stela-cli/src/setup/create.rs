@@ -984,7 +984,7 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         let found = found.with_context(|| format!("this computer lists no disk {disk}"))?;
         ensure!(
             found.erasable(),
-            "{disk} ({}) is an internal disk; setup erases only a removable USB",
+            "{disk} ({}) is an internal disk; stela erases only a removable USB stick",
             found.name
         );
         ensure!(
@@ -1022,7 +1022,7 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         if !command.confirmed && !typed_back {
             ensure!(
                 environment.ui.interactive(),
-                "setup cannot ask before erasing {disk} ({}, {}) without a terminal; pass \
+                "stela cannot ask before erasing {disk} ({}, {}) without a terminal; pass \
                  --confirm-disk with its model or size to erase it",
                 found.name,
                 host::size_text(found.bytes)
@@ -1286,9 +1286,14 @@ fn confirm_erase(environment: &Environment<'_>, disk: &host::Disk) -> Result<()>
         disk.name,
         host::size_text(disk.bytes)
     );
+    // Escape is a no.
+    let accepted = match environment.ui.confirm(&question) {
+        Err(error) if super::ui::cancelled(&error) => false,
+        answer => answer?,
+    };
     ensure!(
-        environment.ui.confirm(&question)?,
-        "{} was not erased; setup stopped",
+        accepted,
+        "{} was not erased; nothing was changed",
         disk.identifier
     );
     Ok(())

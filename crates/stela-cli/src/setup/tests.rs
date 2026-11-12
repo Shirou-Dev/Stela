@@ -1133,15 +1133,34 @@ fn setup_erases_usb_and_refuses_internal_disk() {
         .to_string();
     assert!(error.contains("pass --ipsw"), "{error}");
     // Without a terminal and without the model or size typed back, a USB
-    // is not erased.
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        let mut unasked = command(&f, Path::new("disk5"));
-        unasked.ipsw = None;
-        let error = setup(&environment(&f.host), unasked)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("without a terminal"), "{error}");
+    // is not erased; --yes does not change that.
+    let mut unasked = command(&f, Path::new("disk5"));
+    unasked.ipsw = None;
+    unasked.yes = true;
+    let error = setup(&environment(&f.host), unasked)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("without a terminal"), "{error}");
+    assert!(error.contains("--confirm-disk"), "{error}");
+    // On a terminal the erase is asked, and a no or Escape erases nothing.
+    let before = (snapshot(&f.esp), snapshot(&f.data));
+    for answer in ["no", "cancel"] {
+        let person = ui::tests::Scripted::new(&[answer]);
+        let mut asked = command(&f, Path::new("disk5"));
+        asked.ipsw = None;
+        let environment = Environment {
+            ui: &person,
+            ..environment(&f.host)
+        };
+        let error = setup(&environment, asked).unwrap_err().to_string();
+        assert_eq!(error, "disk5 was not erased; nothing was changed");
+        assert!(
+            person.transcript().starts_with("? Erase disk5 ("),
+            "{}",
+            person.transcript()
+        );
     }
+    assert_eq!((snapshot(&f.esp), snapshot(&f.data)), before);
 }
 
 #[test]
