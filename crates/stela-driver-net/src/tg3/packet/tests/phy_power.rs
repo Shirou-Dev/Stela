@@ -197,7 +197,7 @@ fn independent_peer_refuses_power_writes_with_live_dma_or_missing_drain() {
     for engines_running in [false, true] {
         let (mut packet, _, domain, peer) = attach();
         if !engines_running {
-            packet.hardware.packet_stop().unwrap();
+            stela_driver_base::stepped::block_on(packet.hardware.packet_stop()).unwrap();
         }
         let mut p = peer.lock().unwrap();
         let before = p.phy_writes.len();

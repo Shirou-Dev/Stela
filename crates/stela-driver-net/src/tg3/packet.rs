@@ -11,6 +11,7 @@ use crate::{
     check_frame,
 };
 use alloc::{sync::Arc, vec::Vec};
+use stela_driver_base::stepped::block_on;
 mod memory;
 use super::geometry::Geometry;
 #[cfg(test)]
@@ -109,14 +110,14 @@ impl<R: Registers, D: Delay> Packet<R, D> {
             received: Vec::new(),
         };
         let result = (|| {
-            let board = value.hardware.packet_prepare()?;
+            let board = block_on(value.hardware.packet_prepare())?;
             value.identified = true;
             value.mac = board.mac;
             value.board = Some(board);
             let asic = value.hardware.identity().ok_or(Error::NotIdentified)?.asic;
             value.geometry = Geometry::of(asic);
             value.rx_producer = value.geometry.rx - 1;
-            value.hardware.packet_reset(board)?;
+            block_on(value.hardware.packet_reset(board))?;
             let ring_limit = Geometry::ring_limit(asic);
             match Memory::new(pages, value.domain.clone(), value.geometry, ring_limit) {
                 Ok(memory) => value.memory = Some(memory),
@@ -126,9 +127,11 @@ impl<R: Registers, D: Delay> Packet<R, D> {
                 }
             }
             let addresses = value.memory.as_ref().unwrap().addresses()?;
-            value
-                .hardware
-                .packet_start(board, addresses, &value.receive_filter)?;
+            block_on(
+                value
+                    .hardware
+                    .packet_start(board, addresses, &value.receive_filter),
+            )?;
             Ok(())
         })();
         match result {
@@ -178,7 +181,7 @@ impl<R: Registers, D: Delay> Packet<R, D> {
     pub fn set_receive_filter(&mut self, filter: ReceiveFilter) -> Result<(), Error> {
         self.check()?;
         filter.validate()?;
-        match self.hardware.packet_receive_filter(&filter) {
+        match block_on(self.hardware.packet_receive_filter(&filter)) {
             Ok(()) => {
                 self.receive_filter = filter;
                 Ok(())
@@ -259,11 +262,11 @@ impl<R: Registers, D: Delay> Packet<R, D> {
         let clean = self.failure.is_none() && self.hardware.failure().is_none();
         let result = (|| {
             let unload = if clean {
-                self.hardware.packet_unload_begin()
+                block_on(self.hardware.packet_unload_begin())
             } else {
                 Ok(())
             };
-            self.hardware.packet_stop()?;
+            block_on(self.hardware.packet_stop())?;
             // SAFETY: real engines acknowledged stopped, original BME clear;
             // isolated domain and every packet/status target remain.
             unsafe {
@@ -271,7 +274,7 @@ impl<R: Registers, D: Delay> Packet<R, D> {
             }
             unload?;
             if clean {
-                self.hardware.packet_unload_end()?;
+                block_on(self.hardware.packet_unload_end())?;
             }
             Ok(())
         })();
@@ -296,7 +299,7 @@ impl<R: Registers, D: Delay> Packet<R, D> {
         self.stop()?;
         self.state = State::Faulted;
         self.carrier_up = false;
-        match self.hardware.power_down_packet_phy() {
+        match block_on(self.hardware.power_down_packet_phy()) {
             Ok(()) => {
                 self.state = State::PhySuspended;
                 Ok(())
@@ -371,15 +374,17 @@ impl<R: Registers, D: Delay> Packet<R, D> {
     }
     fn rebuild_after_drain(&mut self) -> Result<(), Error> {
         let board = self.board.ok_or(Error::NotIdentified)?;
-        self.hardware.packet_reset(board)?;
+        block_on(self.hardware.packet_reset(board))?;
         // SAFETY: the old epoch is fully stopped/drained and the chip reset;
         // the same real mappings remain, with no intervening new DMA source.
         unsafe {
             self.memory.as_mut().unwrap().reset_after_drain()?;
         }
         let addresses = self.memory.as_ref().unwrap().addresses()?;
-        self.hardware
-            .packet_start(board, addresses, &self.receive_filter)?;
+        block_on(
+            self.hardware
+                .packet_start(board, addresses, &self.receive_filter),
+        )?;
         self.tx_producer = 0;
         self.tx_consumer = 0;
         self.rx_producer = self.geometry.rx - 1;
@@ -447,7 +452,7 @@ impl<R: Registers, D: Delay> Link for Packet<R, D> {
         if self.check().is_err() {
             return false;
         }
-        match self.hardware.packet_carrier() {
+        match block_on(self.hardware.packet_carrier()) {
             Ok(carrier) => {
                 if !carrier && self.carrier_up {
                     self.carrier_up = false;

@@ -11,6 +11,7 @@ use crate::bus::pci::{
     Capabilities, ConfigError, ConfigFailure, ConfigSpace, capability::Transport,
 };
 use core::cell::{Cell, RefCell};
+use stela_driver_base::stepped::block_on;
 
 const PCI_STATUS_CAP_LIST: u32 = 1 << 20;
 const PCI_EXPRESS: u8 = 0x10;
@@ -90,29 +91,30 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             })
         })
     }
-    pub(super) fn nvram_lock(&mut self) -> Result<(), Error> {
+    pub(super) async fn nvram_lock(&mut self) -> Result<(), Error> {
         self.write(NVRAM_SWARB, SWARB_REQUEST)?;
-        let result = (|| {
+        let result = async {
             for _ in 0..8000 {
                 if self.read(NVRAM_SWARB)? & SWARB_GRANTED != 0 {
                     return Ok(());
                 }
-                self.wait(20)?;
+                self.wait(20).await?;
             }
             Err(Error::NvramTimeout)
-        })();
+        }
+        .await;
         if result.is_err() {
             let cleanup = self.flush(NVRAM_SWARB, SWARB_RELEASE);
             self.cleanup(cleanup);
         }
         result
     }
-    fn firmware_after_reset(&mut self) -> Result<(), Error> {
+    async fn firmware_after_reset(&mut self) -> Result<(), Error> {
         for _ in 0..100_000 {
             if self.sram(FIRMWARE_MBOX, None)? == !FIRMWARE_MAGIC {
                 return Ok(());
             }
-            self.wait(10)?;
+            self.wait(10).await?;
         }
         Err(Error::FirmwareTimeout)
     }
@@ -124,13 +126,16 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     /// failure is terminal and keeps the config/BAR owner, including
     /// uncertain held locks.
     pub fn reset_core(&mut self) -> Result<(), Error> {
+        block_on(self.reset_core_steps())
+    }
+    pub(super) async fn reset_core_steps(&mut self) -> Result<(), Error> {
         if self.failure.is_some() {
             return Err(Error::Poisoned);
         }
         self.timer_ready()?;
         let identity = self.identity.ok_or(Error::NotIdentified)?;
         self.core_reset_complete = false;
-        let result = (|| {
+        let result = async {
             self.observe_management()?;
             let pcie = self.pcie_capability()?;
             let command = Self::checked(self.regs().config_read32(regs::COMMAND)?)? as u16;
@@ -138,7 +143,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 return Err(Error::ConfigDidNotLatch);
             }
             if !self.stopped {
-                self.stop_engines()?;
+                self.stop_engines_steps().await?;
             }
             // No new requester DMA can start while reset/bootcode state is
             // being rebuilt. The source saves/restores command using WORD
@@ -149,11 +154,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 return Err(Error::ConfigDidNotLatch);
             }
             // tg3_reset_hw: tg3_stop_fw, then tg3_write_sig_pre_reset.
-            self.stop_firmware()?;
+            self.stop_firmware().await?;
             self.sram(FIRMWARE_MBOX, Some(FIRMWARE_MAGIC))?;
             self.asf_driver_state(management::DRV_STATE_START)?;
-            self.nvram_lock()?;
-            if let Err(error) = self.lock(1) {
+            self.nvram_lock().await?;
+            if let Err(error) = self.lock(1).await {
                 let cleanup = self.flush(NVRAM_SWARB, SWARB_RELEASE);
                 self.cleanup(cleanup);
                 return Err(error);
@@ -185,9 +190,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             // Do not MMIO-read here: decode may disappear until PCI config is
             // restored. The source requires both 120-us waits/config flush.
             self.write(GRC_MISC_CFG, CORE_RESET | RESET_PCIE_CLOCK)?;
-            self.wait(120)?;
+            self.wait(120).await?;
             Self::checked(self.regs().config_read32(regs::COMMAND)?)?;
-            self.wait(120)?;
+            self.wait(120).await?;
             let control = Self::checked(self.regs().config_read32(pcie + 8)?)? as u16;
             self.regs().config_write16(pcie + 8, control & !0x0810)?;
             if Self::checked(self.regs().config_read32(pcie + 8)?)? & 0x0810 != 0 {
@@ -214,13 +219,13 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             if self.read(MEMARB_MODE)? & ENABLE == 0 {
                 return Err(Error::ConfigDidNotLatch);
             }
-            self.firmware_after_reset()?;
+            self.firmware_after_reset().await?;
             self.write(GRC_MODE, MAC_DATA_SWAP)?;
             self.flush(MAC_MODE, 0)?;
-            self.wait(40)?;
+            self.wait(40).await?;
             self.unlock(1)?;
             self.flush(MAC_MI_MODE, 0x8000)?; // CPMU's 500-kHz MDIO clock.
-            self.wait(80)?;
+            self.wait(80).await?;
             if identity.asic.legacy() {
                 let value = self.read(POST_RESET_PCIE)?;
                 self.write(POST_RESET_PCIE, value | PCIE_POST_RESET_FIX)?;
@@ -240,7 +245,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             // tg3_chip_reset reprobes the ASF setting bootcode left.
             self.observe_management()?;
             Ok(())
-        })();
+        }
+        .await;
         if result.is_ok() {
             self.core_reset_complete = true;
             self.stopped = false;

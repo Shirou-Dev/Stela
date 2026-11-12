@@ -135,7 +135,10 @@ fn unchanged_linux_aux_decode_and_mac_duplex_match_driver() {
                 p.mac.insert(0x400, before);
             }
             let admitted = speed != u32::MAX && !(speed == 1000 && duplex == 0);
-            assert_eq!(packet.hardware.packet_carrier().unwrap(), admitted);
+            assert_eq!(
+                stela_driver_base::stepped::block_on(packet.hardware.packet_carrier()).unwrap(),
+                admitted
+            );
             assert_eq!(
                 peer.lock().unwrap().mac[&0x400],
                 if admitted { after } else { before }

@@ -39,7 +39,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         Ok(())
     }
-    pub(super) fn bcm5762_board(&mut self) -> Result<Board, Error> {
+    pub(super) async fn bcm5762_board(&mut self) -> Result<Board, Error> {
         self.observe_management()?;
         let subsystem = self.bcm5762_subsystem()?;
         let config = self.sram(NIC_SRAM_DATA_CFG, None)?;
@@ -64,16 +64,16 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             | GRC_LCLCTRL_AUTO_SEEPROM
             | (self.read(GRC_LOCAL_CTRL)? & GRC_LCLCTRL_GPIO_UART_SEL);
         self.bcm5762_write(GRC_LOCAL_CTRL, local)?;
-        self.wait(100)?;
+        self.wait(100).await?;
         self.flush(
             GRC_EEPROM_ADDR,
             EEPROM_ADDR_FSM_RESET | (EEPROM_DEFAULT_CLOCK_PERIOD << EEPROM_ADDR_CLKPERD_SHIFT),
         )?;
-        self.wait(1000)?;
+        self.wait(1000).await?;
         let saved_local = self.read(GRC_LOCAL_CTRL)?;
         self.bcm5762_write(GRC_LOCAL_CTRL, saved_local | GRC_LCLCTRL_AUTO_SEEPROM)?;
-        self.wait(100)?;
-        let nvcfg = self.nvram_configuration()?;
+        self.wait(100).await?;
+        let nvcfg = self.nvram_configuration().await?;
         if nvcfg & NVRAM_CFG1_5762VENDOR_MASK == 0 {
             return Err(Error::UnsupportedBoard);
         }
@@ -107,7 +107,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         // NVRAM arbitration/read commands, without address translation.
         // Requiring a recognized magic on Macronix too is conservative: the
         // donor's Macronix branch returns earlier without this extra check.
-        let magic = self.nvram_word(0, false, if macronix { 4096 } else { 0 })?;
+        let magic = self
+            .nvram_word(0, false, if macronix { 4096 } else { 0 })
+            .await?;
         if magic != TG3_EEPROM_MAGIC && magic & TG3_EEPROM_MAGIC_FW_MSK != TG3_EEPROM_MAGIC_FW {
             return Err(Error::UnsupportedBoard);
         }
@@ -117,8 +119,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if high >> 16 != 0x484b || !valid_mac(mac) {
             // 5762 is not 5717_PLUS: all functions use offset 0x7c.
             mac = decode_mac(
-                self.nvram_word(0x7c, false, 4096)?,
-                self.nvram_word(0x80, false, 4096)?,
+                self.nvram_word(0x7c, false, 4096).await?,
+                self.nvram_word(0x80, false, 4096).await?,
             );
         }
         if !super::board::usable_mac(mac) {

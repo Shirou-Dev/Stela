@@ -53,13 +53,13 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         Ok(())
     }
-    pub(in crate::tg3) fn packet_receive_filter(
+    pub(in crate::tg3) async fn packet_receive_filter(
         &mut self,
         filter: &ReceiveFilter,
     ) -> Result<(), Error> {
         self.check()?;
         filter.validate()?;
-        let result = (|| {
+        let result = async {
             let previous = self.read(MAC_RX_MODE)?;
             if previous & RX_MODE_ENABLE == 0 {
                 return Err(Error::ConfigDidNotLatch);
@@ -71,10 +71,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 if self.read(MAC_RX_MODE)? != value {
                     return Err(Error::ConfigDidNotLatch);
                 }
-                self.wait(10)?;
+                self.wait(10).await?;
             }
             Ok(())
-        })();
+        }
+        .await;
         // Partial hash/address/mode effects cannot become an acknowledged policy.
         self.record(result)
     }

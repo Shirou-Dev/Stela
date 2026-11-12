@@ -7,26 +7,26 @@
 use super::{board::Board, phy::Speed, regs::*, *};
 
 impl<R: Registers, D: Delay> Hardware<R, D> {
-    pub(in crate::tg3) fn packet_prepare(&mut self) -> Result<Board, Error> {
-        self.packet_identity()?;
+    pub(in crate::tg3) async fn packet_prepare(&mut self) -> Result<Board, Error> {
+        self.packet_identity().await?;
         // Reject inherited requester DMA before allocating or publishing RAM.
         if self.regs().config_read32(4)? & 4 != 0 {
             return Err(Error::UnsupportedBoard);
         }
-        self.board()
+        self.board().await
     }
-    pub(in crate::tg3) fn packet_reset(&mut self, board: Board) -> Result<(), Error> {
+    pub(in crate::tg3) async fn packet_reset(&mut self, board: Board) -> Result<(), Error> {
         self.timer_ready()?;
         // PHY/config access is legal in the stopped packet epoch. No packet
         // engine is enabled by reopening this serialized register transport.
         self.stopped = false;
         // tg3_start: the APE hears of the driver before tg3_init_hw.
-        self.ape_driver_start()?;
-        self.initialize_phy(board)?;
-        self.reset_core()?;
+        self.ape_driver_start().await?;
+        self.initialize_phy(board).await?;
+        self.reset_core_steps().await?;
         // Re-observe post-bootcode signed board identity; never keep a
         // guessed MAC/management setting across reset.
-        let observed = self.board()?;
+        let observed = self.board().await?;
         if observed.mac != board.mac
             || observed.apd != board.apd
             || observed.capacitive != board.capacitive
@@ -46,7 +46,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.sram(at + 8, Some(count << 16))?;
         Ok(())
     }
-    pub(in crate::tg3) fn packet_start(
+    pub(in crate::tg3) async fn packet_start(
         &mut self,
         board: Board,
         addresses: [u64; 4],
@@ -141,7 +141,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 enabled = true;
                 break;
             }
-            self.wait(10)?;
+            self.wait(10).await?;
         }
         if !enabled {
             return Err(Error::ConfigDidNotLatch);
@@ -254,7 +254,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             SNDDATAI_STATSCTRL,
             SNDDATAI_SCTRL_ENABLE | SNDDATAI_SCTRL_FASTUPD,
         )?;
-        self.stop_block(HOSTCC_MODE)?;
+        self.stop_block(HOSTCC_MODE).await?;
         // Interrupts stay masked. Time and max-frame coalescing cause
         // status DMA even when the caller hasn't requested a NOW update yet.
         for (at, value) in [
@@ -295,9 +295,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 | MAC_MODE_RXSTAT_CLEAR
                 | MAC_MODE_TXSTAT_CLEAR,
         )?;
-        self.wait(40)?;
+        self.wait(40).await?;
         self.flush(GRC_LOCAL_CTRL, board.local)?;
-        self.wait(100)?;
+        self.wait(100).await?;
         self.flush(
             WDMAC_MODE,
             WDMAC_MODE_ENABLE
@@ -311,7 +311,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 | WDMAC_MODE_LNGREAD_ENAB
                 | WDMAC_MODE_STATUS_TAG_FIX,
         )?;
-        self.wait(40)?;
+        self.wait(40).await?;
         // BCM5762 uses a different register and rewrites the source
         // margin/watermark fields. BCM5717, BCM5719 after A0, BCM5720 and BCM5761
         // only add FIFO_OFLW_FIX.
@@ -371,7 +371,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 | RDMAC_MODE_FIFO_LONG_BURST
                 | if legacy { 0 } else { RDMAC_MODE_IPV6_LSO_EN },
         )?;
-        self.wait(40)?;
+        self.wait(40).await?;
         // Observe the residual channel lengths before applying 5719's or
         // 5720's documented workaround; no synthetic normal-channel assumption.
         for index in 0..if bcm5762 || legacy || bcm5717 || class_57765 {
@@ -432,7 +432,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             MAC_TX_MODE,
             tx_mode | TX_MODE_ENABLE | TX_MODE_MBUF_LOCKUP_FIX,
         )?;
-        self.wait(100)?;
+        self.wait(100).await?;
         // Restore the requested table/mode before any new receive DMA can
         // start; the same policy survives full restart and held-D0 PHY resume.
         self.packet_filter_tables(filter)?;
@@ -447,7 +447,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         } else {
             self.flush(MAC_RX_MODE, rx_mode)?;
         }
-        self.wait(10)?;
+        self.wait(10).await?;
         self.write(MAC_LED_CTRL, board.led)?;
         self.write(MAC_MI_STAT, MAC_MI_STAT_LNKSTAT_ATTN_ENAB)?;
         // 57765_CLASS keeps one frame, the others two.
@@ -465,7 +465,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             self.write(MAC_RCV_RULE_0 + index * 8, 0)?;
             self.write(MAC_RCV_VALUE_0 + index * 8, 0)?;
         }
-        self.initialize_phy(board)?;
+        self.initialize_phy(board).await?;
         self.management_started()?;
         self.stopped = false;
         Ok(())
@@ -475,8 +475,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     fn statistics_attention(asic: Asic) -> bool {
         matches!(asic, Asic::Bcm5717 | Asic::Bcm5720 | Asic::Bcm5762)
     }
-    pub(in crate::tg3) fn packet_carrier(&mut self) -> Result<bool, Error> {
+    pub(in crate::tg3) async fn packet_carrier(&mut self) -> Result<bool, Error> {
         self.copper_carrier()
+            .await
             .map(|speed: Option<Speed>| speed.is_some())
     }
     pub(in crate::tg3) fn request_status(&mut self) -> Result<(), Error> {
@@ -551,23 +552,23 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     }
     /// tg3_halt's `tg3_stop_fw` and `tg3_write_sig_pre_reset(RESET_KIND_SHUTDOWN)`,
     /// before the engines stop.
-    pub(in crate::tg3) fn packet_unload_begin(&mut self) -> Result<(), Error> {
-        self.stop_firmware()?;
+    pub(in crate::tg3) async fn packet_unload_begin(&mut self) -> Result<(), Error> {
+        self.stop_firmware().await?;
         self.asf_driver_state(super::management::DRV_STATE_UNLOAD)
     }
     /// tg3_halt's `tg3_write_sig_post_reset(RESET_KIND_SHUTDOWN)` and
     /// `tg3_power_down_prepare`'s APE UNLOAD, after the engines stopped: the
     /// management firmware has the port to itself again.
-    pub(in crate::tg3) fn packet_unload_end(&mut self) -> Result<(), Error> {
+    pub(in crate::tg3) async fn packet_unload_end(&mut self) -> Result<(), Error> {
         self.asf_driver_state(super::management::DRV_STATE_UNLOAD_DONE)?;
-        self.ape_driver_unload()
+        self.ape_driver_unload().await
     }
-    pub(in crate::tg3) fn packet_stop(&mut self) -> Result<(), Error> {
+    pub(in crate::tg3) async fn packet_stop(&mut self) -> Result<(), Error> {
         // A poisoned submission epoch cannot use normal helpers, but
         // stop accesses remain legal for containment. Failure never retires.
         // Re-observe every engine even after a partially failed core reset;
         // an old stopped bit cannot certify bootcode's subsequent effects.
-        self.stop_engines_inner()?;
+        self.stop_engines_inner().await?;
         self.stopped = true;
         let command = Self::checked(self.regs().config_read32(4)?)? as u16;
         self.regs().config_write16(4, command & !4)?;

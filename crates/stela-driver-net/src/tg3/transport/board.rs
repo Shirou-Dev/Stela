@@ -23,7 +23,7 @@ pub(in crate::tg3) struct Board {
 impl<R: Registers, D: Delay> Hardware<R, D> {
     /// Only matching copper BCM5720/5761/5762 A0 or BCM5717/5718/5719
     /// after A0 is a packet candidate.
-    pub(super) fn packet_identity(&mut self) -> Result<Identity, Error> {
+    pub(super) async fn packet_identity(&mut self) -> Result<Identity, Error> {
         self.timer_ready()?;
         // Read static PCI/subsystem denials before identify changes host/MMIO
         // access controls. PCI table membership alone never authorizes packets.
@@ -68,15 +68,15 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             return Err(Error::UnsupportedRevision);
         }
         self.observe_management()?;
-        self.read_phy_identity()?;
+        self.phy_identity().await?;
         Ok(id)
     }
-    pub(super) fn board(&mut self) -> Result<Board, Error> {
+    pub(super) async fn board(&mut self) -> Result<Board, Error> {
         if self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5761 {
-            return self.bcm5761_board();
+            return self.bcm5761_board().await;
         }
         if self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5762 {
-            return self.bcm5762_board();
+            return self.bcm5762_board().await;
         }
         self.observe_management()?;
         let config = self.sram(NIC_SRAM_DATA_CFG, None)?;
@@ -109,13 +109,13 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             // tg3_pwrsrc_switch_to_vmain outside the 5717 class: the local
             // control alone, with no GPIO lock or driver-present bits.
             self.flush(GRC_LOCAL_CTRL, local)?;
-            self.wait(100)?;
+            self.wait(100).await?;
         } else {
             // tg3_pwrsrc_switch_to_vmain: internal port, not BDF.
             // tg3_set_function_status keeps 5717/5719's driver-present bits
             // in the APE and 5720's in the CPMU.
-            self.lock(7)?;
-            let result = (|| {
+            self.lock(7).await?;
+            let result = async {
                 let identity = self.identity.unwrap();
                 let shift = TG3_APE_GPIO_MSG_SHIFT + 4 * u32::from(identity.function);
                 if matches!(identity.asic, Asic::Bcm5717 | Asic::Bcm5719) {
@@ -127,9 +127,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                     self.flush(TG3_CPMU_DRV_STATUS, (status & !(3 << shift)) | (1 << shift))?;
                 }
                 self.flush(GRC_LOCAL_CTRL, local)?;
-                self.wait(100)?;
+                self.wait(100).await?;
                 Ok(())
-            })();
+            }
+            .await;
             let release = self.unlock(7);
             self.combine(result, release)?;
         }
@@ -137,13 +138,13 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             GRC_EEPROM_ADDR,
             EEPROM_ADDR_FSM_RESET | (EEPROM_DEFAULT_CLOCK_PERIOD << EEPROM_ADDR_CLKPERD_SHIFT),
         )?;
-        self.wait(1000)?;
+        self.wait(1000).await?;
         let saved_local = self.read(GRC_LOCAL_CTRL)?;
         self.flush(GRC_LOCAL_CTRL, saved_local | GRC_LCLCTRL_AUTO_SEEPROM)?;
-        self.wait(100)?;
+        self.wait(100).await?;
         // Decode the pinstrap, including Atmel non-power-of-two pages.
         // No unrecognized NVM is treated as a functional firmware source.
-        let nvcfg = self.nvram_configuration()?;
+        let nvcfg = self.nvram_configuration().await?;
         let Some(kind) = nvram_kind(asic, nvcfg & NVRAM_CFG1_5752VENDOR_MASK) else {
             return Err(Error::UnsupportedBoard);
         };
@@ -178,8 +179,12 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             } else {
                 0x7c
             };
-            let high = self.nvram_word(offset, atmel && matches!(page, 264 | 528), page)?;
-            let low = self.nvram_word(offset + 4, atmel && matches!(page, 264 | 528), page)?;
+            let high = self
+                .nvram_word(offset, atmel && matches!(page, 264 | 528), page)
+                .await?;
+            let low = self
+                .nvram_word(offset + 4, atmel && matches!(page, 264 | 528), page)
+                .await?;
             mac = decode_mac(high, low);
         }
         if !usable_mac(mac) {
@@ -187,7 +192,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         let led = super::board::decode_led(cfg2)?;
         let phy_otp = if asic == Asic::Bcm5784 {
-            self.bcm5784_board()?
+            self.bcm5784_board().await?
         } else {
             0
         };
@@ -208,7 +213,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     /// (`TG3_OTP_DEFAULT` when unreadable), and a refusal of the
     /// ASPM_WORKAROUND board, whose per-link L1 threshold changes are not
     /// implemented.
-    fn bcm5784_board(&mut self) -> Result<u32, Error> {
+    async fn bcm5784_board(&mut self) -> Result<u32, Error> {
         if self.sram(NIC_SRAM_DATA_CFG_3, None)? & NIC_SRAM_ASPM_DEBOUNCE != 0 {
             return Err(Error::UnsupportedBoard);
         }
@@ -219,39 +224,40 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         self.clkreq_bug.get_or_insert(control & 0x100 != 0);
         self.write(OTP_MODE, OTP_MODE_OTP_THRU_GRC)?;
-        let otp = (|| {
-            if !self.otp_command(OTP_CTRL_OTP_CMD_INIT)? {
+        let otp = async {
+            if !self.otp_command(OTP_CTRL_OTP_CMD_INIT).await? {
                 return Ok(0);
             }
             self.write(OTP_ADDRESS, OTP_ADDRESS_MAGIC1)?;
-            if !self.otp_command(OTP_CTRL_OTP_CMD_READ)? {
+            if !self.otp_command(OTP_CTRL_OTP_CMD_READ).await? {
                 return Ok(0);
             }
             let top = self.regs().read32(OTP_READ_DATA)?;
             self.write(OTP_ADDRESS, OTP_ADDRESS_MAGIC2)?;
-            if !self.otp_command(OTP_CTRL_OTP_CMD_READ)? {
+            if !self.otp_command(OTP_CTRL_OTP_CMD_READ).await? {
                 return Ok(0);
             }
             let bottom = self.regs().read32(OTP_READ_DATA)?;
             Ok::<_, Error>(((top & 0xffff) << 16) | (bottom >> 16))
-        })()?;
+        }
+        .await?;
         Ok(if otp == 0 { TG3_OTP_DEFAULT } else { otp })
     }
     /// `tg3_issue_otp_command`: up to 1 ms for the command to finish.
-    fn otp_command(&mut self, command: u32) -> Result<bool, Error> {
+    async fn otp_command(&mut self, command: u32) -> Result<bool, Error> {
         self.write(OTP_CTRL, command | OTP_CTRL_OTP_CMD_START)?;
         self.write(OTP_CTRL, command)?;
         for _ in 0..100 {
             if self.read(OTP_STATUS)? & OTP_STATUS_CMD_DONE != 0 {
                 return Ok(true);
             }
-            self.wait(10)?;
+            self.wait(10).await?;
         }
         Ok(self.read(OTP_STATUS)? & OTP_STATUS_CMD_DONE != 0)
     }
-    pub(super) fn nvram_configuration(&mut self) -> Result<u32, Error> {
-        self.nvram_lock()?;
-        let result = (|| {
+    pub(super) async fn nvram_configuration(&mut self) -> Result<u32, Error> {
+        self.nvram_lock().await?;
+        let result = async {
             let access = self.read(NVRAM_ACCESS)?;
             self.flush(NVRAM_ACCESS, access | ACCESS_ENABLE)?;
             let config = self.read(NVRAM_CFG1)?;
@@ -275,16 +281,18 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 }
             }
             Ok(config)
-        })();
-        let disable = (|| {
+        }
+        .await;
+        let disable = async {
             let access = self.read(NVRAM_ACCESS)?;
             self.flush(NVRAM_ACCESS, access & !ACCESS_ENABLE)
-        })();
+        }
+        .await;
         let result = self.combine(result, disable);
         let release = self.flush(NVRAM_SWARB, SWARB_REQ_CLR1);
         self.combine(result, release)
     }
-    pub(super) fn nvram_word(
+    pub(super) async fn nvram_word(
         &mut self,
         offset: u32,
         translate: bool,
@@ -298,8 +306,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if address > NVRAM_ADDR_MSK || offset & 3 != 0 {
             return Err(Error::Bounds);
         }
-        self.nvram_lock()?;
-        let result = (|| {
+        self.nvram_lock().await?;
+        let result = async {
             let access = self.read(NVRAM_ACCESS)?;
             self.flush(NVRAM_ACCESS, access | ACCESS_ENABLE)?;
             self.write(NVRAM_ADDR, address)?;
@@ -308,19 +316,21 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 NVRAM_CMD_RD | NVRAM_CMD_GO | NVRAM_CMD_FIRST | NVRAM_CMD_LAST | NVRAM_CMD_DONE,
             )?;
             for _ in 0..10_000 {
-                self.wait(10)?;
+                self.wait(10).await?;
                 if self.read(NVRAM_CMD)? & NVRAM_CMD_DONE != 0 {
-                    self.wait(10)?;
+                    self.wait(10).await?;
                     // All-ones is legal NVRAM data; access errors remain errors.
                     return self.regs().read32(NVRAM_RDDATA);
                 }
             }
             Err(Error::NvramTimeout)
-        })();
-        let disable = (|| {
+        }
+        .await;
+        let disable = async {
             let access = self.read(NVRAM_ACCESS)?;
             self.flush(NVRAM_ACCESS, access & !ACCESS_ENABLE)
-        })();
+        }
+        .await;
         let result = self.combine(result, disable);
         let release = self.flush(NVRAM_SWARB, SWARB_REQ_CLR1);
         self.combine(result, release)

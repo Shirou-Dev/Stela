@@ -11,6 +11,7 @@
 //! ENABLE_APE is a property of the chip ([`super::super::ape`]); ASF
 //! follows the signed board configuration.
 use super::*;
+use stela_driver_base::stepped::block_on;
 
 const SRAM_DATA_SIGNATURE: u32 = 0xb54;
 const SRAM_DATA_CONFIG: u32 = 0xb58;
@@ -124,12 +125,12 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     }
     /// `tg3_wait_for_event_ack`: give the RX CPU up to 2.5 ms to take the
     /// previous event. Like Linux, the driver goes on when it does not.
-    fn wait_for_event_ack(&mut self) -> Result<(), Error> {
+    async fn wait_for_event_ack(&mut self) -> Result<(), Error> {
         for _ in 0..FW_EVENT_POLLS {
             if self.read(GRC_RX_CPU_EVENT)? & GRC_RX_CPU_DRIVER_EVENT == 0 {
                 break;
             }
-            self.wait(8)?;
+            self.wait(8).await?;
         }
         Ok(())
     }
@@ -140,20 +141,21 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     }
     /// `tg3_stop_fw`: ASF firmware without an APE pauses before the driver
     /// resets or halts the chip.
-    pub(super) fn stop_firmware(&mut self) -> Result<(), Error> {
+    pub(super) async fn stop_firmware(&mut self) -> Result<(), Error> {
         if !self.legacy_asf()? {
             return Ok(());
         }
-        self.wait_for_event_ack()?;
+        self.wait_for_event_ack().await?;
         self.sram(FW_CMD_MBOX, Some(FWCMD_NICDRV_PAUSE_FW))?;
         self.generate_firmware_event()?;
-        self.wait_for_event_ack()
+        self.wait_for_event_ack().await
     }
     /// `tg3_timer`'s ASF heartbeat for firmware without an APE: every two
     /// seconds, FWCMD_NICDRV_ALIVE3 with a five-second timeout, so the
     /// firmware checks the rings before it would reset a silent driver.
     /// The packet poll calls this; a timer with no retained interval
     /// cannot keep the beat, and such a function is refused at start.
+    /// Its one wait for the firmware, at most 2.5 ms, runs in the call.
     pub(in crate::tg3) fn asf_heartbeat(&mut self) -> Result<(), Error> {
         if !self.legacy_asf()? {
             return Ok(());
@@ -165,7 +167,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if !self.record(elapsed)? {
             return Ok(());
         }
-        self.wait_for_event_ack()?;
+        block_on(self.wait_for_event_ack())?;
         self.sram(FW_CMD_MBOX, Some(FWCMD_NICDRV_ALIVE3))?;
         self.sram(FW_CMD_LEN_MBOX, Some(4))?;
         self.sram(FW_CMD_DATA_MBOX, Some(FW_UPDATE_TIMEOUT_SEC))?;
@@ -185,7 +187,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     /// `tg3_ape_driver_state_change(RESET_KIND_INIT)`, once per driver
     /// start: the host segment, driver identity and START state, then the
     /// state-change event.
-    pub(super) fn ape_driver_start(&mut self) -> Result<(), Error> {
+    pub(super) async fn ape_driver_start(&mut self) -> Result<(), Error> {
         if self.ape_started || !self.ape()? {
             return Ok(());
         }
@@ -200,7 +202,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.ape_write(APE_HOST_BEHAVIOR, APE_HOST_BEHAV_NO_PHYLOCK)?;
         self.ape_write(APE_HOST_DRVR_STATE, APE_HOST_DRVR_STATE_START)?;
         self.ape_started = true;
-        self.ape_send_event(APE_EVENT_STATUS_STATE_START)
+        self.ape_send_event(APE_EVENT_STATUS_STATE_START).await
     }
     /// The end of `tg3_reset_hw`: the heartbeat interval and ASF's
     /// START_DONE.
@@ -218,19 +220,19 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     }
     /// `tg3_ape_driver_state_change(RESET_KIND_SHUTDOWN)` without wake-up:
     /// the UNLOAD state and its event, so the firmware takes the port back.
-    pub(super) fn ape_driver_unload(&mut self) -> Result<(), Error> {
+    pub(super) async fn ape_driver_unload(&mut self) -> Result<(), Error> {
         if !self.ape_started {
             return Ok(());
         }
         self.ape_write(APE_HOST_DRVR_STATE, APE_HOST_DRVR_STATE_UNLOAD)?;
         self.ape_started = false;
-        self.ape_send_event(APE_EVENT_STATUS_STATE_UNLOAD)
+        self.ape_send_event(APE_EVENT_STATUS_STATE_UNLOAD).await
     }
     /// `tg3_ape_send_event`: only to running APE firmware, after it took the
     /// previous event. Like Linux, an event the APE does not take within
     /// 20 ms, or whose memory lock is not granted, is not sent; the state
     /// words written before it still say where the driver is.
-    fn ape_send_event(&mut self, event: u32) -> Result<(), Error> {
+    async fn ape_send_event(&mut self, event: u32) -> Result<(), Error> {
         if self.ape_read(APE_SEG_SIG)? != APE_SEG_SIG_MAGIC
             || self.ape_read(APE_FW_STATUS)? & APE_FW_STATUS_READY == 0
         {
@@ -238,7 +240,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         let mut remaining = APE_EVENT_WAIT_US;
         loop {
-            match self.lock(APE_LOCK_MEM) {
+            match self.lock(APE_LOCK_MEM).await {
                 Ok(()) => {}
                 Err(Error::ApeTimeout) => return Ok(()),
                 Err(error) => return Err(error),
@@ -257,7 +259,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             if remaining == 0 {
                 return Ok(());
             }
-            self.wait(10)?;
+            self.wait(10).await?;
             remaining = remaining.saturating_sub(10);
         }
         let posted = self.ape_write(

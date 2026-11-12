@@ -822,7 +822,7 @@ fn management_firmware_hears_the_driver_start_and_the_reset_carries_asf_state() 
         m.borrow_mut().sram.insert(0xb58, 0x0020_0080);
         m.borrow_mut().ape.insert(0x4208, 6);
         running_ape(&m);
-        hardware.ape_driver_start().unwrap();
+        stela_driver_base::stepped::block_on(hardware.ape_driver_start()).unwrap();
         // tg3_ape_driver_state_change(RESET_KIND_INIT), then the event under
         // the memory lock once the previous one was taken.
         assert_eq!(
@@ -843,7 +843,7 @@ fn management_firmware_hears_the_driver_start_and_the_reset_carries_asf_state() 
         );
         // A second start in the same epoch tells the APE nothing new.
         m.borrow_mut().trace.clear();
-        hardware.ape_driver_start().unwrap();
+        stela_driver_base::stepped::block_on(hardware.ape_driver_start()).unwrap();
         assert!(ape_writes(&m).is_empty());
         hardware.reset_core().unwrap();
         assert!(hardware.core_reset_completed());
@@ -860,7 +860,7 @@ fn management_firmware_hears_the_driver_start_and_the_reset_carries_asf_state() 
             .unwrap();
         assert!(state < reset);
         assert_eq!(m.borrow().sram[&0xc04], 1);
-        hardware.ape_driver_unload().unwrap();
+        stela_driver_base::stepped::block_on(hardware.ape_driver_unload()).unwrap();
         assert_eq!(m.borrow().ape[&0x421c], 2);
         assert_eq!(m.borrow().ape[&0x4300], 0x0002_0510);
     }
@@ -872,7 +872,7 @@ fn an_event_the_ape_never_takes_is_dropped_after_twenty_milliseconds() {
     running_ape(&m);
     m.borrow_mut().ape.insert(0x4300, 0x8001_0510);
     m.borrow_mut().ape_busy = true;
-    hardware.ape_driver_start().unwrap();
+    stela_driver_base::stepped::block_on(hardware.ape_driver_start()).unwrap();
     let writes = ape_writes(&m);
     assert!(!writes.iter().any(|&(at, _)| at == 0x0c || at == 0x4300));
     // The lock is given back after every look, the last one included.
@@ -891,7 +891,7 @@ fn an_event_the_ape_never_takes_is_dropped_after_twenty_milliseconds() {
     let (mut hardware, m) = identified(Asic::Bcm5720, 0);
     running_ape(&m);
     m.borrow_mut().no_grant = true;
-    hardware.ape_driver_start().unwrap();
+    stela_driver_base::stepped::block_on(hardware.ape_driver_start()).unwrap();
     assert!(!ape_writes(&m).iter().any(|&(at, _)| at == 0x0c));
     assert_eq!(hardware.failure(), None);
 }
@@ -902,7 +902,7 @@ fn without_running_ape_firmware_only_the_host_state_is_written() {
         let (mut hardware, m) = identified(Asic::Bcm5762, 0);
         m.borrow_mut().ape.insert(0x4000, signature);
         m.borrow_mut().ape.insert(0x400c, status);
-        hardware.ape_driver_start().unwrap();
+        stela_driver_base::stepped::block_on(hardware.ape_driver_start()).unwrap();
         let writes = ape_writes(&m);
         assert_eq!(writes.last(), Some(&(0x421c, 1)));
         assert!(!writes.iter().any(|&(at, _)| at == 0x8410 || at == 0x0c));
@@ -1114,10 +1114,10 @@ fn without_an_ape_every_lock_is_taken_at_once_and_no_ape_space_is_touched() {
     without_ape(&mut hardware);
     m.borrow_mut().trace.clear();
     assert_eq!(hardware.read_phy(7), Ok(0xa55a));
-    hardware.ape_driver_start().unwrap();
+    stela_driver_base::stepped::block_on(hardware.ape_driver_start()).unwrap();
     hardware.reset_core().unwrap();
     hardware.management_started().unwrap();
-    hardware.ape_driver_unload().unwrap();
+    stela_driver_base::stepped::block_on(hardware.ape_driver_unload()).unwrap();
     let m = m.borrow();
     assert!(
         !m.trace
@@ -1209,7 +1209,7 @@ fn the_57765_class_has_no_ape_to_open_lock_or_tell() {
         assert!(!identity.ape);
         assert_eq!((identity.function, identity.phy_address), (function, 1));
         assert_eq!(hardware.read_phy(7), Ok(0xa55a));
-        hardware.ape_driver_start().unwrap();
+        stela_driver_base::stepped::block_on(hardware.ape_driver_start()).unwrap();
         let m = m.borrow();
         assert!(!m.trace.iter().any(|e| matches!(
             e,

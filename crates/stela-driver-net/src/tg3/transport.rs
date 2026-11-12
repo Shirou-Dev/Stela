@@ -6,6 +6,8 @@
 //! Linux tg3's APE, SRAM, MDIO, management handshake and engine-stop
 //! protocols, with checked failures.
 use super::{Asic, Delay, Error, Registers, candidate};
+use alloc::rc::Rc;
+use stela_driver_base::stepped::{Allowance, block_on};
 
 const MISC_HOST_CTRL: u16 = 0x68;
 const PRODID: u16 = 0xbc;
@@ -130,6 +132,9 @@ pub struct Hardware<R: Registers, D: Delay> {
     /// The interval until the next ASF heartbeat to firmware without an
     /// APE (`tg3_timer`'s `asf_counter`).
     asf_heartbeat: Option<alloc::boxed::Box<dyn crate::bus::pci::power::Interval>>,
+    /// The share of waiting a call has while work runs in steps
+    /// ([`Allowance`]); none while it runs to completion.
+    allowance: Option<Rc<Allowance>>,
 }
 impl<R: Registers, D: Delay> Drop for Hardware<R, D> {
     fn drop(&mut self) {
@@ -164,6 +169,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             ape_heartbeat: 0,
             ape_started: false,
             asf_heartbeat: None,
+            allowance: None,
         }
     }
     /// Stop inherited packet engines while the original configuration/root
@@ -174,7 +180,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         reason = "return the original owner and precise failure without allocating during refusal or retirement"
     )]
     pub fn quiesce_cold(mut self) -> Result<R, (Error, Self)> {
-        let result = (|| {
+        let result = block_on(async {
             self.timer_ready()?;
             if self.identity.is_some() || self.failure.is_some() || self.stopped {
                 return Err(Error::Poisoned);
@@ -190,9 +196,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             if self.regs().config_read32(4)? & 0x406 != 0x402 {
                 return Err(Error::ConfigDidNotLatch);
             }
-            self.packet_identity()?;
-            self.packet_stop()
-        })();
+            self.packet_identity().await?;
+            self.packet_stop().await
+        });
         match self.record(result) {
             Ok(()) => Ok(self.release_registers()),
             Err(error) => Err((error, self)),
@@ -214,11 +220,17 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     fn timer_ready(&self) -> Result<(), Error> {
         self.delay.check().map_err(Error::Timing)
     }
-    fn wait(&mut self, microseconds: u64) -> Result<(), Error> {
+    /// Wait at least `microseconds`, then end the step if its share is
+    /// used up.
+    async fn wait(&mut self, microseconds: u64) -> Result<(), Error> {
         let result = self.delay.wait_us(microseconds).map_err(Error::Timing);
         // A failed settling wait cannot certify an in-flight device effect.
         // Poison even private packet helpers that return through Packet's error.
-        self.record(result)
+        self.record(result)?;
+        if let Some(allowance) = &self.allowance {
+            allowance.spent(microseconds).await;
+        }
+        Ok(())
     }
     fn regs(&mut self) -> &mut R {
         self.registers
@@ -442,23 +454,24 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     }
     /// tg3_ape_lock: without an APE there is no one to share with, and the
     /// lock is taken at once.
-    fn lock(&mut self, lock: u8) -> Result<(), Error> {
+    async fn lock(&mut self, lock: u8) -> Result<(), Error> {
         if !self.identity.ok_or(Error::NotIdentified)?.ape {
             return Ok(());
         }
         let (request, grant, bit) = self.lock_coordinates(lock)?;
         self.regs().ape_write32(request, bit)?;
-        let result = (|| {
+        let result = async {
             for _ in 0..100 {
                 // Exact equality is required: our bit with a competing grant
                 // is not exclusive ownership (tg3_ape_lock).
                 if self.ape_read(grant)? == bit {
                     return Ok(());
                 }
-                self.wait(10)?;
+                self.wait(10).await?;
             }
             Err(Error::ApeTimeout)
-        })();
+        }
+        .await;
         if result.is_err() {
             let cleanup = self.regs().ape_write32(grant, bit);
             self.cleanup(cleanup);
@@ -473,24 +486,24 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.regs().ape_write32(grant, bit)
     }
 
-    fn restore_phy_mode(&mut self, mode: u32) -> Result<(), Error> {
+    async fn restore_phy_mode(&mut self, mode: u32) -> Result<(), Error> {
         let restore = self.flush(MAC_MI_MODE, mode);
-        let settle = self.wait(80);
+        let settle = self.wait(80).await;
         self.combine(restore, settle)
     }
-    fn phy_command(&mut self, register: u8, data: Option<u16>) -> Result<u16, Error> {
+    async fn phy_command(&mut self, register: u8, data: Option<u16>) -> Result<u16, Error> {
         let identity = self.identity.ok_or(Error::NotIdentified)?;
         let mode = self.read(MAC_MI_MODE)?;
         let auto_poll = mode & MI_AUTO_POLL != 0;
         if auto_poll {
             self.flush(MAC_MI_MODE, mode & !MI_AUTO_POLL)?;
-            if let Err(error) = self.wait(80) {
-                let restore = self.restore_phy_mode(mode);
+            if let Err(error) = self.wait(80).await {
+                let restore = self.restore_phy_mode(mode).await;
                 return self.combine(Err(error), restore);
             }
         }
         let lock = PHY_LOCKS[usize::from(identity.function)];
-        let acquired = self.lock(lock);
+        let acquired = self.lock(lock).await;
         let primary = if let Err(error) = acquired {
             Err(error)
         } else {
@@ -498,12 +511,12 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 | (u32::from(register) << 16)
                 | MI_START
                 | data.map_or(MI_READ, |value| MI_WRITE | u32::from(value));
-            let result = (|| {
+            let result = async {
                 self.flush(MAC_MI_COM, command)?;
                 for _ in 0..5000 {
-                    self.wait(10)?;
+                    self.wait(10).await?;
                     if self.read(MAC_MI_COM)? & MI_START == 0 {
-                        self.wait(5)?;
+                        self.wait(5).await?;
                         let value = self.read(MAC_MI_COM)?;
                         if value & MI_START != 0 {
                             return Err(Error::MdioTimeout);
@@ -515,10 +528,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                     }
                 }
                 Err(Error::MdioTimeout)
-            })();
+            }
+            .await;
             // Restore autopoll before giving back the PHY grant, as the donor.
             let restore = if auto_poll {
-                self.restore_phy_mode(mode)
+                self.restore_phy_mode(mode).await
             } else {
                 Ok(())
             };
@@ -527,7 +541,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             return self.combine(result, release);
         };
         let restore = if auto_poll {
-            self.restore_phy_mode(mode)
+            self.restore_phy_mode(mode).await
         } else {
             Ok(())
         };
@@ -538,7 +552,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if register > 31 {
             return Err(Error::Bounds);
         }
-        let result = self.phy_command(register, None);
+        let result = block_on(self.phy_command(register, None));
         self.record(result)
     }
     pub fn write_phy(&mut self, register: u8, value: u16) -> Result<(), Error> {
@@ -546,7 +560,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if register > 31 {
             return Err(Error::Bounds);
         }
-        let result = self.phy_command(register, Some(value)).map(|_| ());
+        let result = block_on(self.phy_command(register, Some(value))).map(|_| ());
         self.record(result)
     }
     /// `tg3_phy_probe`'s PHY ID. The PHY's own ID registers are read only
@@ -560,14 +574,17 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     /// know as the family's copper PHY (tg3 keys its PHY setup to the ASIC
     /// for these families). A known ID must be the family's own PHY.
     pub fn read_phy_identity(&mut self) -> Result<u32, Error> {
+        block_on(self.phy_identity())
+    }
+    pub(super) async fn phy_identity(&mut self) -> Result<u32, Error> {
         self.check()?;
-        let result = (|| {
+        let result = async {
             let chip = self.identity.expect("identified");
             let hardware = if self.management.asf || chip.ape {
                 None
             } else {
-                let high = u32::from(self.phy_command(2, None)?);
-                let low = u32::from(self.phy_command(3, None)?);
+                let high = u32::from(self.phy_command(2, None).await?);
+                let low = u32::from(self.phy_command(3, None).await?);
                 Some(broadcom_phy_id(high, low))
             };
             let identity = match hardware {
@@ -603,35 +620,36 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 return Err(Error::UnsupportedMedia);
             }
             Ok(identity)
-        })();
+        }
+        .await;
         self.record(result)
     }
     /// Clause 45 through Clause 22's MMD control/address pair (tg3_phy_cl45_read).
     pub fn read_mmd(&mut self, device: u8, register: u16) -> Result<u16, Error> {
-        self.check()?;
-        if device > 31 {
-            return Err(Error::Bounds);
-        }
-        let result = (|| {
-            self.phy_command(13, Some(u16::from(device)))?;
-            self.phy_command(14, Some(register))?;
-            self.phy_command(13, Some(0x4000 | u16::from(device)))?;
-            self.phy_command(14, None)
-        })();
-        self.record(result)
+        block_on(self.mmd(device, register, None))
     }
     pub fn write_mmd(&mut self, device: u8, register: u16, value: u16) -> Result<(), Error> {
+        block_on(self.mmd(device, register, Some(value))).map(|_| ())
+    }
+    /// One MMD register read, or written with `value`.
+    pub(super) async fn mmd(
+        &mut self,
+        device: u8,
+        register: u16,
+        value: Option<u16>,
+    ) -> Result<u16, Error> {
         self.check()?;
         if device > 31 {
             return Err(Error::Bounds);
         }
-        let result = (|| {
-            self.phy_command(13, Some(u16::from(device)))?;
-            self.phy_command(14, Some(register))?;
-            self.phy_command(13, Some(0x4000 | u16::from(device)))?;
-            self.phy_command(14, Some(value))?;
-            Ok(())
-        })();
+        let result = async {
+            self.phy_command(13, Some(u16::from(device))).await?;
+            self.phy_command(14, Some(register)).await?;
+            self.phy_command(13, Some(0x4000 | u16::from(device)))
+                .await?;
+            self.phy_command(14, value).await
+        }
+        .await;
         self.record(result)
     }
 
@@ -676,23 +694,23 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     /// is explicit rather than Linux's log-and-continue fallback.
     pub fn wait_firmware(&mut self) -> Result<(), Error> {
         self.check()?;
-        let result = (|| {
+        let result = block_on(async {
             for _ in 0..100_000 {
                 if self.sram(FIRMWARE_MBOX, None)? == !FIRMWARE_MAGIC {
                     return Ok(());
                 }
-                self.wait(10)?;
+                self.wait(10).await?;
             }
             Err(Error::FirmwareTimeout)
-        })();
+        });
         self.record(result)
     }
 
-    fn stop_block(&mut self, at: u32) -> Result<(), Error> {
+    async fn stop_block(&mut self, at: u32) -> Result<(), Error> {
         let value = self.read(at)?;
         self.flush(at, value & !ENABLE)?;
         for _ in 0..1000 {
-            self.wait(100)?;
+            self.wait(100).await?;
             if self.read(at)? & ENABLE == 0 {
                 return Ok(());
             }
@@ -703,16 +721,19 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
     /// certify PCI/remapper posted-write drain or release any DMA mapping.
     /// A failure is sticky, keeps the real owner, and never clears status RAM.
     pub fn stop_engines(&mut self) -> Result<(), Error> {
+        block_on(self.stop_engines_steps())
+    }
+    pub(super) async fn stop_engines_steps(&mut self) -> Result<(), Error> {
         self.check()?;
-        let result = self.stop_engines_inner();
+        let result = self.stop_engines_inner().await;
         if result.is_ok() {
             self.stopped = true;
         }
         self.record(result)
     }
-    pub(super) fn stop_engines_inner(&mut self) -> Result<(), Error> {
+    pub(super) async fn stop_engines_inner(&mut self) -> Result<(), Error> {
         self.timer_ready()?;
-        (|| {
+        async {
             let host = Self::checked(self.regs().config_read32(MISC_HOST_CTRL)?)?;
             self.flush(u32::from(MISC_HOST_CTRL), host | MASK_PCI_INT)?;
             // The declared transport is single-vector/polled; cold attachment
@@ -720,23 +741,24 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             self.flush(MAILBOX_INTERRUPT, 1)?;
             let mode = self.read(MAC_RX_MODE)?;
             self.flush(MAC_RX_MODE, mode & !ENABLE)?;
-            self.wait(10)?;
+            self.wait(10).await?;
             // All declared parts are 5705_PLUS: RCVLSC/DMAC/MBFREE/BUFMGR/
             // MEMARB are not software-disableable and are absent.
             for at in STOP_RX.into_iter().chain(STOP_TX) {
-                self.stop_block(at)?;
+                self.stop_block(at).await?;
             }
             let mode = self.read(MAC_MODE)?;
             self.flush(MAC_MODE, mode & !TRANSMIT_DATA_ENABLE)?;
-            self.wait(40)?;
-            self.stop_block(MAC_TX_MODE)?;
-            self.stop_block(HOSTCC_MODE)?;
-            self.stop_block(WDMAC_MODE)?;
+            self.wait(40).await?;
+            self.stop_block(MAC_TX_MODE).await?;
+            self.stop_block(HOSTCC_MODE).await?;
+            self.stop_block(WDMAC_MODE).await?;
             self.write(FTQ_RESET, u32::MAX)?;
             self.write(FTQ_RESET, 0)?;
             self.read(FTQ_RESET)?;
             Ok(())
-        })()
+        }
+        .await
     }
     pub(super) fn release_registers(&mut self) -> R {
         self.registers.take().expect("retained hardware registers")

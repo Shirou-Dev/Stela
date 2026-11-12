@@ -19,7 +19,7 @@ pub(in crate::tg3) struct Profile {
 }
 
 impl<R: Registers, D: Delay> Hardware<R, D> {
-    pub(super) fn bcm5761_board(&mut self) -> Result<Board, Error> {
+    pub(super) async fn bcm5761_board(&mut self) -> Result<Board, Error> {
         self.observe_management()?;
         let identity = self.identity.ok_or(Error::NotIdentified)?;
         if identity.chip_revision != 0x0576_1000 || identity.bdf_function != 0 {
@@ -55,21 +55,21 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         // 5761 is not 5717_PLUS. Source VMain setup writes the local
         // control directly, without the 5720 APE GPIO/CPMU-status handshake.
         self.flush(GRC_LOCAL_CTRL, local)?;
-        self.wait(100)?;
+        self.wait(100).await?;
         self.flush(
             GRC_EEPROM_ADDR,
             EEPROM_ADDR_FSM_RESET | (EEPROM_DEFAULT_CLOCK_PERIOD << EEPROM_ADDR_CLKPERD_SHIFT),
         )?;
-        self.wait(1000)?;
+        self.wait(1000).await?;
         let observed = self.read(GRC_LOCAL_CTRL)?;
         self.flush(GRC_LOCAL_CTRL, observed | GRC_LCLCTRL_AUTO_SEEPROM)?;
-        self.wait(100)?;
+        self.wait(100).await?;
         // Source TPM-protected NVM requires a separate lockout-bound read path.
         // Refuse before enabling NVRAM_ACCESS or issuing a read command.
         if self.read(NVRAM_CFG1)? & (1 << 27) != 0 {
             return Err(Error::UnsupportedBoard);
         }
-        let nvram = self.nvram_configuration()?;
+        let nvram = self.nvram_configuration().await?;
         if nvram & (1 << 27) != 0 {
             return Err(Error::UnsupportedBoard);
         }
@@ -96,7 +96,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         ) {
             return Err(Error::UnsupportedBoard);
         }
-        let magic = self.nvram_word(0, false, 256)?;
+        let magic = self.nvram_word(0, false, 256).await?;
         if magic != TG3_EEPROM_MAGIC && magic & TG3_EEPROM_MAGIC_FW_MSK != TG3_EEPROM_MAGIC_FW {
             return Err(Error::UnsupportedBoard);
         }
@@ -105,8 +105,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let mut mac = decode_mac(high, low);
         if high >> 16 != 0x484b || !valid_mac(mac) {
             mac = decode_mac(
-                self.nvram_word(0x7c, false, 256)?,
-                self.nvram_word(0x80, false, 256)?,
+                self.nvram_word(0x7c, false, 256).await?,
+                self.nvram_word(0x80, false, 256).await?,
             );
         }
         if !super::board::usable_mac(mac) {
