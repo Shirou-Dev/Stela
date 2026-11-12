@@ -961,12 +961,16 @@ static BOOL install_path(const char *name, NSString *loader, char *path, size_t 
 	free(records);
 	if (status != StelaStatusOk) {
 		/* A name the library lacks is Metal's nil, which callers probing
-		 * libraries expect. */
+		 * libraries expect. A function it holds but this device cannot
+		 * take is unsupported, or failed to compile, as Metal says of a
+		 * specialization: never a name it lacks, which it lists. */
+		NSInteger code = MTLLibraryErrorFunctionNotFound;
 		if (status != StelaStatusDeclined) {
 			stela_report([[NSString stringWithFormat:@"function %@", name] UTF8String], &failure);
+			code = status == StelaStatusUnsupported ? MTLLibraryErrorUnsupported : MTLLibraryErrorCompileFailure;
 		}
 		if (error) {
-			*error = stela_error(MTLLibraryErrorDomain, MTLLibraryErrorFunctionNotFound, &failure);
+			*error = stela_error(MTLLibraryErrorDomain, code, &failure);
 		}
 		return nil;
 	}
