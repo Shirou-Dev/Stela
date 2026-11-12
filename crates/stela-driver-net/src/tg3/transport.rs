@@ -10,6 +10,7 @@ use super::{Asic, Delay, Error, Registers, candidate};
 const MISC_HOST_CTRL: u16 = 0x68;
 const PRODID: u16 = 0xbc;
 const GEN2_PRODID: u16 = 0xf4;
+const GEN15_PRODID: u16 = 0xfc;
 const MEM_BASE: u32 = 0x7c;
 const MEM_DATA: u32 = 0x84;
 const MAC_MODE: u32 = 0x400;
@@ -276,6 +277,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         if chip_revision >> 12 == 0xf {
             let at = if matches!(device, 0x1655 | 0x1656 | 0x1665 | 0x1657 | 0x165f | 0x1687) {
                 GEN2_PRODID
+            } else if matches!(device, 0x16b0 | 0x16b1 | 0x16b2 | 0x16b4 | 0x16b5 | 0x16b6) {
+                GEN15_PRODID
             } else {
                 PRODID
             };
@@ -290,6 +293,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             }
             (0x1655 | 0x1656 | 0x1665, 0x5717) => Asic::Bcm5717,
             (0x1657, 0x5719) => Asic::Bcm5719,
+            (0x16b0 | 0x16b1 | 0x16b2 | 0x16b4 | 0x16b5 | 0x16b6, 0x57785) => Asic::Bcm57765,
             (0x165f, 0x5720) => Asic::Bcm5720,
             (0x1687, 0x5762) => Asic::Bcm5762,
             _ => return Err(Error::UnsupportedRevision),
@@ -511,6 +515,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             let identity = (high << 10) | ((low & 0xfc00) << 16) | (low & 0x3ff);
             let expected = match self.identity.expect("identified").asic {
                 Asic::Bcm5761 => 0xbc05_0fd0,
+                Asic::Bcm57765 => 0x5c0d_8a40,
                 Asic::Bcm5717 => 0x5c0d_8a00,
                 Asic::Bcm5719 => 0x5c0d_8a20,
                 Asic::Bcm5720 => 0x5c0d_8b60,

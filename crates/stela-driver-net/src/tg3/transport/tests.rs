@@ -259,6 +259,7 @@ unsafe impl Registers for Reg {
 fn model(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>) {
     let (device, revision, identity) = match asic {
         Asic::Bcm5761 => (0x1681u16, 0x0576_1000, 0xbc05_0fd3u32),
+        Asic::Bcm57765 => (0x16b4, 0x5778_5100, 0x5c0d_8a41),
         Asic::Bcm5717 => (0x1655, 0x0571_7100, 0x5c0d_8a01),
         Asic::Bcm5719 => (0x1657, 0x0571_9001, 0x5c0d_8a21),
         Asic::Bcm5720 => (0x165f, 0x0572_0000, 0x5c0d_8b62),
@@ -272,10 +273,10 @@ fn model(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>)
     m.config.insert(8, 0x0200_0000);
     m.config.insert(MISC_HOST_CTRL, 0xf000_0000);
     m.config.insert(
-        if asic == Asic::Bcm5761 {
-            PRODID
-        } else {
-            GEN2_PRODID
+        match asic {
+            Asic::Bcm5761 => PRODID,
+            Asic::Bcm57765 => GEN15_PRODID,
+            _ => GEN2_PRODID,
         },
         revision,
     );
@@ -308,6 +309,7 @@ fn identified(asic: Asic, function: u8) -> (Hardware<Reg, Timer>, Rc<RefCell<Mod
 fn config_revision_and_phy_oui_select_each_named_family() {
     for asic in [
         Asic::Bcm5761,
+        Asic::Bcm57765,
         Asic::Bcm5717,
         Asic::Bcm5719,
         Asic::Bcm5720,
@@ -711,6 +713,7 @@ fn reset_model(asic: Asic) -> (Hardware<Reg, Timer>, Rc<RefCell<Model>>) {
 fn core_reset_uses_config_while_mmio_decode_is_gone() {
     for asic in [
         Asic::Bcm5761,
+        Asic::Bcm57765,
         Asic::Bcm5717,
         Asic::Bcm5719,
         Asic::Bcm5720,
@@ -738,6 +741,15 @@ fn core_reset_uses_config_while_mmio_decode_is_gone() {
         assert!(m.trace.contains(&Event::Write(MAC_MI_MODE, 0x8000)));
         match asic {
             Asic::Bcm5761 => assert!(m.trace.contains(&Event::Write(0x7c00, 1 << 25))),
+            Asic::Bcm57765 => {
+                // No clock override, and no APE space opened again.
+                assert!(
+                    !m.trace
+                        .iter()
+                        .any(|e| matches!(e, Event::Write(0x3624 | 0x3628, _)))
+                );
+                assert!(m.trace.contains(&Event::ConfigWrite(PCISTATE, 0x60)));
+            }
             Asic::Bcm5717 => {
                 // tg3_override_clk and tg3_restore_clk's enable bit.
                 let set = m
@@ -1170,4 +1182,25 @@ fn asf_firmware_without_an_ape_needs_a_timer_that_keeps_the_heartbeat() {
     hardware.reset_core().unwrap();
     hardware.management_started().unwrap();
     hardware.asf_heartbeat().unwrap();
+}
+
+#[test]
+fn the_57765_class_has_no_ape_to_open_lock_or_tell() {
+    for function in 0..4 {
+        let (mut hardware, m) = model(Asic::Bcm57765, function);
+        let identity = hardware.identify().unwrap();
+        assert!(!identity.ape);
+        assert_eq!((identity.function, identity.phy_address), (function, 1));
+        assert_eq!(hardware.read_phy(7), Ok(0xa55a));
+        hardware.ape_driver_start().unwrap();
+        let m = m.borrow();
+        assert!(!m.trace.iter().any(|e| matches!(
+            e,
+            Event::ApeRead(..) | Event::ApeWrite(..) | Event::ConfigWrite(PCISTATE, _)
+        )));
+    }
+    // A 5720 revision under a 57765 ID does not identify.
+    let (mut hardware, m) = model(Asic::Bcm57765, 0);
+    m.borrow_mut().config.insert(GEN15_PRODID, 0x0572_0000);
+    assert_eq!(hardware.identify(), Err(Error::UnsupportedRevision));
 }

@@ -45,7 +45,9 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         // their A0, whose PHY strap, EEE, TSO, jumbo ring, statistics and
         // read DMA errata are not implemented here, and treats every later
         // revision alike (a 5717 C0 is identified as a 5720 A0).
-        let admitted = if id.asic == Asic::Bcm5717 {
+        let admitted = if id.asic == Asic::Bcm57765 {
+            id.chip_revision != CHIPREV_ID_57765_A0
+        } else if id.asic == Asic::Bcm5717 {
             id.chip_revision != CHIPREV_ID_5717_A0
         } else if id.asic == Asic::Bcm5719 {
             id.chip_revision != CHIPREV_ID_5719_A0
@@ -77,7 +79,12 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         } else {
             0
         };
+        let asic = self.identity.unwrap().asic;
         let mut local = GRC_LCLCTRL_INT_ON_ATTN | GRC_LCLCTRL_AUTO_SEEPROM;
+        // tg3_get_invariants: the 57765 class turns the debug UART off.
+        if asic == Asic::Bcm57765 {
+            local |= GRC_LCLCTRL_GPIO_UART_SEL;
+        }
         if config & NIC_SRAM_DATA_CFG_EEPROM_WP != 0 {
             // LOM GPIO settings are bootcode-owned and must be preserved.
             local |= self.read(GRC_LOCAL_CTRL)?
@@ -88,6 +95,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                     | GRC_LCLCTRL_GPIO_OUTPUT1
                     | GRC_LCLCTRL_GPIO_OUTPUT2);
             local |= GRC_LCLCTRL_GPIO_OE1 | GRC_LCLCTRL_GPIO_OUTPUT1;
+        } else if !asic.plus_5717() {
+            // tg3_pwrsrc_switch_to_vmain outside the 5717 class: the local
+            // control alone, with no GPIO lock or driver-present bits.
+            self.flush(GRC_LOCAL_CTRL, local)?;
+            self.wait(100)?;
         } else {
             // tg3_pwrsrc_switch_to_vmain: internal port, not BDF.
             // tg3_set_function_status keeps 5717/5719's driver-present bits
@@ -122,7 +134,6 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         // Decode the pinstrap, including Atmel non-power-of-two pages.
         // No unrecognized NVM is treated as a functional firmware source.
         let nvcfg = self.nvram_configuration()?;
-        let asic = self.identity.unwrap().asic;
         let Some(kind) = nvram_kind(asic, nvcfg & NVRAM_CFG1_5752VENDOR_MASK) else {
             return Err(Error::UnsupportedBoard);
         };
@@ -146,10 +157,14 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let low = self.sram(NIC_SRAM_MAC_ADDR_LOW_MBOX, None)?;
         let mut mac = decode_mac(high, low);
         if high >> 16 != 0x484b || !valid_mac(mac) {
+            // tg3_get_device_address: only 5717_PLUS ports have their own.
             let function = self.identity.unwrap().function;
-            let offset = 0x7c
-                + if function & 1 != 0 { 0x50 } else { 0 }
-                + if function > 1 { 0x18c } else { 0 };
+            let offset = if asic.plus_5717() {
+                0x7c + if function & 1 != 0 { 0x50 } else { 0 }
+                    + if function > 1 { 0x18c } else { 0 }
+            } else {
+                0x7c
+            };
             let high = self.nvram_word(offset, atmel && matches!(page, 264 | 528), page)?;
             let low = self.nvram_word(offset + 4, atmel && matches!(page, 264 | 528), page)?;
             mac = decode_mac(high, low);
@@ -177,7 +192,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             let vendor = config & NVRAM_CFG1_5752VENDOR_MASK;
             let eeprom = match self.identity.ok_or(Error::NotIdentified)?.asic {
                 Asic::Bcm5762 => matches!(vendor, FLASH_5762_EEPROM_HD | FLASH_5762_EEPROM_LD),
-                asic @ (Asic::Bcm5717 | Asic::Bcm5719 | Asic::Bcm5720) => {
+                asic @ (Asic::Bcm57765 | Asic::Bcm5717 | Asic::Bcm5719 | Asic::Bcm5720) => {
                     nvram_kind(asic, vendor) == Some(Nvram::Eeprom)
                 }
                 Asic::Bcm5761 => false, // Source pinstraps are buffered flash.
@@ -249,10 +264,29 @@ enum Nvram {
     St,
 }
 
-/// tg3_get_5717_nvram_info and tg3_get_5720_nvram_info's vendor pinstrap
-/// decode. The two tables reuse codes for different parts.
+/// tg3_get_57780_nvram_info, tg3_get_5717_nvram_info and
+/// tg3_get_5720_nvram_info's vendor pinstrap decode. The tables reuse codes
+/// for different parts.
 fn nvram_kind(asic: Asic, vendor: u32) -> Option<Nvram> {
     Some(match (asic, vendor) {
+        (
+            Asic::Bcm57765,
+            FLASH_5787VENDOR_ATMEL_EEPROM_376KHZ | FLASH_5787VENDOR_MICRO_EEPROM_376KHZ,
+        ) => Nvram::Eeprom,
+        (
+            Asic::Bcm57765,
+            FLASH_5752VENDOR_ATMEL_FLASH_BUFFERED
+            | FLASH_57780VENDOR_ATMEL_AT45DB011D
+            | FLASH_57780VENDOR_ATMEL_AT45DB011B
+            | FLASH_57780VENDOR_ATMEL_AT45DB021D
+            | FLASH_57780VENDOR_ATMEL_AT45DB021B
+            | FLASH_57780VENDOR_ATMEL_AT45DB041D
+            | FLASH_57780VENDOR_ATMEL_AT45DB041B,
+        ) => Nvram::Atmel,
+        (
+            Asic::Bcm57765,
+            FLASH_5752VENDOR_ST_M45PE10 | FLASH_5752VENDOR_ST_M45PE20 | FLASH_5752VENDOR_ST_M45PE40,
+        ) => Nvram::St,
         (
             Asic::Bcm5717 | Asic::Bcm5719,
             FLASH_5717VENDOR_ATMEL_EEPROM | FLASH_5717VENDOR_MICRO_EEPROM,

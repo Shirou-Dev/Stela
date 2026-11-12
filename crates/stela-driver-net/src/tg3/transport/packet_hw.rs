@@ -3,7 +3,7 @@
 // Copyright (C) 2001-2003 Jeff Garzik
 // Copyright (C) 2004 Sun Microsystems Inc.
 // Copyright (C) 2005-2018 Broadcom
-//! One BCM5717/5718/5719/5720/5761/5762 host-send/standard-receive/return queue, polled status DMA.
+//! One BCM5717/5718/5719/5720/5761/5762/57765-class host-send/standard-receive/return queue, polled status DMA.
 use super::{board::Board, phy::Speed, regs::*, *};
 
 impl<R: Registers, D: Delay> Hardware<R, D> {
@@ -60,6 +60,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         let bcm5762 = asic == Asic::Bcm5762;
         let legacy = asic == Asic::Bcm5761;
         let bcm5717 = asic == Asic::Bcm5717;
+        let class_57765 = asic == Asic::Bcm57765;
         let bcm5719 = asic == Asic::Bcm5719;
         // tg3's statistics workaround (5717, 5720 A0 and 5762, not 5719
         // after A0)
@@ -156,8 +157,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             RCVDBDI_STD_BD + 8,
             ((geometry.rx as u32) << 16) | if legacy { 0 } else { 1536 << 2 },
         )?;
+        // tg3_reset_hw: the standard ring's NIC address outside 5717_PLUS.
         if bcm5762 || legacy {
             self.bcm5762_write(RCVDBDI_STD_BD + 12, NIC_SRAM_RX_BUFFER_DESC)?;
+        } else if class_57765 {
+            self.write(RCVDBDI_STD_BD + 12, NIC_SRAM_RX_BUFFER_DESC)?;
         }
         if !legacy {
             self.write(RCVDBDI_JUMBO_BD + 8, BDINFO_FLAGS_DISABLED)?;
@@ -166,7 +170,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.flush(TG3_RX_JMB_PROD_IDX_REG, 0)?;
         for index in 1..if legacy {
             1
-        } else if bcm5762 {
+        } else if bcm5762 || class_57765 {
             2
         } else {
             4
@@ -178,7 +182,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         }
         for index in 1..if legacy {
             1
-        } else if bcm5762 {
+        } else if bcm5762 || class_57765 {
             4
         } else {
             17
@@ -231,7 +235,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             TG3_LSO_RD_DMA_CRPTEN_CTRL
         };
         // tg3_reset_hw: 5719, 5720 and 5762 only.
-        if !(legacy || bcm5717) {
+        if !(legacy || bcm5717 || class_57765) {
             let corruption = self.read(corruption_register)?
                 | TG3_LSO_RD_DMA_CRPTEN_CTRL_BLEN_BD_4K
                 | TG3_LSO_RD_DMA_CRPTEN_CTRL_BLEN_LSO_4K;
@@ -356,7 +360,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.wait(40)?;
         // Observe the residual channel lengths before applying 5719's or
         // 5720's documented workaround; no synthetic normal-channel assumption.
-        for index in 0..if bcm5762 || legacy || bcm5717 {
+        for index in 0..if bcm5762 || legacy || bcm5717 || class_57765 {
             0
         } else {
             TG3_NUM_RDMA_CHANNELS
@@ -387,7 +391,11 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
                 RCVDBDI_MODE,
                 RCVDBDI_MODE_ENABLE
                     | RCVDBDI_MODE_INV_RING_SZ
-                    | if legacy { 0 } else { RCVDBDI_MODE_LRG_RING_SZ },
+                    | if asic.large_rings() {
+                        RCVDBDI_MODE_LRG_RING_SZ
+                    } else {
+                        0
+                    },
             ),
             (SNDDATAI_MODE, SNDDATAI_MODE_ENABLE),
             (SNDDATAI_MODE, SNDDATAI_MODE_ENABLE | 0x8), // hardware TSO generation 2/3.
@@ -423,7 +431,8 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         self.wait(10)?;
         self.write(MAC_LED_CTRL, board.led)?;
         self.write(MAC_MI_STAT, MAC_MI_STAT_LNKSTAT_ATTN_ENAB)?;
-        self.flush(MAC_LOW_WMARK_MAX_RX_FRAME, 2)?;
+        // 57765_CLASS keeps one frame, the others two.
+        self.flush(MAC_LOW_WMARK_MAX_RX_FRAME, if class_57765 { 1 } else { 2 })?;
         // No multicast/VLAN/checksum offload is relied upon by the software.
         // Accept broadcast, own unicast and multicast as a raw Ethernet link.
         self.write(MAC_RCV_RULE_0, 0xc200_0000 & RCV_RULE_DISABLE_MASK)?;

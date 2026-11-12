@@ -217,7 +217,10 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
         // 10/100 half/full and 1000 full duplex, no pause. Carrier uses the
         // negotiated PHY result to program MAC speed and duplex.
         self.pw(ADVERTISE, 0x01e1)?;
-        self.pw(CTRL1000, 0x0200)?;
+        // tg3_phy_autoneg_cfg: a 10/100-only PHY has no 1000BASE-T control.
+        if !super::super::ten_hundred_only(self.identity.ok_or(Error::NotIdentified)?.device) {
+            self.pw(CTRL1000, 0x0200)?;
+        }
         if !bcm5761 {
             self.flush(
                 TG3_CPMU_EEE_LNKIDL_CTRL,
@@ -227,7 +230,7 @@ impl<R: Registers, D: Delay> Hardware<R, D> {
             self.flush(TG3_CPMU_EEE_MODE, 0)?;
             let tap26 = matches!(
                 self.identity.ok_or(Error::NotIdentified)?.asic,
-                Asic::Bcm5717 | Asic::Bcm5719
+                Asic::Bcm57765 | Asic::Bcm5717 | Asic::Bcm5719
             );
             self.smdsp(true)?;
             let result = (|| {

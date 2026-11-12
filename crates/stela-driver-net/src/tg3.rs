@@ -165,6 +165,7 @@ pub use crate::bus::pci::power::Timer as Delay;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Asic {
     Bcm5761,
+    Bcm57765,
     Bcm5717,
     Bcm5719,
     Bcm5720,
@@ -176,6 +177,20 @@ impl Asic {
     pub const fn plus_5717(self) -> bool {
         matches!(self, Self::Bcm5717 | Self::Bcm5719 | Self::Bcm5720)
     }
+    /// tg3's LRG_PROD_RING_CAP: 2048-entry standard and 4096-entry return
+    /// rings.
+    pub const fn large_rings(self) -> bool {
+        matches!(
+            self,
+            Self::Bcm5717 | Self::Bcm5719 | Self::Bcm5720 | Self::Bcm5762
+        )
+    }
+}
+
+/// Devices Linux's PCI table marks TG3_DRV_DATA_FLAG_10_100_ONLY among the
+/// named ones (BCM57791, BCM57795): their PHY has no gigabit to advertise.
+pub const fn ten_hundred_only(device: u16) -> bool {
+    matches!(device, 0x16b2 | 0x16b6)
 }
 
 /// Whether the device has an APE: Linux's `tg3_init_one` maps BAR 2 and
@@ -208,7 +223,22 @@ pub fn candidate(vendor: u16, device: u16, class: [u8; 3]) -> bool {
         && class == [2, 0, 0]
         && matches!(
             device,
-            0x1655 | 0x1656 | 0x1665 | 0x1657 | 0x165f | 0x1680 | 0x1681 | 0x1688 | 0x1689 | 0x1687
+            0x16b0
+                | 0x16b1
+                | 0x16b2
+                | 0x16b4
+                | 0x16b5
+                | 0x16b6
+                | 0x1655
+                | 0x1656
+                | 0x1665
+                | 0x1657
+                | 0x165f
+                | 0x1680
+                | 0x1681
+                | 0x1688
+                | 0x1689
+                | 0x1687
         )
 }
 

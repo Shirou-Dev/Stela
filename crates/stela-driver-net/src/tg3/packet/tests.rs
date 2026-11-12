@@ -609,11 +609,13 @@ impl Device {
             };
             self.require_bits(0x400, 14, mode);
             assert_eq!(self.phy[&4] & 0x1ff, 0x1e1);
-            assert_eq!(self.phy[&9] & 0x300, 0x200, "no 1000half advertisement");
+            if !crate::tg3::ten_hundred_only((self.config[&0] >> 16) as u16) {
+                assert_eq!(self.phy[&9] & 0x300, 0x200, "no 1000half advertisement");
+            }
         }
         match path {
             DmaPath::Status => {
-                let attention = !(self.is_5761() || self.is_5719());
+                let attention = !(self.is_5761() || self.is_5719() || self.is_57765());
                 self.require_bits(0x3c00, 0x187, if attention { 0x106 } else { 0x102 });
                 self.require_bits(0x4c00, 3, 2); // host status needs write DMA.
             }
@@ -639,7 +641,8 @@ impl Device {
                 let keep = if asf { 0 } else { 0x400 };
                 self.require_bits(0x468, 0x403, 0x2 | keep);
                 self.require_bits(0x4c00, 3, 2);
-                self.require_bits(0x2400, 0x10003, if self.is_5761() { 2 } else { 0x10002 });
+                let large = !(self.is_5761() || self.is_57765());
+                self.require_bits(0x2400, 0x10003, if large { 0x10002 } else { 2 });
                 for at in [0x2c00, 0x2000, 0x2800, 0x3000] {
                     self.require_bits(at, 3, 2);
                 }
@@ -718,6 +721,8 @@ impl Device {
         }
         let (rx_count, ret_count, flags) = if self.is_5761() {
             (512, 512, 512 << 16)
+        } else if self.is_57765() {
+            (512, 1024, (512 << 16) | (1536 << 2))
         } else {
             (2048, 4096, (2048 << 16) | (1536 << 2))
         };
@@ -890,7 +895,7 @@ unsafe impl Registers for Reg {
                 p.publish_attention(&self.domain);
             }
             0x44c => {
-                let expected_phy = if p.config[&0] == 0x1687_14e4 {
+                let expected_phy = if p.config[&0] == 0x1687_14e4 || p.is_57765() {
                     1
                 } else if p.is_5717() {
                     ((p.sram[&0xe00] >> 29) & 1) + 1
@@ -1812,6 +1817,7 @@ mod bcm5719;
 mod bcm5761;
 mod bcm5761_power;
 mod bcm5762;
+mod bcm57765;
 mod phy_link;
 mod phy_power;
 mod rdma_mode;

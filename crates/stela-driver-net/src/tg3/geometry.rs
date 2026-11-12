@@ -15,6 +15,12 @@ impl Geometry {
                 rx: 512,
                 returns: 512,
             },
+            // JUMBO_CAPABLE without LRG_PROD_RING_CAP: tg3_rx_ret_ring_size's
+            // 5700 return ring.
+            Asic::Bcm57765 => Self {
+                rx: 512,
+                returns: 1024,
+            },
             Asic::Bcm5717 | Asic::Bcm5719 | Asic::Bcm5720 | Asic::Bcm5762 => Self {
                 rx: 2048,
                 returns: 4096,
