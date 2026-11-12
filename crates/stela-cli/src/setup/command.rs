@@ -175,8 +175,7 @@ struct Wifi {
     #[arg(long, value_name = "FILE")]
     wifi_passphrase_file: Option<PathBuf>,
     /// The country whose Wi-Fi rules apply, as an ISO 3166 code such as US
-    /// or DE: this computer's by default.
-    /// (this computer's region by default)
+    /// or DE: this computer's region by default.
     #[arg(long, value_name = "CODE", value_parser = wifi::country, hide = true)]
     wifi_country: Option<String>,
 }
@@ -243,13 +242,13 @@ fn dns(word: &str) -> Result<Automatic<Vec<std::net::IpAddr>>, String> {
 /// The addresses `stela.efi`'s network uses instead of DHCP's.
 #[derive(Args)]
 struct Addressing {
-    /// Static IPv4 address, or DHCP
+    /// Static IPv4 address, or auto for DHCP
     #[arg(long, value_name = "ADDRESS/PREFIX|auto", value_parser = ipv4)]
     ipv4: Option<Automatic<stela_boot_core::options::StaticIpv4>>,
     /// IPv4 router, with --ipv4
     #[arg(long, value_name = "ADDRESS", requires = "ipv4")]
     gateway: Option<std::net::Ipv4Addr>,
-    /// Up to 3 DNS servers, comma-separated
+    /// Up to 3 DNS servers, comma-separated, or auto for DHCP's
     #[arg(long, value_name = "SERVERS|auto", value_parser = dns)]
     dns: Option<Automatic<Vec<std::net::IpAddr>>>,
 }
@@ -498,7 +497,8 @@ pub(crate) struct Repair {
     /// Use this IPSW instead of downloading
     #[arg(long, value_name = "FILE")]
     ipsw: Option<PathBuf>,
-    /// For finishing a create without a terminal
+    /// Read the Wi-Fi passphrase from FILE when finishing an interrupted
+    /// create without a terminal
     #[arg(long, value_name = "FILE")]
     wifi_passphrase_file: Option<PathBuf>,
     /// Where downloaded images are kept: Stela's per-user cache by default.
