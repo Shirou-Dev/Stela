@@ -19,7 +19,7 @@ pub(super) fn resolve() -> Result<PathBuf> {
 #[cfg(not(stela_boot_image))]
 pub(super) fn resolve() -> Result<PathBuf> {
     anyhow::bail!(
-        "this stela was built without its boot image (`cargo xtask dist` embeds it); pass --efi \
-         FILE"
+        "this stela was built without its boot image: build it with `cargo xtask dist`, which \
+         embeds it"
     )
 }
