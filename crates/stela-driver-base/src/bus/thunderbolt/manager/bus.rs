@@ -10,8 +10,8 @@ use crate::bus::thunderbolt::{
     config::{Address, NotificationError, PlugEvent, Reply, Route, Space},
     ring::{self, Registers},
 };
+use crate::stepped::yield_now;
 use alloc::vec::Vec;
-use core::{future::poll_fn, task::Poll};
 
 /// Linux's `TB_TIMEOUT`, per attempt.
 const REQUEST_MS: u64 = 100;
@@ -74,19 +74,6 @@ pub(super) enum Incoming {
     Notification(NotificationError),
 }
 
-/// Give the host its CPU once. Nothing wakes this task: its owner polls it.
-pub(super) async fn yield_once() {
-    let mut yielded = false;
-    poll_fn(|_| {
-        if core::mem::replace(&mut yielded, true) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    })
-    .await;
-}
-
 fn address(port: u8, space: Space, offset: u16, words: u8) -> Address {
     Address {
         port,
@@ -136,7 +123,7 @@ impl Cm {
                     Ok(id) => break id,
                     Err(channel::Error::Busy | channel::Error::Ring(ring::Error::Full)) => {
                         self.pump()?;
-                        yield_once().await;
+                        yield_now().await;
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -165,7 +152,7 @@ impl Cm {
                     }
                     Some(Event::TimedOut { request: done }) if done == id => break,
                     Some(event) => self.dispatch(event),
-                    None => yield_once().await,
+                    None => yield_now().await,
                 }
             }
         }
@@ -311,7 +298,7 @@ impl Cm {
         let deadline = self.platform.now_ms() + milliseconds;
         while self.platform.now_ms() < deadline {
             self.pump()?;
-            yield_once().await;
+            yield_now().await;
         }
         Ok(())
     }

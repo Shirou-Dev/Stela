@@ -27,7 +27,7 @@ use core::{
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    task::{Context, Poll, Waker},
+    task::Poll,
 };
 
 mod bus;
@@ -42,7 +42,8 @@ pub use bus::Transport;
 pub use tunnel::Protocol;
 
 use super::{channel, config::PlugEvent, drom};
-use bus::{Incoming, yield_once};
+use crate::stepped::{poll_once, yield_now};
+use bus::Incoming;
 use path::Adapter;
 use regs::*;
 use router::{Kind, Router, beneath, depth, downstream, parent, port_at};
@@ -315,7 +316,7 @@ impl Manager {
         let Some(task) = &mut self.task else {
             return false;
         };
-        if let Poll::Ready(()) = task.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        if let Poll::Ready(()) = poll_once(task.as_mut()) {
             self.task = None;
             return false;
         }
@@ -381,7 +382,7 @@ impl Cm {
                 return error;
             }
             self.status.idle.store(true, Ordering::Relaxed);
-            yield_once().await;
+            yield_now().await;
             self.status.idle.store(false, Ordering::Relaxed);
         }
     }
