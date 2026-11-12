@@ -221,7 +221,7 @@ pub(super) fn between_drivers_here() -> bool {
 
 /// Run `between` as a point of the device start between two drivers'
 /// calls ([`between_drivers_here`]).
-fn between_drivers<T>(between: impl FnOnce() -> T) -> T {
+pub(crate) fn between_drivers<T>(between: impl FnOnce() -> T) -> T {
     BETWEEN_GS.store(this_gs(), Ordering::Release);
     let result = between();
     BETWEEN_GS.store(0, Ordering::Release);

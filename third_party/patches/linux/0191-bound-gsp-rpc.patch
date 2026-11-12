@@ -176,7 +176,7 @@ index 3ca3de8f434082d881675e49c6c08b2cdefdc60b..fa20ca84dc46786f1fd155d70cb3190b
 + * stop GSP may already be gone, so the bound is short there; it applies to
 + * waits already under way when the stop begins.
 + */
-+#define R535_GSP_RPC_MS 30000
++#define R535_GSP_RPC_MS 4000
 +#define R535_GSP_RPC_STOP_MS 2000
 +
 +static bool

@@ -405,8 +405,13 @@ impl Host {
 
     fn report(&self, line: core::fmt::Arguments<'_>) {
         output::arguments(format_args!("LINUX {line}\n"));
-        output::flush_log();
+        flush_gpu_log();
     }
+}
+
+/// Store GPU logs to USB immediately via storage::between_drivers
+fn flush_gpu_log() {
+    crate::engine::storage::between_drivers(output::store_usb_log);
 }
 
 // SAFETY: work owns the original queue, code and root. Its live dispatcher
@@ -1383,12 +1388,12 @@ struct Started {
 unsafe impl ManagedJob for Start {
     fn run(mut self: Pin<&mut Self>) {
         output::arguments(format_args!("GPU start job running\n"));
-        output::flush_log();
+        flush_gpu_log();
         let claimed = core::mem::take(&mut *self.claimed);
         self.completed
             .set(Some(ManuallyDrop::new(start(self.kernel, claimed))));
         output::arguments(format_args!("GPU start job completed\n"));
-        output::flush_log();
+        flush_gpu_log();
     }
 }
 
@@ -1405,13 +1410,13 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
     job.result = unsafe { gpu::nouveau::start() };
     if let Err(errno) = job.result {
         output::arguments(format_args!("GPU nouveau::start error: errno={errno:?}\n"));
-        output::flush_log();
+        flush_gpu_log();
         // No source-specific device return was acknowledged.
         core::mem::forget(claimed);
         return job;
     }
     output::arguments(format_args!("GPU nouveau::start passed\n"));
-    output::flush_log();
+    flush_gpu_log();
     for claimed in claimed {
         let authority = {
             let mut function = claimed.device.config.0.borrow_mut();
@@ -1817,10 +1822,10 @@ fn mount_and_start(
     // original owners until its genuine managed child has joined.
     let pending = unsafe { threads.submit(job) }.map_err(|refusal| Error::Submit(refusal.error))?;
     output::arguments(format_args!("GPU mount_and_start waiting for child (deadline={START_SECONDS}s)\n"));
-    output::flush_log();
+    flush_gpu_log();
     wait_for_child(runtime, threads, time, deadline, || pending.status().joined)?;
     output::arguments(format_args!("GPU mount_and_start child joined successfully\n"));
-    output::flush_log();
+    flush_gpu_log();
     // SAFETY: physical return on the same dispatcher with the joined status.
     let joined =
         unsafe { pending.try_join() }.map_err(|_| environment_error(WorkError::Pending))?;
@@ -1843,13 +1848,29 @@ fn wait_for_child(
     deadline: u64,
     finished: impl Fn() -> bool,
 ) -> Result<(), Error> {
+    let mut last_flush = host::rdtsc();
     loop {
+        // Allow pending MSI interrupts from the GPU to reach the CPU vector
+        native_irq::interrupt_window();
+
         // SAFETY: runtime is on its dispatcher after real physical return.
         unsafe { threads.dispatcher_step() }.map_err(Error::Threads)?;
         if finished() {
+            flush_gpu_log();
             return Ok(());
         }
+
+        let now = host::rdtsc();
+        if now.wrapping_sub(last_flush) > 1_000_000_000 {
+            last_flush = now;
+            flush_gpu_log();
+        }
+
         if time.now_ns().map_err(environment_error)? >= deadline {
+            output::arguments(format_args!(
+                "GPU wait_for_child: TIMED OUT after {START_SECONDS}s\n"
+            ));
+            flush_gpu_log();
             return Err(Error::Timeout);
         }
         runtime.step_or_idle().map_err(environment_error)?;
