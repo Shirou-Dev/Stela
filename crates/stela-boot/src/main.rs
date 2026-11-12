@@ -326,6 +326,7 @@ extern "sysv64" fn run(handoff: &mut firmware::Handoff) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     // No allocator, formatting of caller-supplied values, Rust lock, unwind,
-    // poison recovery or continuation is allowed on this terminal path.
+    // poison recovery or continuation is allowed before the port has the
+    // report; the screen and the boot log are tried after it.
     output::panic(info)
 }

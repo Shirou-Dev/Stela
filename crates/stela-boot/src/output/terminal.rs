@@ -1,4 +1,5 @@
-//! Terminal panic path, independent of allocator, output queues and callbacks.
+//! Terminal panic path. Its report to the port is independent of allocator,
+//! output queues and callbacks; the screen and the boot log get it after.
 use crate::serial::Serial;
 use core::{
     arch::asm,
@@ -11,6 +12,9 @@ use core::{
 /// then 1 without a hypervisor and 2 under one.
 static EXIT_PORT: AtomicU8 = AtomicU8::new(0);
 static PRINTING: AtomicBool = AtomicBool::new(false);
+/// Set while the first panic's report goes on to the screen and the boot
+/// log, after the port has all of it.
+static SHOWING: AtomicBool = AtomicBool::new(false);
 
 /// The hypervisor exit port ([`stela_boot_core::exit_port`]) under a
 /// hypervisor, `None` on a PC without one. CPUID is read once; no
@@ -155,8 +159,31 @@ pub(crate) fn panic(info: &PanicInfo<'_>) -> ! {
             }
         }
         print_stack();
+        // The port has the whole report. A PC without a serial port keeps
+        // only the screen and the boot log, so the same report goes there
+        // through the stop every other failure takes. That path allocates
+        // and takes the output's locks: where the panic was inside them it
+        // panics again or never returns, so the port gets its stop line
+        // first and its report stands.
         let _ = writeln!(Serial, "STELA STOPPED code=0x11; power off to continue");
-        // No heap/log/runtime code may run between this report and halt.
+        SHOWING.store(true, Ordering::Release);
+        let stack: *const u64;
+        // SAFETY: reads the stack pointer.
+        unsafe { asm!("mov {}, rsp", out(reg) stack, options(nomem, nostack, preserves_flags)) };
+        // SAFETY: the stack pointer's own page is mapped.
+        let callers = unsafe { Callers::at(stack) };
+        match info.location() {
+            Some(at) => super::fatal(format_args!(
+                "Stela failed at {}:{}: {message} stack={callers}",
+                at.file(),
+                at.line()
+            )),
+            None => super::fatal(format_args!("Stela failed: {message} stack={callers}")),
+        }
+    }
+    if SHOWING.load(Ordering::Acquire) {
+        // A panic inside the screen's report: the port already has the
+        // first and its stop line, so the run ends here.
         exit(0x11);
     }
     // Other panicking CPUs must not end the run before the first report ends.
