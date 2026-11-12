@@ -697,19 +697,18 @@ fn a_sliced_initialization_matches_the_blocking_one_and_waits_little_per_call() 
             let expected = Hardware::new(&blocking, &blocking).unwrap().initialize();
             let model = Model::ready(flash);
             prepare(&model);
-            let slice = Slice::new();
+            let slice = Allowance::new(STEP_US);
             let mut hw = Hardware::new(&model, &model).unwrap().sliced(&slice);
-            let mut task = pin!(hw.initialize_steps());
-            let mut context = Context::from_waker(Waker::noop());
+            let mut task = core::pin::pin!(hw.initialize_steps());
             let mut calls = 0;
             let result = loop {
                 slice.refill();
                 let before = model.elapsed.get();
-                let poll = task.as_mut().poll(&mut context);
+                let poll = stela_driver_base::stepped::poll_once(task.as_mut());
                 let waited = model.elapsed.get() - before;
                 assert!(waited <= 60_000, "case {case}: {waited}");
                 calls += 1;
-                if let Poll::Ready(result) = poll {
+                if let core::task::Poll::Ready(result) = poll {
                     break result;
                 }
             };

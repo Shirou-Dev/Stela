@@ -2,12 +2,7 @@
 // Copyright (c) 2018 Intel Corporation
 //! Checked boot-lifetime adaptation of Linux igc_base/mac/phy/nvm/i225.c.
 use crate::{block::BlockError, bus::mmio::Mmio};
-use core::{
-    cell::Cell,
-    future::Future,
-    pin::{Pin, pin},
-    task::{Context, Poll, Waker},
-};
+use stela_driver_base::stepped::{Allowance, block_on};
 
 pub(super) trait Registers {
     fn read(&self, register: usize) -> u32;
@@ -26,56 +21,10 @@ pub(super) trait Timer {
     fn delay(&self, microseconds: u64) -> Result<(), BlockError>;
 }
 
-/// What one runtime call may still wait: a sequence driven in slices
-/// ([`Hardware::sliced`]) yields once its waits use it up, and the next call
-/// resumes it with a fresh slice. A processor's exit must end well inside
-/// half a second.
-pub(super) struct Slice {
-    left: Cell<u64>,
-}
-
-impl Slice {
-    /// Each call's waits: up to this, plus the one delay that crosses it.
-    pub(super) const MICROSECONDS: u64 = 40_000;
-
-    pub(super) const fn new() -> Self {
-        Self {
-            left: Cell::new(Self::MICROSECONDS),
-        }
-    }
-
-    /// A new call's share.
-    pub(super) fn refill(&self) {
-        self.left.set(Self::MICROSECONDS);
-    }
-}
-
-/// Pending once, then ready: hands the processor back mid-sequence.
-struct Yield(bool);
-
-impl Future for Yield {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
-        if self.0 {
-            Poll::Ready(())
-        } else {
-            self.0 = true;
-            Poll::Pending
-        }
-    }
-}
-
-/// Run a sequence to its end in this call, as attachment and teardown do.
-/// Without a [`Slice`] it never yields, so one poll completes it.
-pub(super) fn block<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
+/// Each runtime call's share of waiting, when a sequence runs in steps
+/// ([`Hardware::sliced`]): up to this, plus the one delay that crosses it.
+/// A processor's exit must end well inside half a second.
+pub(super) const STEP_US: u64 = 40_000;
 
 /// A semaphore-held operation's result, failing if either failed.
 fn joined<V>(
@@ -389,8 +338,8 @@ pub(super) struct Hardware<'a, R: Registers, T: Timer> {
     timer: &'a T,
     semaphore_attempts: usize,
     clear_semaphore_once: bool,
-    /// The share of waiting this call has, when driven in slices.
-    slice: Option<&'a Slice>,
+    /// The share of waiting this call has, when run in steps.
+    slice: Option<&'a Allowance>,
 }
 
 impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
@@ -411,7 +360,7 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     }
 
     /// Drive this controller's sequences in slices of `slice`.
-    pub(super) fn sliced(mut self, slice: &'a Slice) -> Self {
+    pub(super) fn sliced(mut self, slice: &'a Allowance) -> Self {
         self.slice = Some(slice);
         self
     }
@@ -421,11 +370,7 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     async fn pause(&self, microseconds: u64) -> Result<(), BlockError> {
         self.timer.delay(microseconds)?;
         if let Some(slice) = self.slice {
-            let left = slice.left.get().saturating_sub(microseconds);
-            slice.left.set(left);
-            if left == 0 {
-                Yield(false).await;
-            }
+            slice.spent(microseconds).await;
         }
         Ok(())
     }
@@ -489,7 +434,7 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     /// [`DROP_MASTER_POLLS`]). Only a completed reset proves the controller
     /// writes no ring.
     pub(super) fn stop(&self, master_polls: usize) -> Result<(), BlockError> {
-        block(self.stop_steps(master_polls))
+        block_on(self.stop_steps(master_polls))
     }
     pub(super) async fn stop_steps(&self, master_polls: usize) -> Result<(), BlockError> {
         self.modify(RCTL, RCTL_EN, 0)?;
@@ -716,14 +661,14 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     /// observed link either way. A failed PHY exchange reports no link, as
     /// Linux's watchdog treats it; an absent function is a register error.
     pub(super) fn check_for_copper_link(&mut self) -> Result<Option<Negotiated>, BlockError> {
-        block(self.copper_link(2))
+        block_on(self.copper_link(2))
     }
 
     /// The same check repeated after one that found no link, with no link
     /// change since: that check's read cleared the latched-low bit, so one
     /// read gives the present state.
     pub(super) fn recheck_copper_link(&mut self) -> Result<Option<Negotiated>, BlockError> {
-        block(self.copper_link(1))
+        block_on(self.copper_link(1))
     }
 
     pub(super) async fn copper_link(
@@ -851,14 +796,14 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     /// The 1000BASE-T status register's remote receiver OK bit, which Linux
     /// waits on for up to two seconds before reporting a 1 Gb/s carrier.
     pub(super) fn remote_receiver_ready(&mut self) -> Result<bool, BlockError> {
-        block(self.remote_receiver_ready_steps())
+        block_on(self.remote_receiver_ready_steps())
     }
     pub(super) async fn remote_receiver_ready_steps(&mut self) -> Result<bool, BlockError> {
         Ok(self.phy_read(PHY_GIGABIT_STATUS).await? & REMOTE_RECEIVER_OK != 0)
     }
 
     pub(super) fn initialize(&mut self) -> Result<u32, BlockError> {
-        block(self.initialize_steps())
+        block_on(self.initialize_steps())
     }
     /// igc_reset_hw, the NVM check, PHY reset and copper setup, and the MAC
     /// configuration: in slices when [`Self::sliced`].

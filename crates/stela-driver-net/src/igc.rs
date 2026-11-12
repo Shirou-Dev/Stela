@@ -31,14 +31,13 @@ use crate::{
     },
     registers,
 };
-use alloc::{boxed::Box, format, rc::Rc, string::String, vec::Vec};
+use alloc::{format, rc::Rc, string::String, vec::Vec};
 use core::{
-    future::Future,
     mem::ManuallyDrop,
-    pin::Pin,
     sync::atomic::{Ordering, fence},
-    task::{Context, Poll, Waker},
+    task::Poll,
 };
+use stela_driver_base::stepped::{Allowance, Stepped};
 
 const VENDOR: u16 = 0x8086;
 /// igc.h IGC_DEFAULT_RXD and IGC_DEFAULT_TXD.
@@ -194,8 +193,8 @@ pub struct Igc {
 /// master polls 2 ms apart among them, spread over as many calls as needed.
 struct Recovery {
     /// The stop and reinitialization, yielding whenever a slice is used up.
-    task: Pin<Box<dyn Future<Output = Result<u32, BlockError>>>>,
-    slice: Rc<hardware::Slice>,
+    task: Stepped<'static, Result<u32, BlockError>>,
+    slice: Rc<Allowance>,
     /// The PHY identity of a finished reinitialization, whose rings start
     /// on the next call.
     finished: Option<u32>,
@@ -384,10 +383,10 @@ impl Igc {
         }
         let _ = self.statistics.accumulate(&self.device);
         let (device, clock) = (self.device, self.clock.clone());
-        let slice = Rc::new(hardware::Slice::new());
+        let slice = Rc::new(Allowance::new(hardware::STEP_US));
         let shared = slice.clone();
         self.recovery = Some(Recovery {
-            task: Box::pin(async move {
+            task: Stepped::new(async move {
                 let mut hardware = hardware::Hardware::new(&device, &clock)?.sliced(&shared);
                 hardware.stop_steps(hardware::MASTER_POLLS).await?;
                 hardware.initialize_steps().await
@@ -409,8 +408,7 @@ impl Igc {
             }
             None => {
                 recovery.slice.refill();
-                let mut context = Context::from_waker(Waker::noop());
-                match recovery.task.as_mut().poll(&mut context) {
+                match recovery.task.step() {
                     Poll::Pending => return None,
                     // The rings start on the next call, in a slice of their own.
                     Poll::Ready(Ok(identity)) => {
