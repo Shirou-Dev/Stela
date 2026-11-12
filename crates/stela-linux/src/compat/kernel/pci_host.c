@@ -128,6 +128,33 @@ static void free_coherent(struct device *dev, size_t size, void *cpu, dma_addr_t
 	__free_pages(virt_to_page(cpu), (unsigned int)get_order(size));
 }
 
+/* Linux dma_common_alloc_pages, which x86's direct and IOMMU mappings both
+ * reach from dma_alloc_pages: zeroed pages, mapped for the device. nouveau's
+ * falcon firmware (the GSP booter on a GTX 16 or RTX 20) is loaded from such
+ * pages and takes their address without a check. */
+static struct page *alloc_mapped_pages(struct device *dev, size_t size, dma_addr_t *address,
+				       enum dma_data_direction direction, gfp_t gfp)
+{
+	unsigned int order = (unsigned int)get_order(size);
+	struct page *page = alloc_pages(gfp | __GFP_ZERO, order);
+
+	if (!page)
+		return NULL;
+	*address = map_phys(dev, page_to_phys(page), size, direction, 0);
+	if (*address == DMA_MAPPING_ERROR) {
+		__free_pages(page, order);
+		return NULL;
+	}
+	return page;
+}
+
+static void free_mapped_pages(struct device *dev, size_t size, struct page *page,
+			      dma_addr_t address, enum dma_data_direction direction)
+{
+	unmap_phys(dev, address, size, direction, 0);
+	__free_pages(page, (unsigned int)get_order(size));
+}
+
 /* The device reaches whatever its owner hands it: its addresses, not physical
  * memory, are what a mask must cover. */
 static int mask_supported(struct device *dev, u64 mask)
@@ -142,6 +169,8 @@ static const struct dma_map_ops mapping_ops = {
 	.unmap_sg = unmap_scatter,
 	.alloc = alloc_coherent,
 	.free = free_coherent,
+	.alloc_pages_op = alloc_mapped_pages,
+	.free_pages = free_mapped_pages,
 	.dma_supported = mask_supported,
 };
 
@@ -413,6 +442,17 @@ int main(void)
 
 	assert(cpu && mapped == 1 && !*(u8 *)cpu && coherent > BUS_OFFSET);
 	dma_free_coherent(&dev->dev, PAGE_SIZE, cpu, coherent);
+	assert(!mapped);
+
+	/* Pages for the device, as nouveau's falcon firmware asks for them. */
+	dma_addr_t pages;
+	void *image = dma_alloc_noncoherent(&dev->dev, PAGE_SIZE + 1, &pages, DMA_TO_DEVICE,
+					    GFP_KERNEL);
+
+	assert(image && mapped == 1 && !*(u8 *)image && pages > BUS_OFFSET);
+	sg_init_one(&list[0], image, 2 * PAGE_SIZE);
+	assert(sg_page(&list[0]) == virt_to_page(image));
+	dma_free_noncoherent(&dev->dev, PAGE_SIZE + 1, image, pages, DMA_TO_DEVICE);
 	assert(!mapped);
 
 	msi_error = -ENOSPC;
