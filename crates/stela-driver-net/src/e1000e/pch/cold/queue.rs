@@ -6,10 +6,17 @@
 //! jumbo workaround is explicitly restored to its non-jumbo settings. FCS is
 //! received and removed in software as in that source profile. No IRQ, EEE,
 //! pause, VLAN, jumbo, managed firmware or power-transition profile is claimed.
-use super::{Controller, Delay, Error, Registers, i219, lpt, nvm, spt};
+use super::{Bus, Controller, Delay, Error, Registers, i219, lpt, nvm, spt};
 use crate::{Link, LinkError, MAX_FRAME, MIN_FRAME, Mac, bus::dma::DmaAllocator};
-use alloc::{format, vec::Vec};
-use core::sync::atomic::{Ordering, fence};
+use alloc::{format, rc::Rc, vec::Vec};
+use core::{
+    ops::{Deref, DerefMut},
+    sync::atomic::{Ordering, fence},
+    task::Poll,
+};
+use stela_driver_base::stepped::{Allowance, Stepped, block_on};
+
+type Phy<R, D> = super::super::Phy<Bus<R>, D>;
 
 // Common descriptor storage only; the 82574-specific programming/reset/start
 // routines are never called. Addresses are boot-lifetime coherent DMA RAM.
@@ -91,12 +98,49 @@ const LPI_PLL_SHUT: u16 = 0x4412;
 const EEE_PCS_STATUS: u16 = 0x182e;
 const EEE_ADVERTISEMENT: u16 = 0x040e;
 const LPI_ENABLE: u16 = 0x6000;
+/// The most one call waits on a link change, ending its step: the change
+/// goes on at the next call.
+const STEP_US: u64 = 40_000;
+/// The steps a stop or drop gives a link change under way to finish.
+const SETTLE_STEPS: usize = 2;
+
+/// The controller, lent whole to the link change under way, if any. Every
+/// path that reaches it checks [`Ethernet::change`] first.
+struct Kept<T>(Option<T>);
+impl<T> Deref for Kept<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0
+            .as_ref()
+            .expect("PCH controller lent to a link change")
+    }
+}
+impl<T> DerefMut for Kept<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.0
+            .as_mut()
+            .expect("PCH controller lent to a link change")
+    }
+}
+
+/// The link to remember and whether it is up.
+type Changed = (Option<u32>, bool);
+
+/// A link change under way, holding the controller until it completes.
+struct Change<R: Registers + nvm::Registers, D: Delay + Clone + 'static> {
+    task: Stepped<'static, (Controller<R, D>, Result<Changed, Error>)>,
+    slice: Rc<Allowance>,
+}
 
 /// The controller owner and DMA storage remain held after an
 /// uncertain doorbell, timeout, removal or control failure. A fresh object is
 /// not a retry mechanism; only an external real reset/recovery grants one.
-pub struct Ethernet<R: Registers + nvm::Registers, D: Delay + Clone> {
-    controller: Controller<R, D>,
+pub struct Ethernet<R: Registers + nvm::Registers, D: Delay + Clone + 'static> {
+    controller: Kept<Controller<R, D>>,
+    change: Option<Change<R, D>>,
+    station: Mac,
+    nvm_repair_left_out: bool,
+    ulp_exit_failed: bool,
     receive: Ring,
     transmit: Ring,
     next_rx: usize,
@@ -107,7 +151,7 @@ pub struct Ethernet<R: Registers + nvm::Registers, D: Delay + Clone> {
     stopped: bool,
     failure: Option<Error>,
 }
-impl<R: Registers + nvm::Registers, D: Delay + Clone> Ethernet<R, D> {
+impl<R: Registers + nvm::Registers, D: Delay + Clone + 'static> Ethernet<R, D> {
     /// # Safety
     /// `dma` grants coherent boot-lifetime CPU/DMA RAM reachable by the
     /// same PCI requester as `controller`, using the allocator's real
@@ -130,7 +174,11 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Ethernet<R, D> {
         let receive = Ring::new(dma).map_err(Error::Dma)?;
         let transmit = Ring::new(dma).map_err(Error::Dma)?;
         let mut this = Self {
-            controller,
+            station: controller.station,
+            nvm_repair_left_out: controller.nvm.repair_left_out(),
+            ulp_exit_failed: controller.ulp_exit_failed(),
+            controller: Kept(Some(controller)),
+            change: None,
             receive,
             transmit,
             next_rx: 0,
@@ -157,17 +205,21 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Ethernet<R, D> {
     /// Whether the NVM's checksum valid bit was clear, which Linux repairs
     /// in flash and Stela leaves unwritten.
     pub fn nvm_repair_left_out(&self) -> bool {
-        self.controller.nvm.repair_left_out()
+        self.nvm_repair_left_out
     }
     /// Whether the PHY did not leave ULP when asked and the start went on.
     pub fn ulp_exit_failed(&self) -> bool {
-        self.controller.ulp_exit_failed()
+        self.ulp_exit_failed
     }
     fn check(&mut self) -> Result<(), Error> {
         if let Some(error) = &self.failure
             && error.minimum_cause().is_some()
         {
             return Err(error.clone());
+        }
+        if self.change.is_some() {
+            // The link change holds the controller and checks it itself.
+            return Ok(());
         }
         if let Some(error) = self.controller.minimum_failure() {
             return Err(super::Fault::Minimum(error).into());
@@ -182,8 +234,11 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Ethernet<R, D> {
         }
     }
     fn modify_mac(&mut self, at: u32, clear: u32, set: u32) -> Result<(), Error> {
-        let value = self.controller.read(at)?;
-        self.controller.write(at, (value & !clear) | set)
+        Self::modify_in(&mut self.controller, at, clear, set)
+    }
+    fn modify_in(c: &mut Controller<R, D>, at: u32, clear: u32, set: u32) -> Result<(), Error> {
+        let value = c.read(at)?;
+        c.write(at, (value & !clear) | set)
     }
     fn kmrn(&mut self, index: u8, write: Option<u16>) -> Result<u16, Error> {
         Ok(self.controller.phy.transaction(|p| {
@@ -399,172 +454,235 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Ethernet<R, D> {
         Ok(())
     }
     fn disable_eee(&mut self) -> Result<(), Error> {
-        let lpt = self.controller.profile.is_lpt_or_newer();
-        self.controller.phy.transaction(|p| {
-            Controller::<R, D>::emi(
-                p,
-                if lpt {
-                    lpt::EEE_ADVERTISEMENT
-                } else {
-                    EEE_ADVERTISEMENT
-                },
-                0,
-            )?;
-            let control = super::super::Register {
-                page: 772,
-                index: 20,
-            };
-            let value = p.access(control, None)? & !LPI_ENABLE;
-            if !lpt {
-                p.access(
+        block_on(Self::disable_eee_steps(&mut self.controller))
+    }
+    async fn disable_eee_steps(c: &mut Controller<R, D>) -> Result<(), Error> {
+        let lpt = c.profile.is_lpt_or_newer();
+        c.phy
+            .transaction_steps(async |p: &mut Phy<R, D>| {
+                Controller::<R, D>::emi_steps(
+                    p,
+                    if lpt {
+                        lpt::EEE_ADVERTISEMENT
+                    } else {
+                        EEE_ADVERTISEMENT
+                    },
+                    0,
+                )
+                .await?;
+                let control = super::super::Register {
+                    page: 772,
+                    index: 20,
+                };
+                let value = p.access_steps(control, None).await? & !LPI_ENABLE;
+                if !lpt {
+                    p.access_steps(
+                        super::super::Register { page: 0, index: 16 },
+                        Some(LPI_PLL_SHUT),
+                    )
+                    .await?;
+                    let pll = p
+                        .access_steps(super::super::Register { page: 0, index: 17 }, None)
+                        .await?;
+                    Controller::<R, D>::emi_steps(p, LPI_PLL_SHUT, pll & !4).await?;
+                }
+                p.access_steps(
                     super::super::Register { page: 0, index: 16 },
-                    Some(LPI_PLL_SHUT),
-                )?;
-                let pll = p.access(super::super::Register { page: 0, index: 17 }, None)?;
-                Controller::<R, D>::emi(p, LPI_PLL_SHUT, pll & !4)?;
-            }
-            p.access(
-                super::super::Register { page: 0, index: 16 },
-                Some(if lpt {
-                    lpt::EEE_PCS_STATUS
-                } else {
-                    EEE_PCS_STATUS
-                }),
-            )?;
-            p.access(super::super::Register { page: 0, index: 17 }, None)?;
-            p.access(control, Some(value))?;
-            Ok(())
-        })?;
+                    Some(if lpt {
+                        lpt::EEE_PCS_STATUS
+                    } else {
+                        EEE_PCS_STATUS
+                    }),
+                )
+                .await?;
+                p.access_steps(super::super::Register { page: 0, index: 17 }, None)
+                    .await?;
+                p.access_steps(control, Some(value)).await?;
+                Ok(())
+            })
+            .await?;
         Ok(())
     }
+    /// Poll the link: two MAC reads while nothing changed. A change runs
+    /// the PHY and K1 workarounds as stepped work that holds the controller
+    /// and waits at most [`STEP_US`] (plus the one delay that crosses it)
+    /// per call, so a PHY semaphore the Intel ME holds or a slow management
+    /// bus never holds the processor for long; the link stays down until
+    /// the work completes.
     fn update_link(&mut self) -> Result<bool, Error> {
-        self.check()?;
-        let status = self.controller.read(super::STATUS)? & LINK_SUMMARY;
-        // IMC masks interrupts, but ICR still latches link-status changes.
-        // Consume that event so same-speed reconnects cannot bypass
-        // PHY/K1 workarounds because the MAC summary is unchanged.
-        let event = self.controller.read(super::ICR)?;
-        if self.link == Some(status) && event & LINK_EVENT == 0 {
-            return Ok(status & LINK_UP != 0);
+        if self.change.is_none() {
+            self.check()?;
+            let status = self.controller.read(super::STATUS)? & LINK_SUMMARY;
+            // IMC masks interrupts, but ICR still latches link-status changes.
+            // Consume that event so same-speed reconnects cannot bypass
+            // PHY/K1 workarounds because the MAC summary is unchanged.
+            let event = self.controller.read(super::ICR)?;
+            if self.link == Some(status) && event & LINK_EVENT == 0 {
+                return Ok(status & LINK_UP != 0);
+            }
+            let mut controller = self.controller.0.take().expect("kept PCH controller");
+            let slice = Rc::new(Allowance::new(STEP_US));
+            controller.phy.allowance = Some(slice.clone());
+            let task = Stepped::new(async move {
+                let result = Self::link_change(&mut controller, status).await;
+                controller.phy.allowance = None;
+                (controller, result)
+            });
+            self.change = Some(Change { task, slice });
         }
+        self.advance()
+    }
+    /// One step of the link change under way: its result once complete,
+    /// with the controller back; `false` (no link yet) until then.
+    fn advance(&mut self) -> Result<bool, Error> {
+        let Some(change) = &mut self.change else {
+            return Ok(self.link.is_some_and(|status| status & LINK_UP != 0));
+        };
+        change.slice.refill();
+        let Poll::Ready((controller, result)) = change.task.step() else {
+            return Ok(false);
+        };
+        self.change = None;
+        self.controller.0 = Some(controller);
+        let (link, up) = result?;
+        self.link = link;
+        Ok(up)
+    }
+    /// Finish a link change under way in at most `steps` steps, for a stop.
+    fn settle(&mut self, steps: usize) -> Result<(), Error> {
+        for _ in 0..steps {
+            if self.change.is_none() {
+                return Ok(());
+            }
+            if let Err(error) = self.advance() {
+                self.failure.get_or_insert_with(|| error.clone());
+                self.poison();
+                return Err(error);
+            }
+        }
+        if self.change.is_none() {
+            Ok(())
+        } else {
+            Err(Error::LinkChangeUnfinished)
+        }
+    }
+    /// The PHY, K1 and MAC workarounds for an observed link `status`: the
+    /// link to remember and whether it is up.
+    async fn link_change(c: &mut Controller<R, D>, status: u32) -> Result<Changed, Error> {
         let mii = super::super::Register::new(0, 1)?;
-        self.controller.phy.read(mii)?; // clear latched-low observation
-        let phy = self.controller.phy.read(mii)?;
+        c.phy.read_steps(mii).await?; // clear latched-low observation
+        let phy = c.phy.read_steps(mii).await?;
         if status & LINK_UP == 0 || phy & PHY_LINK_READY != PHY_LINK_READY {
-            self.controller
-                .lpt_link_common(if status & LINK_UP != 0 && phy & 4 != 0 {
-                    Some(status)
-                } else {
-                    None
-                })?;
-            self.link = if status & LINK_UP == 0 {
+            c.lpt_link_common(if status & LINK_UP != 0 && phy & 4 != 0 {
+                Some(status)
+            } else {
+                None
+            })?;
+            let link = if status & LINK_UP == 0 {
                 Some(status)
             } else {
                 None
             };
-            return Ok(false);
+            return Ok((link, false));
         }
         let half_ten = status & (FULL_DUPLEX | SPEED_MASK) == 0;
-        self.modify_mac(
-            TIPG,
-            0x3ff,
-            if half_ten {
-                0xff
-            } else if self.controller.is_i219()
-                && status & FULL_DUPLEX != 0
-                && status & (1 << 7) == 0
-            {
-                0xc
-            } else {
-                8
-            },
-        )?;
-        let lpt = self.controller.profile.is_lpt_or_newer();
-        let mtp = self.controller.mtp_family().is_some();
-        self.controller.phy.transaction(|p| {
-            Controller::<R, D>::emi(
-                p,
-                if lpt { lpt::RX_CONFIG } else { RX_CONFIG },
-                u16::from(!half_ten),
-            )?;
-            if lpt {
-                let gate = lpt::PLL_CLOCK_GATE;
-                let word = p.access(gate, None)?;
-                p.access(
-                    gate,
-                    Some(
-                        (word & !lpt::PLL_CLOCK_GATE_MASK)
-                            | if status & (1 << 7) != 0 {
-                                if mtp {
-                                    super::mtp::GIGABIT_PLL_CLOCK_GATE
+        let gap = if half_ten {
+            0xff
+        } else if c.is_i219() && status & FULL_DUPLEX != 0 && status & (1 << 7) == 0 {
+            0xc
+        } else {
+            8
+        };
+        Self::modify_in(c, TIPG, 0x3ff, gap)?;
+        let lpt = c.profile.is_lpt_or_newer();
+        let mtp = c.mtp_family().is_some();
+        c.phy
+            .transaction_steps(async |p: &mut Phy<R, D>| {
+                Controller::<R, D>::emi_steps(
+                    p,
+                    if lpt { lpt::RX_CONFIG } else { RX_CONFIG },
+                    u16::from(!half_ten),
+                )
+                .await?;
+                if lpt {
+                    let gate = lpt::PLL_CLOCK_GATE;
+                    let word = p.access_steps(gate, None).await?;
+                    p.access_steps(
+                        gate,
+                        Some(
+                            (word & !lpt::PLL_CLOCK_GATE_MASK)
+                                | if status & (1 << 7) != 0 {
+                                    if mtp {
+                                        super::mtp::GIGABIT_PLL_CLOCK_GATE
+                                    } else {
+                                        lpt::PLL_CLOCK_GATE_GIGABIT
+                                    }
                                 } else {
-                                    lpt::PLL_CLOCK_GATE_GIGABIT
-                                }
-                            } else {
-                                lpt::PLL_CLOCK_GATE_SLOW
-                            },
-                    ),
-                )?;
-                if status & (1 << 7) != 0 {
-                    let pm = super::super::Register {
-                        page: 770,
-                        index: 17,
-                    };
-                    let word = p.access(pm, None)?;
-                    p.access(pm, Some(word | lpt::K1_CLOCK_REQUEST))?;
+                                    lpt::PLL_CLOCK_GATE_SLOW
+                                },
+                        ),
+                    )
+                    .await?;
+                    if status & (1 << 7) != 0 {
+                        let pm = super::super::Register {
+                            page: 770,
+                            index: 17,
+                        };
+                        let word = p.access_steps(pm, None).await?;
+                        p.access_steps(pm, Some(word | lpt::K1_CLOCK_REQUEST))
+                            .await?;
+                    }
                 }
-            }
-            Ok(())
-        })?;
-        if self.controller.is_i219() {
+                Ok(())
+            })
+            .await?;
+        if c.is_i219() {
             let gap = super::super::Register {
                 page: 776,
                 index: 20,
             };
             if status & (1 << 7) != 0 {
-                let word = self.controller.phy.read(gap)?;
+                let word = c.phy.read_steps(gap).await?;
                 if ((word >> 2) & 0x3ff) < 0x18 {
-                    self.controller
-                        .phy
-                        .write(gap, (word & !(0x3ff << 2)) | (0x18 << 2))?;
+                    c.phy
+                        .write_steps(gap, (word & !(0x3ff << 2)) | (0x18 << 2))
+                        .await?;
                 }
             } else {
-                self.controller.phy.write(gap, 0xc023)?;
+                c.phy.write_steps(gap, 0xc023).await?;
             }
         }
         if lpt {
-            self.controller.lpt_link_common(Some(status))?;
-            self.disable_eee()?;
-            self.modify_mac(super::TCTL, 0x3ff << 12, 63 << 12)?;
-            self.modify_mac(super::CTRL, PAUSE, 0)?;
-            self.link = Some(status);
-            return Ok(true);
+            c.lpt_link_common(Some(status))?;
+            Self::disable_eee_steps(c).await?;
+            Self::modify_in(c, super::TCTL, 0x3ff << 12, 63 << 12)?;
+            Self::modify_in(c, super::CTRL, PAUSE, 0)?;
+            return Ok((Some(status), true));
         }
         // 82579 K1 and half-duplex preamble workarounds apply on every observed
         // speed/duplex transition, including a cable reconnection while polling.
-        let hv = self
-            .controller
+        let hv = c
             .phy
-            .read(super::super::Register::new(0, 26)?)?;
+            .read_steps(super::super::Register::new(0, 26)?)
+            .await?;
         if hv & 0x1040 != 0x1040 || u32::from((hv & 0x300) >> 8) != (status & SPEED_MASK) >> 6 {
-            self.link = None;
-            return Ok(false);
+            return Ok((None, false));
         }
         if hv & 0x300 != 0 {
-            self.controller.modify(770, 17, 1 << 14, 0)?;
+            c.modify_steps(770, 17, 1 << 14, 0).await?;
         } else {
-            self.modify_mac(FEXTNVM4, 7, 3)?;
+            Self::modify_in(c, FEXTNVM4, 7, 3)?;
         }
-        self.controller.modify(
+        c.modify_steps(
             770,
             16,
             0x7000,
             if status & FULL_DUPLEX == 0 { 0x1000 } else { 0 },
-        )?;
-        self.modify_mac(super::TCTL, 0x3ff << 12, 63 << 12)?;
-        self.modify_mac(super::CTRL, PAUSE, 0)?;
-        self.link = Some(status);
-        Ok(true)
+        )
+        .await?;
+        Self::modify_in(c, super::TCTL, 0x3ff << 12, 63 << 12)?;
+        Self::modify_in(c, super::CTRL, PAUSE, 0)?;
+        Ok((Some(status), true))
     }
     fn offer(&mut self, index: usize) {
         let base = index * DESCRIPTOR;
@@ -647,6 +765,7 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Ethernet<R, D> {
         if self.stopped {
             return Ok(());
         }
+        self.settle(SETTLE_STEPS)?;
         self.check()?;
         let result = (|| {
             self.controller.write(super::IMC, u32::MAX)?;
@@ -693,8 +812,16 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Ethernet<R, D> {
         LinkError::Adapter(format!("PCH: {error}"))
     }
 }
-impl<R: Registers + nvm::Registers, D: Delay + Clone> Drop for Ethernet<R, D> {
+impl<R: Registers + nvm::Registers, D: Delay + Clone + 'static> Drop for Ethernet<R, D> {
     fn drop(&mut self) {
+        if self.settle(SETTLE_STEPS).is_err()
+            && let Some(change) = self.change.take()
+        {
+            // The PHY is mid-operation, perhaps holding its semaphore:
+            // keep the controller owner it holds, as a poisoned PHY does.
+            core::mem::forget(change);
+            return;
+        }
         if !self.stopped && !self.controller.is_poisoned() {
             let _ = self.shutdown();
         }
@@ -702,9 +829,9 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Drop for Ethernet<R, D> {
         // DMA RAM is independently boot-lifetime, including after uncertainty.
     }
 }
-impl<R: Registers + nvm::Registers, D: Delay + Clone> Link for Ethernet<R, D> {
+impl<R: Registers + nvm::Registers, D: Delay + Clone + 'static> Link for Ethernet<R, D> {
     fn mac(&self) -> Mac {
-        self.controller.station
+        self.station
     }
     fn carrier(&mut self) -> bool {
         match self.update_link() {
@@ -759,6 +886,10 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Link for Ethernet<R, D> {
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
         self.check().map_err(|e| self.error(e))?;
         self.update_link().map_err(|e| self.error(e))?;
+        if self.change.is_some() {
+            // The link change holds the controller, and with it RDT.
+            return Ok(false);
+        }
         for _ in 0..DESCRIPTORS {
             let index = self.next_rx;
             let base = index * DESCRIPTOR;

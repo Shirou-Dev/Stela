@@ -14,6 +14,9 @@ pub mod cold;
 pub mod io;
 pub mod nvm;
 
+use alloc::rc::Rc;
+use stela_driver_base::stepped::{Allowance, block_on};
+
 const MDIC: u32 = 0x20;
 const FWSM: u32 = 0x5b54;
 const EXTCNF_CTRL: u32 = 0xf00;
@@ -160,6 +163,9 @@ pub struct Phy<R: Registers, D: Delay> {
     poisoned: bool,
     retry_count: u8,
     retry_enabled: bool,
+    /// The wait share of the stepped work running this PHY's operations,
+    /// if any: its delays end a step once the share is spent.
+    allowance: Option<Rc<Allowance>>,
 }
 impl<R: Registers, D: Delay> Phy<R, D> {
     /// # Safety
@@ -178,6 +184,7 @@ impl<R: Registers, D: Delay> Phy<R, D> {
             poisoned: false,
             retry_count: 0,
             retry_enabled: false,
+            allowance: None,
         }
     }
 
@@ -222,6 +229,14 @@ impl<R: Registers, D: Delay> Phy<R, D> {
             }
         }
     }
+    /// [`Self::wait_minimum`], then the step ends if it spent its share.
+    async fn pause(&mut self, us: u64) -> Result<(), Fault> {
+        self.wait_minimum(us)?;
+        if let Some(allowance) = &self.allowance {
+            allowance.spent(us).await;
+        }
+        Ok(())
+    }
     fn read_mac(&mut self, at: u32) -> Result<u32, Fault> {
         self.check_minimum()?;
         let value = self
@@ -246,6 +261,9 @@ impl<R: Registers, D: Delay> Phy<R, D> {
     /// `e1000_acquire_swflag_ich8lan`: the software flag the Intel ME
     /// honours as well, so a managed adapter's PHY is shared through it.
     fn acquire(&mut self) -> Result<(), Error> {
+        block_on(self.acquire_steps())
+    }
+    async fn acquire_steps(&mut self) -> Result<(), Error> {
         let mut value = 0;
         let mut available = false;
         for _ in 0..100 {
@@ -254,7 +272,7 @@ impl<R: Registers, D: Delay> Phy<R, D> {
                 available = true;
                 break;
             }
-            self.wait_minimum(1000)?;
+            self.pause(1000).await?;
         }
         if !available {
             return Err(Fault::SemaphoreBusy.into());
@@ -264,7 +282,7 @@ impl<R: Registers, D: Delay> Phy<R, D> {
             if self.read_mac(EXTCNF_CTRL)? & SWFLAG != 0 {
                 return Ok(());
             }
-            self.wait_minimum(1000)?;
+            self.pause(1000).await?;
         }
         // An unacknowledged claim is uncertain. Try the source's clear, keep
         // the owner on the final failure, and never retry this access epoch.
@@ -294,6 +312,13 @@ impl<R: Registers, D: Delay> Phy<R, D> {
         &mut self,
         operation: impl FnOnce(&mut Self) -> Result<T, Fault>,
     ) -> Result<T, Error> {
+        block_on(self.transaction_steps(async move |this: &mut Self| operation(this)))
+    }
+    /// The semaphore held around `operation`, which may wait across steps.
+    async fn transaction_steps<T>(
+        &mut self,
+        operation: impl AsyncFnOnce(&mut Self) -> Result<T, Fault>,
+    ) -> Result<T, Error> {
         if let Some(error) = self.minimum_failure {
             return Err(Fault::Minimum(error).into());
         }
@@ -301,11 +326,11 @@ impl<R: Registers, D: Delay> Phy<R, D> {
             return Err(Fault::Poisoned.into());
         }
         self.check_minimum()?;
-        if let Err(error) = self.acquire() {
+        if let Err(error) = self.acquire_steps().await {
             self.poisoned = true;
             return Err(error);
         }
-        let result = operation(self);
+        let result = operation(self).await;
         let cleanup = self.release();
         match (result, cleanup) {
             (Ok(value), Ok(())) => Ok(value),
@@ -324,22 +349,35 @@ impl<R: Registers, D: Delay> Phy<R, D> {
     }
 
     fn mdic(&mut self, address: u8, index: u16, write: Option<u16>) -> Result<u16, Fault> {
+        block_on(self.mdic_steps(address, index, write))
+    }
+    async fn mdic_steps(
+        &mut self,
+        address: u8,
+        index: u16,
+        write: Option<u16>,
+    ) -> Result<u16, Fault> {
         let retries = if self.retry_enabled {
             self.retry_count
         } else {
             0
         };
         for attempt in 0..=retries {
-            match self.mdic_once(address, index, write) {
+            match self.mdic_once(address, index, write).await {
                 Err(Fault::MdicTimeout | Fault::MdicResponse(_)) if attempt < retries => {
-                    self.wait_minimum(10_000)?;
+                    self.pause(10_000).await?;
                 }
                 result => return result,
             }
         }
         unreachable!("bounded MDIC loop returns its last actual outcome")
     }
-    fn mdic_once(&mut self, address: u8, index: u16, write: Option<u16>) -> Result<u16, Fault> {
+    async fn mdic_once(
+        &mut self,
+        address: u8,
+        index: u16,
+        write: Option<u16>,
+    ) -> Result<u16, Fault> {
         if address > 31 || index > 31 {
             return Err(Fault::InvalidRegister);
         }
@@ -350,7 +388,7 @@ impl<R: Registers, D: Delay> Phy<R, D> {
         let mut response = 0;
         let mut ready = false;
         for _ in 0..MDIC_POLLS {
-            self.wait_minimum(50)?;
+            self.pause(50).await?;
             response = self.read_mac(MDIC)?;
             if response & MDIC_READY != 0 {
                 ready = true;
@@ -359,7 +397,7 @@ impl<R: Registers, D: Delay> Phy<R, D> {
         }
         // 82579 requires this quiet interval even when the transaction fails.
         if self.kind == Kind::I82579 {
-            self.wait_minimum(100)?;
+            self.pause(100).await?;
         }
         if !ready {
             return Err(Fault::MdicTimeout);
@@ -371,43 +409,63 @@ impl<R: Registers, D: Delay> Phy<R, D> {
     }
 
     fn page(&mut self, page: u16) -> Result<(), Fault> {
-        self.mdic(1, PHY_PAGE, Some(page << 5)).map(|_| ())
+        block_on(self.page_steps(page))
+    }
+    async fn page_steps(&mut self, page: u16) -> Result<(), Fault> {
+        self.mdic_steps(1, PHY_PAGE, Some(page << 5))
+            .await
+            .map(|_| ())
     }
 
     fn access(&mut self, register: Register, value: Option<u16>) -> Result<u16, Fault> {
+        block_on(self.access_steps(register, value))
+    }
+    async fn access_steps(&mut self, register: Register, value: Option<u16>) -> Result<u16, Fault> {
         let Register { page, index } = register;
         if page == WAKE_PAGE {
-            return self.wakeup(index, value);
+            return self.wakeup(index, value).await;
         }
         if page > 0 && page < 768 {
             // All supported PHY types use I82577's debug address/data pair.
-            self.mdic(2, 16, Some(((page << 5) | index) & 0x3f))?;
-            return self.mdic(2, 17, value);
+            self.mdic_steps(2, 16, Some(((page << 5) | index) & 0x3f))
+                .await?;
+            return self.mdic_steps(2, 17, value).await;
         }
         let address = if page >= 768 { 1 } else { 2 };
         if index > 15 {
-            self.page(if page == 768 { 0 } else { page })?;
+            self.page_steps(if page == 768 { 0 } else { page }).await?;
         }
-        self.mdic(address, index, value)
+        self.mdic_steps(address, index, value).await
     }
 
-    fn wakeup(&mut self, index: u16, value: Option<u16>) -> Result<u16, Fault> {
-        self.page(PORT_PAGE)?;
-        let saved = self.mdic(1, WAKE_ENABLE, None)?;
-        self.mdic(1, WAKE_ENABLE, Some((saved | WAKE_ACCESS) & !WAKE_ME_HOST))?;
-        self.page(WAKE_PAGE)?;
-        self.mdic(1, WAKE_ADDRESS, Some(index))?;
-        let result = self.mdic(1, WAKE_DATA, value)?;
-        self.page(PORT_PAGE)?;
-        self.mdic(1, WAKE_ENABLE, Some(saved))?;
+    async fn wakeup(&mut self, index: u16, value: Option<u16>) -> Result<u16, Fault> {
+        self.page_steps(PORT_PAGE).await?;
+        let saved = self.mdic_steps(1, WAKE_ENABLE, None).await?;
+        self.mdic_steps(1, WAKE_ENABLE, Some((saved | WAKE_ACCESS) & !WAKE_ME_HOST))
+            .await?;
+        self.page_steps(WAKE_PAGE).await?;
+        self.mdic_steps(1, WAKE_ADDRESS, Some(index)).await?;
+        let result = self.mdic_steps(1, WAKE_DATA, value).await?;
+        self.page_steps(PORT_PAGE).await?;
+        self.mdic_steps(1, WAKE_ENABLE, Some(saved)).await?;
         Ok(result)
     }
 
     pub fn read(&mut self, register: Register) -> Result<u16, Error> {
-        self.transaction(|this| this.access(register, None))
+        block_on(self.read_steps(register))
     }
     pub fn write(&mut self, register: Register, value: u16) -> Result<(), Error> {
-        self.transaction(|this| this.access(register, Some(value)).map(|_| ()))
+        block_on(self.write_steps(register, value))
+    }
+    async fn read_steps(&mut self, register: Register) -> Result<u16, Error> {
+        self.transaction_steps(async |this: &mut Self| this.access_steps(register, None).await)
+            .await
+    }
+    async fn write_steps(&mut self, register: Register, value: u16) -> Result<(), Error> {
+        self.transaction_steps(async |this: &mut Self| {
+            this.access_steps(register, Some(value)).await.map(|_| ())
+        })
+        .await
     }
     /// Change `register` of a PHY that may not answer: a PHY that does not
     /// answer is an answer (`false`), not a failure of the transport.

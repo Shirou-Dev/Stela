@@ -40,6 +40,11 @@ pub(super) struct Model {
     pub(super) flash_control: u16,
     pub(super) time: u64,
     pub(super) quiet_until: u64,
+    /// The Intel ME holds the PHY semaphore until this model time.
+    pub(super) firmware_flag_until: u64,
+    /// Each MDIO cycle takes this long before MDIC reports it ready.
+    pub(super) mdic_cycle_us: u64,
+    pub(super) mdic_ready_at: u64,
     pub(super) master_busy: usize,
     pub(super) mdic_failures: usize,
     /// The MDIC attempt the `mdic_failures` window starts at.
@@ -104,6 +109,9 @@ impl Model {
             flash_control: 0,
             time: 0,
             quiet_until: 0,
+            firmware_flag_until: 0,
+            mdic_cycle_us: 0,
+            mdic_ready_at: 0,
             master_busy: 0,
             mdic_failures: 0,
             mdic_fail_after: 0,
@@ -177,6 +185,12 @@ unsafe impl Registers for Io {
         let mut m = self.0.borrow_mut();
         m.enter()?;
         let mut value = m.mac.get(&at).copied().unwrap_or(0);
+        if at == super::super::EXTCNF_CTRL && m.time < m.firmware_flag_until {
+            value |= super::super::SWFLAG;
+        }
+        if at == super::super::MDIC && m.time < m.mdic_ready_at {
+            value &= !super::super::MDIC_READY;
+        }
         if at == STATUS && m.master_busy != 0 {
             m.master_busy -= 1;
             value |= MASTER_ENABLED;
@@ -272,6 +286,7 @@ unsafe impl Registers for Io {
                     smb && m.smb_hidden && m.mac.get(&0x18).copied().unwrap_or(0) & (1 << 11) == 0;
                 m.phy_load(address, index)
             };
+            m.mdic_ready_at = m.time + m.mdic_cycle_us;
             let failed =
                 (m.mdic_fail_after..m.mdic_fail_after + m.mdic_failures).contains(&m.mdic_attempts);
             m.mdic_attempts += 1;
