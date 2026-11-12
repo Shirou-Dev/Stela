@@ -897,6 +897,44 @@ fn mtrr_pat_equality_does_not_conflate_clock_adjustment() {
     );
 }
 
+/// The legacy hole's DRAM routing is each processor's own on AMD: two
+/// processors that differ only there have the same installed memory types.
+#[test]
+fn amd_legacy_hole_routing_is_not_part_of_the_installed_memory_types() {
+    let mut baseline = native_snapshot();
+    baseline.msrs[baseline.msr_count as usize] = Msr {
+        index: 0x26e,
+        value: 0x1010_1010_1010_1010,
+    };
+    baseline.msrs[baseline.msr_count as usize + 1] = Msr {
+        index: 0x258,
+        value: 0x1e1e_1e1e_1e1e_1e1e,
+    };
+    baseline.msr_count += 2;
+    let shadow = baseline.msr_count as usize - 2;
+    let mut other = baseline;
+    other.msrs[shadow].value = 0x1818_1818_1818_1818;
+    // Masked reads say nothing of the routing: the values must be equal.
+    assert_eq!(
+        baseline.same_memory_types(&other),
+        Err(CapabilityRefusal::MemoryTypes)
+    );
+    baseline.amd_fixed_raw = true;
+    other.amd_fixed_raw = true;
+    assert_eq!(baseline.same_memory_types(&other), Ok(()));
+    other.msrs[shadow].value ^= 1; // the type is installed
+    assert_eq!(
+        baseline.same_memory_types(&other),
+        Err(CapabilityRefusal::MemoryTypes)
+    );
+    other.msrs[shadow].value ^= 1;
+    other.msrs[shadow + 1].value ^= 0x08; // conventional memory
+    assert_eq!(
+        baseline.same_memory_types(&other),
+        Err(CapabilityRefusal::MemoryTypes)
+    );
+}
+
 #[test]
 fn duplicate_physical_thread_refuses() {
     let mut cores = [processor(0, 0, 0, 0), processor(1, 0, 0, 0)];

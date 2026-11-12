@@ -152,12 +152,14 @@ impl Image {
                 source.compatible(amd::State::from_snapshot(snapshot, self.physical_bits)?)?;
                 // Clearing MTRR.E leaves routing attributes active. Preserve
                 // their exact low-page routing throughout offline installation.
+                // The legacy hole keeps each processor's own routing, which
+                // the installation does not write (`amd::legacy_hole`).
                 for write in self.writes[..self.count]
                     .iter()
-                    .filter(|write| FIXED.contains(&write.index))
+                    .filter(|write| FIXED.contains(&write.index) && !amd::legacy_hole(write.index))
                 {
                     let expected = u64::from(write.low) | u64::from(write.high) << 32;
-                    if (expected ^ register(snapshot, write.index)?) & 0x1818_1818_1818_1818 != 0 {
+                    if (expected ^ register(snapshot, write.index)?) & amd::FIXED_ROUTING != 0 {
                         return Err(refuse!(
                             "AMD initial fixed DRAM routing differs across cores"
                         ));
@@ -310,6 +312,22 @@ mod tests {
         changed.msrs[2].value = 0x1818_1818_1818_1818; // same routing, UC before offline install
         assert_eq!(image.compatible(&changed), Ok(()));
         changed.amd_fixed_raw = false;
+        assert!(image.compatible(&changed).is_err());
+        // The firmware shadow, routed differently on an AP (a Lenovo Legion 5
+        // 15ACH6H: 0x10 a byte on the BSP, 0x18 on every AP), is admitted;
+        // conventional memory routed differently is not.
+        changed = snapshot;
+        for msr in &mut changed.msrs[..changed.msr_count as usize] {
+            if amd::legacy_hole(msr.index) {
+                msr.value ^= 0x0808_0808_0808_0808;
+            }
+        }
+        assert_eq!(image.compatible(&changed), Ok(()));
+        let low = changed.msrs[..changed.msr_count as usize]
+            .iter_mut()
+            .find(|msr| msr.index == 0x258)
+            .unwrap();
+        low.value ^= 0x08;
         assert!(image.compatible(&changed).is_err());
     }
 

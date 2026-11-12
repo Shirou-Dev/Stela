@@ -576,6 +576,17 @@ impl Snapshot {
     /// intended source image before sharing RAM or Stela metadata. Initial
     /// offline installation may establish this equality; TSC_ADJUST is separate.
     pub fn same_memory_types(&self, other: &Self) -> Result<(), CapabilityRefusal> {
+        use crate::memory_types::amd;
+        // What the installation writes of a register: all of it, but for
+        // the legacy hole's DRAM routing, which stays each processor's own.
+        let raw = self.amd_fixed_raw;
+        let installed = move |msr: &Msr| {
+            if raw && amd::legacy_hole(msr.index) {
+                (msr.index, msr.value & !amd::FIXED_ROUTING)
+            } else {
+                (msr.index, msr.value)
+            }
+        };
         fn memory(index: u32) -> bool {
             index == 0xfe
                 || index == 0x2ff
@@ -598,7 +609,8 @@ impl Snapshot {
             || !left
                 .iter()
                 .filter(|msr| memory(msr.index))
-                .eq(right.iter().filter(|msr| memory(msr.index)))
+                .map(installed)
+                .eq(right.iter().filter(|msr| memory(msr.index)).map(installed))
             || !left.iter().any(|msr| msr.index == 0xfe)
             || !left.iter().any(|msr| msr.index == 0x2ff)
         {

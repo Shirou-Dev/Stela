@@ -26,6 +26,20 @@ pub const SECURE_NESTED_PAGING: u64 = 1 << 24;
 pub const VMPL: u64 = 1 << 25;
 /// HostMultiKeyMemEncrModeEn: physical-address bits select host keys.
 pub const HOST_MULTI_KEY: u64 = 1 << 26;
+/// RdMem and WrMem of each fixed-range byte: whether reads and writes of
+/// the range go to DRAM (APM Vol. 2 7.9.1).
+pub const FIXED_ROUTING: u64 = 0x1818_1818_1818_1818;
+
+/// Whether fixed-range register `index` covers only the legacy hole,
+/// 0xa0000 to 0xfffff: video memory and the option ROM and firmware shadow,
+/// which no memory map gives as RAM. Firmware may route it differently on
+/// each processor (an Insyde laptop write-protects the firmware shadow on
+/// the BSP alone), and Linux leaves each processor's routing there as it
+/// finds it. The registers below it (0x250, 0x258) cover conventional memory.
+pub const fn legacy_hole(index: u32) -> bool {
+    matches!(index, 0x259 | 0x268..=0x26f)
+}
+
 pub const REGISTERS: [u32; 7] = [
     SYSCFG,
     IORR_BASE,
