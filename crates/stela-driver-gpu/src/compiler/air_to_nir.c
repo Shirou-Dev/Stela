@@ -6865,6 +6865,50 @@ field_space(const struct stela_air_field *field)
    return 0;
 }
 
+/* A device or constant pointer made of a 64-bit address the function
+ * computes or reads, as a structure in a buffer holds a buffer's gpuAddress
+ * as an integer: a root at that address, as an address an argument buffer
+ * holds is, which device memory is read and written through and constant
+ * memory read through. Without device addresses, as SSBO bindings are,
+ * there is nothing it names. */
+static unsigned
+address_access(LLVMValueRef inst)
+{
+   return LLVMGetPointerAddressSpace(LLVMTypeOf(inst)) == 1 ? STELA_AIR_READ_WRITE : STELA_AIR_READ;
+}
+
+/* The authority of a pointer made of an address, which its instruction
+ * validates when translated: a PHI declared before it takes it. */
+static struct value *
+address_authority(LLVMValueRef inst, struct value *authority)
+{
+   *authority = (struct value){.access = address_access(inst), .pointer_root = inst};
+   return authority;
+}
+
+static bool
+address_pointer(struct translator *t, LLVMValueRef inst)
+{
+   LLVMValueRef operand = LLVMGetOperand(inst, 0);
+   LLVMTypeRef type = LLVMTypeOf(operand);
+   unsigned space = LLVMGetPointerAddressSpace(LLVMTypeOf(inst));
+   if ((space != 1 && space != 2) || LLVMGetTypeKind(type) != LLVMIntegerTypeKind ||
+       LLVMGetIntTypeWidth(type) != 64 || LLVMPointerSizeForAS(t->layout, space) != 8)
+      return fail(t, STELA_AIR_TYPE, "a pointer made of other than a 64-bit device or constant address");
+   /* A constant names no buffer's address, only one the function made up. */
+   if (LLVMIsAConstant(operand))
+      return fail(t, STELA_AIR_TYPE, "a pointer made of a constant address");
+   if (t->options->bind_ssbo)
+      return fail(t, STELA_AIR_ARGUMENT, "a pointer made of an address requires device addresses");
+   nir_def *address = get_value(t, operand);
+   if (!address || address->num_components != 1 || address->bit_size != 64)
+      return fail(t, STELA_AIR_TYPE, "a pointer made of an undefined address");
+   if (!put_value(t, inst, address, address_access(inst)))
+      return false;
+   find_value(t, inst)->pointer_root = inst;
+   return true;
+}
+
 /* A load of an address or resource ID from an argument buffer, or of a
  * texture or sampler array's handle. An address roots the pointers derived
  * from it, with its field's access; an ID names its texture or sampler for
@@ -7398,6 +7442,8 @@ instruction(struct translator *t, LLVMValueRef inst)
       return true;
    if (op == LLVMLoad && LLVMGetTypeKind(LLVMTypeOf(inst)) == LLVMPointerTypeKind)
       return argument_load(t, inst);
+   if (op == LLVMIntToPtr)
+      return address_pointer(t, inst);
    if (op == LLVMInsertValue || op == LLVMExtractValue)
       return aggregate_instruction(t, inst, op);
    if ((op == LLVMLoad && aggregate_count(LLVMTypeOf(inst))) ||
@@ -8362,12 +8408,12 @@ pointer_node(struct translator *t, LLVMValueRef llvm)
    return entry ? entry->data : NULL;
 }
 
-/* Validates a provenance root. An address loaded from an argument buffer is
- * a root its load validates when translated. */
+/* Validates a provenance root. An address loaded from an argument buffer,
+ * or made a pointer, is a root its instruction validates when translated. */
 static bool
 pointer_anchor(struct translator *t, LLVMValueRef llvm)
 {
-   if (LLVMIsALoadInst(llvm) || imageblock_data_call(llvm))
+   if (LLVMIsALoadInst(llvm) || LLVMIsAIntToPtrInst(llvm) || imageblock_data_call(llvm))
       return true;
    struct value *value = find_value(t, llvm);
    if (!value && LLVMIsAAllocaInst(llvm))
@@ -8614,10 +8660,11 @@ pointer_provenance(struct translator *t)
          LLVMOpcode op = LLVMGetInstructionOpcode(inst);
          if (imageblock_data_call(inst) && !t->imageblock_root)
             t->imageblock_root = inst;
-         if (op == LLVMAlloca || op == LLVMLoad || stela_air_read_sampler(inst) ||
+         if (op == LLVMAlloca || op == LLVMLoad || op == LLVMIntToPtr || stela_air_read_sampler(inst) ||
              stela_air_null_texture(inst) || stitched_resource_call(inst) ||
              imageblock_data_call(inst) || async_copy_call_named(inst))
-            continue; /* Roots, like arguments and globals; a copy's event is unused. */
+            continue; /* Roots, like arguments and globals; a copy's event is unused.
+                       * An address made a pointer is one as a loaded address is. */
          if (op != LLVMPHI && op != LLVMSelect && op != LLVMGetElementPtr && op != LLVMBitCast &&
              op != LLVMAddrSpaceCast)
             return fail(t, STELA_AIR_TYPE, "unsupported pointer provenance producer %d", op);
@@ -8802,7 +8849,9 @@ cfg_declare_phi(struct translator *t, LLVMValueRef inst)
       struct value authority;
       struct value *root = !node ? NULL :
                            node->root && node->root == t->imageblock_root ? imageblock_authority(t, &authority) :
-                                                              pointer_value(t, node->root);
+                           node->root && LLVMIsAIntToPtrInst(node->root) ?
+                              address_authority(node->root, &authority) :
+                              pointer_value(t, node->root);
       if (!root)
          return fail(t, STELA_AIR_MEMORY, "pointer PHI lacks completed provenance proof");
       pointer_authority(value, root);

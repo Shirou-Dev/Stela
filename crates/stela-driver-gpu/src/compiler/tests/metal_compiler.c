@@ -4696,6 +4696,68 @@ threadgroup_globals_hold_bfloat(void)
    stela_metal_release(shader);
 }
 
+/* Writes its thread's index plus 100 through the device address its
+ * constant parameters hold as an integer, as MPS's kernels keep their
+ * buffers' gpuAddress: the even threads' at it, the odd threads' 64 bytes
+ * past it, joined by a PHI. */
+static const char *addressed =
+   "define void @addressed(ptr addrspace(2) %params, i32 %tid) {\n"
+   "entry:\n%odd = and i32 %tid, 1\n%is_odd = icmp ne i32 %odd, 0\n"
+   "%a = load i64, ptr addrspace(2) %params, align 8\n"
+   "%pa = inttoptr i64 %a to ptr addrspace(1)\n"
+   "br i1 %is_odd, label %second, label %join\n"
+   "second:\n%pb = getelementptr i8, ptr addrspace(1) %pa, i64 64\nbr label %join\n"
+   "join:\n%p = phi ptr addrspace(1) [ %pa, %entry ], [ %pb, %second ]\n"
+   "%v = add i32 %tid, 100\nstore i32 %v, ptr addrspace(1) %p, align 4\nret void\n}\n"
+   "!air.kernel = !{!2}\n!2 = !{ptr @addressed, !3, !4}\n!3 = !{}\n!4 = !{!40, !41}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read\","
+   " !\"air.address_space\", i32 2, !\"air.arg_type_size\", i32 16, !\"air.arg_type_align_size\","
+   " i32 8, !\"air.arg_type_name\", !\"Params\", !\"air.arg_name\", !\"params\"}\n"
+   "!41 = !{i32 1, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\","
+   " !\"air.arg_name\", !\"tid\"}\n";
+
+/* A pointer made of a device address reaches the memory at that address,
+ * and past it through a PHI. */
+static void
+pointers_made_of_addresses_reach_their_memory(void)
+{
+   struct stela_air_error error;
+   const struct stela_metal_specialization specialization = {.workgroup_size = {64, 1, 1}};
+   nir_shader *shader = compile(addressed, "addressed", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "addressed: %u %s\n", error.kind, error.detail);
+   assert(shader);
+   for (uint32_t tid = 0; tid < 2; tid++) {
+      static uint8_t memory[0x900];
+      uint8_t push[STELA_METAL_PUSH_BYTES] = {0};
+      memset(memory, 0, sizeof(memory));
+      put64(push + STELA_METAL_PUSH_TABLES, BASE + TABLE);
+      put64(memory + TABLE + STELA_METAL_TABLE_BUFFER_ADDRESSES, BASE + OUT);
+      put64(memory + OUT, BASE + OUT + 0x40);
+      const struct air_effect_environment environment = {
+         .base = BASE, .bytes = memory, .size = sizeof(memory), .push = push,
+         .push_size = sizeof(push), .local_index = tid,
+      };
+      struct air_effect_store store;
+      struct air_effect_run run = air_effect_execute_in(shader, 100000, &store, 1, &environment);
+      if (run.status != AIR_EFFECT_COMPLETE)
+         fprintf(stderr, "addressed: %s\n", run.detail);
+      assert(run.status == AIR_EFFECT_COMPLETE && run.stores == 1);
+      expect_store(&store, false, BASE + OUT + (tid ? 0x80 : 0x40), (const uint32_t[]){tid + 100}, 1);
+   }
+   stela_metal_release(shader);
+   /* Only a 64-bit address makes a device or constant pointer. */
+   char *narrow = ralloc_asprintf(NULL, "%s", addressed);
+   char *at = strstr(narrow, "%pa = inttoptr i64 %a");
+   assert(at);
+   memcpy(at, "%pa = inttoptr i32 %t", strlen("%pa = inttoptr i32 %t"));
+   char *fixture = ralloc_asprintf(NULL, "%.*s%%t = trunc i64 %%a to i32\n%s", (int)(at - narrow),
+                                   narrow, at);
+   assert(!compile(fixture, "addressed", &specialization, &error) && error.kind == STELA_AIR_TYPE);
+   ralloc_free(fixture);
+   ralloc_free(narrow);
+}
+
 /* TEMPORARY host harness (not for commit). */
 static void
 harness(void)
@@ -4784,6 +4846,7 @@ main(void)
    untyped_threadgroup_buffers_take_their_dispatch_lengths();
    thread_constants_are_constant_data();
    threadgroup_globals_hold_bfloat();
+   pointers_made_of_addresses_reach_their_memory();
    render_stages_compile_at_their_linked_locations();
    patch_functions_compile_behind_their_tessellation_stages();
    kernels_compile_with_their_stage_in();
