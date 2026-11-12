@@ -52,7 +52,35 @@ impl Error {
         match self {
             Self::NoMpServices => "native cores need UEFI MP Services source identity",
             Self::ProcessorInventory => "native processor inventory is invalid",
-            Self::Topology(_) => "native processor topology is ambiguous",
+            Self::Topology(refusal) => match refusal {
+                topology::Refusal::NoBootstrapProcessor => {
+                    "native processor topology is ambiguous: firmware marks no bootstrap processor"
+                }
+                topology::Refusal::MultipleBootstrapProcessors => {
+                    "native processor topology is ambiguous: firmware marks more than one bootstrap processor"
+                }
+                topology::Refusal::BootstrapUnavailable => {
+                    "native processor topology is ambiguous: firmware marks the bootstrap processor disabled or unhealthy"
+                }
+                topology::Refusal::InvalidTopology => {
+                    "native processor topology is ambiguous: a processor has an unknown topology version"
+                }
+                topology::Refusal::DuplicateProcessorNumber => {
+                    "native processor topology is ambiguous: two processors share a firmware number"
+                }
+                topology::Refusal::DuplicateApicId => {
+                    "native processor topology is ambiguous: firmware lists two processors with one APIC ID"
+                }
+                topology::Refusal::DuplicateThreadLocation => {
+                    "native processor topology is ambiguous: firmware lists two processors at one package, core and thread"
+                }
+                topology::Refusal::MixedTopologyVersions => {
+                    "native processor topology is ambiguous: processors mix topology versions"
+                }
+                topology::Refusal::InvalidAssignment => {
+                    "native processor topology is ambiguous: the processor assignment is invalid"
+                }
+            },
             Self::CoreCount => {
                 "requested native count exceeds the available processors or the executor's capacity"
             }
