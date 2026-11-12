@@ -107,6 +107,12 @@ pub(super) const MCU_TX_EMPTY: u8 = 1 << 5;
 pub(super) const MCU_RX_EMPTY: u8 = 1 << 4;
 pub(super) const LINK_LIST_READY: u8 = 1 << 1;
 pub(super) const TX_FIFO_EMPTY: u32 = 1 << 11;
+/// Every receive-accept bit of RxConfig (Linux `RX_CONFIG_ACCEPT_MASK`).
+pub(super) const RX_ACCEPT_MASK: u32 = 0x3f;
+/// ChipCmd's transmit stop request (`StopReq`).
+pub(super) const STOP_REQ: u8 = 0x80;
+/// TxPoll's low-priority queue poll (`NPQ`).
+pub(super) const NPQ: u8 = 0x40;
 pub(super) const RXDV_GATED: u32 = 1 << 19;
 /// Linux r8169's `NUM_RX_DESC` and `NUM_TX_DESC`.
 pub(super) const DESCRIPTORS: usize = 256;

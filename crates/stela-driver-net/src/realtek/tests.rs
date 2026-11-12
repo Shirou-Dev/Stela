@@ -259,4 +259,5 @@ mod nbase_bp;
 mod nbase_d_cp;
 mod packet_io;
 mod registers;
+mod stop;
 mod stuck_registers;

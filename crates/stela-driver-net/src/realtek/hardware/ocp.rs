@@ -98,23 +98,13 @@ impl<R: Registers, T: Timer> Hardware<'_, R, T> {
     ) -> Result<(), BlockError> {
         self.mac_ocp_write(address, (self.mac_ocp_read(address)? & !clear) | set)
     }
-    pub fn initialize_modern(&self) -> Result<(), BlockError> {
-        if !matches!(
-            self.revision.version,
-            40 | 42 | 44 | 46 | 51 | 52 | 61 | 63..=66 | 70
-        ) {
-            return Ok(());
-        }
-        if matches!(self.revision.version, 51 | 52) {
-            self.ep_stop_cmac()?;
-        }
-        let r = self.registers;
-        r.write32(MISC, self.mmio32(MISC)? | RXDV_GATED); // RXDV gate.
-        self.timer.delay(2_000)?;
+    /// Linux `rtl_wait_txrx_fifo_empty` for versions 40 and later.
+    pub(in super::super) fn fifo_empty(&self) -> Result<(), BlockError> {
         if self.revision.version < 61 {
             self.poll32(TX_CONFIG, TX_FIFO_EMPTY, true, 100, 42)?;
         } else if self.revision.version >= 63 {
-            r.write8(COMMAND, self.mmio8(COMMAND)? | 0x80); // StopReq.
+            self.registers
+                .write8(COMMAND, self.mmio8(COMMAND)? | STOP_REQ);
         }
         self.wait8(
             MCU,
@@ -135,6 +125,22 @@ impl<R: Registers, T: Timer> Hardware<'_, R, T> {
                 return Err(BlockError::Timeout);
             }
         }
+        Ok(())
+    }
+    pub fn initialize_modern(&self) -> Result<(), BlockError> {
+        if !matches!(
+            self.revision.version,
+            40 | 42 | 44 | 46 | 51 | 52 | 61 | 63..=66 | 70
+        ) {
+            return Ok(());
+        }
+        if matches!(self.revision.version, 51 | 52) {
+            self.ep_stop_cmac()?;
+        }
+        let r = self.registers;
+        r.write32(MISC, self.mmio32(MISC)? | RXDV_GATED); // RXDV gate.
+        self.timer.delay(2_000)?;
+        self.fifo_empty()?;
         r.write8(COMMAND, self.mmio8(COMMAND)? & !ENABLE);
         self.timer.delay(1_000)?;
         r.write8(MCU, self.mmio8(MCU)? & !MCU_OOB);

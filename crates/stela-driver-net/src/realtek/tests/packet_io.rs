@@ -20,8 +20,8 @@ fn modelled(registers: &mut [u32], memory: &mut [u64], signalled: bool) -> Realt
         clock: crate::timing::model(Clock {
             ticks_per_microsecond: 1,
         }),
-        receive: Ring::new(&mut dma, true).unwrap(),
-        transmit: Ring::new(&mut dma, true).unwrap(),
+        receive: ManuallyDrop::new(Ring::new(&mut dma, true).unwrap()),
+        transmit: ManuallyDrop::new(Ring::new(&mut dma, true).unwrap()),
         mac: Mac([2, 0, 0, 0, 0, 1]),
         link: RuntimeLink::default(),
         revision,
@@ -85,6 +85,22 @@ fn transmit_without_carrier_is_refused_and_leaves_the_ring_untouched() {
     assert_eq!(net.transmit(&[0; 60]), Err(LinkError::NoCarrier));
     assert_eq!(net.transmit.descriptors.bytes(), descriptors);
     assert_eq!(registers[TX_POLL / 4], 0);
+}
+
+/// A dropped adapter closes its receive and asks for the MAC reset, as
+/// `rtl8169_down` does; one whose function left the bus reads all ones and
+/// gets no write.
+#[test]
+fn dropping_an_adapter_resets_it_and_a_lost_one_gets_no_write() {
+    let mut registers = vec![0u32; 64];
+    let mut memory = vec![0u64; 262_144];
+    registers[RX_CONFIG / 4] = RX_FIFO_THRESHOLD | RX_ACCEPT_MASK;
+    drop(modelled(&mut registers, &mut memory, false));
+    assert_eq!(registers[RX_CONFIG / 4], RX_FIFO_THRESHOLD);
+    assert_ne!(registers[COMMAND / 4].to_le_bytes()[COMMAND % 4] & RESET, 0);
+    let mut registers = vec![u32::MAX; 64];
+    drop(modelled(&mut registers, &mut memory, false));
+    assert!(registers.iter().all(|&word| word == u32::MAX));
 }
 
 /// The stack's path refills its own buffer in place across the ring wrap,

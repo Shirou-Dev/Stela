@@ -65,6 +65,42 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
         }
         Err(BlockError::Timeout)
     }
+    /// Linux `rtl8169_cleanup`: interrupts masked and acknowledged, receive
+    /// closed, the chip's own way to drain its transmit and receive paths,
+    /// then the MAC reset ([`Self::reset`]), whose completion alone proves
+    /// the chip writes no ring. The drain's waits time out quietly, as
+    /// Linux's do. All waits together stay under 80 ms, inside a
+    /// processor's exit.
+    pub fn stop(&self) -> Result<(), BlockError> {
+        self.interrupts_off();
+        let r = self.registers;
+        r.write32(RX_CONFIG, self.mmio32(RX_CONFIG)? & !RX_ACCEPT_MASK);
+        match self.revision.version {
+            28 | 31 => {
+                // The low-priority transmit poll clears once queued frames left.
+                for _ in 0..2_000 {
+                    self.timer.delay(20)?;
+                    if self.mmio8(TX_POLL)? & NPQ == 0 {
+                        break;
+                    }
+                }
+            }
+            34..=38 => {
+                r.write8(COMMAND, self.mmio8(COMMAND)? | STOP_REQ);
+                let _ = self.poll32(TX_CONFIG, TX_FIFO_EMPTY, true, 100, 666);
+            }
+            40.. => {
+                r.write32(MISC, self.mmio32(MISC)? | RXDV_GATED);
+                self.timer.delay(2_000)?;
+                let _ = self.fifo_empty();
+            }
+            _ => {
+                r.write8(COMMAND, self.mmio8(COMMAND)? | STOP_REQ);
+                self.timer.delay(100)?;
+            }
+        }
+        self.reset()
+    }
     pub fn interrupts_off(&self) {
         if self.revision.nbase() {
             self.registers.write32(NBASE_INTERRUPT_MASK, 0);

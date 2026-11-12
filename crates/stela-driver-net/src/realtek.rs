@@ -53,8 +53,11 @@
 //! and jumbo frames are
 //! outside this slice. This is not a whole-family hardware validation.
 //!
-//! DMA buffers live until reboot even on startup/transmit errors. OWN is the
-//! sole ownership transfer; timed-out transmit slots are never overwritten.
+//! Drop stops the chip and resets its MAC, as rtl8169_down does; DASH
+//! firmware is not told the driver stopped (its EP/FP stop waits seconds).
+//! DMA buffers live until reboot when that reset is not observed, and on
+//! startup/transmit errors. OWN is the sole ownership transfer; timed-out
+//! transmit slots are never overwritten.
 
 use super::{Link, LinkError, MAX_FRAME, MIN_FRAME, Mac, check_frame};
 use crate::{
@@ -70,6 +73,7 @@ use crate::{
 use alloc::{format, string::String, vec::Vec};
 use core::{
     fmt,
+    mem::ManuallyDrop,
     sync::atomic::{Ordering, fence},
 };
 mod firmware;
@@ -243,8 +247,8 @@ impl fmt::Display for Warning {
 pub struct Realtek {
     device: Mmio,
     clock: crate::timing::Timing,
-    receive: Ring,
-    transmit: Ring,
+    receive: ManuallyDrop<Ring>,
+    transmit: ManuallyDrop<Ring>,
     mac: Mac,
     link: RuntimeLink,
     revision: Revision,
@@ -348,8 +352,8 @@ impl Realtek {
         let mut net = Self {
             device,
             clock,
-            receive: Ring::new(dma, revision.version >= 18)?,
-            transmit: Ring::new(dma, revision.version >= 18)?,
+            receive: ManuallyDrop::new(Ring::new(dma, revision.version >= 18)?),
+            transmit: ManuallyDrop::new(Ring::new(dma, revision.version >= 18)?),
             mac,
             link: RuntimeLink::default(),
             revision,
@@ -792,6 +796,30 @@ fn publish<R: Registers, T: Timer>(
     }
     Ok(())
 }
+impl Drop for Realtek {
+    /// Linux `rtl8169_down`'s register sequence ([`Hardware::stop`]). The
+    /// rings are freed only once the MAC reset completed; otherwise they
+    /// stay allocated. A function that left the bus reads all ones and
+    /// gets no write.
+    ///
+    /// This drives the controller's registers, so the owner drops it where
+    /// its MMIO window is mapped; anywhere else the first read faults.
+    fn drop(&mut self) {
+        if self.device.read32(TX_CONFIG) == u32::MAX {
+            return;
+        }
+        let hardware = Hardware::new(&self.device, &self.clock, self.revision, self.function);
+        if hardware.stop().is_ok() {
+            // SAFETY: the completed MAC reset stopped every descriptor and
+            // buffer access, and neither ring is used after this.
+            unsafe {
+                ManuallyDrop::drop(&mut self.receive);
+                ManuallyDrop::drop(&mut self.transmit);
+            }
+        }
+    }
+}
+
 impl Link for Realtek {
     fn mac(&self) -> Mac {
         self.mac
