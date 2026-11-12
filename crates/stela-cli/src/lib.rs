@@ -48,9 +48,7 @@ STICK is the stick's whole disk ({disk}) or one of its mounted volumes.
 It can be left out when only one stick fits.
 
 Options:
-{{options}}
-
-{{after-help}}"
+{{options}}{{after-help}}"
     )
 }
 
