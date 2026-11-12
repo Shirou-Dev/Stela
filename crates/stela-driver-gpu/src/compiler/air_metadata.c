@@ -200,7 +200,9 @@ stela_air_metadata_constructed(LLVMValueRef global)
 /* Threadgroup memory is an internal AS3 global, undefined or zeroed as
  * Apple's compiler gives atomics, which Metal never initializes; constant
  * data is an initialized internal or private AS2 constant, or a global
- * constructors compute. */
+ * constructors compute. An initialized internal or private constant of the
+ * thread address space, such as a C++ template parameter object Apple's
+ * compiler copies from, is constant data too: nothing can write it. */
 bool
 stela_air_metadata_global(struct stela_air_metadata *t, LLVMValueRef global,
                           struct stela_air_global *info)
@@ -213,7 +215,7 @@ stela_air_metadata_global(struct stela_air_metadata *t, LLVMValueRef global,
    bool threadgroup = space == 3 && !constant && linkage == LLVMInternalLinkage && initializer &&
                       ((LLVMIsUndef(initializer) && !LLVMIsPoison(initializer)) ||
                        LLVMIsNull(initializer));
-   bool data = (space == 2 && constant && initializer &&
+   bool data = ((space == 2 || space == 0) && constant && initializer &&
                 (linkage == LLVMInternalLinkage || linkage == LLVMPrivateLinkage)) ||
                (t->constructed && stela_air_metadata_constructed(global));
    if ((!threadgroup && !data) || LLVMIsThreadLocal(global) || LLVMIsExternallyInitialized(global) ||

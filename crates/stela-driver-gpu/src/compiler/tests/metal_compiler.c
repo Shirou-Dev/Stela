@@ -4613,6 +4613,40 @@ untyped_threadgroup_buffers_take_their_dispatch_lengths(void)
    }
 }
 
+/* A C++ template parameter object, an internal constant of the thread
+ * address space, which the kernel copies and reads fields of, as MPS's
+ * tensor kernels copy their matmul descriptors. */
+static const char *descriptor_copy =
+   "%struct.d = type { i32, i32, i8, i32 }\n"
+   "@descriptor = internal unnamed_addr constant %struct.d { i32 16, i32 32, i8 1, i32 5 },"
+   " align 16\n"
+   "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n"
+   "define void @copied(ptr addrspace(1) %out) {\n"
+   "%copy = alloca %struct.d, align 4\n"
+   "call void @llvm.memcpy.p0.p0.i64(ptr align 4 %copy, ptr align 16 @descriptor, i64 16, i1 false)\n"
+   "%b = getelementptr i8, ptr %copy, i64 4\n%v = load i32, ptr %b, align 4\n"
+   "%c = getelementptr i8, ptr @descriptor, i64 12\n%w = load i32, ptr %c, align 4\n"
+   "%s = add i32 %v, %w\nstore i32 %s, ptr addrspace(1) %out, align 4\nret void\n}\n"
+   "!air.kernel = !{!2}\n!2 = !{ptr @copied, !3, !4}\n!3 = !{}\n!4 = !{!40}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\","
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\","
+   " i32 4, !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"out\"}\n";
+
+/* Constant data of the thread address space holds its initializer's
+ * values, copied or read in place. */
+static void
+thread_constants_are_constant_data(void)
+{
+   struct stela_air_error error;
+   const struct stela_metal_specialization specialization = {.workgroup_size = {64, 1, 1}};
+   nir_shader *shader = compile(descriptor_copy, "copied", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "copied: %u %s\n", error.kind, error.detail);
+   assert(shader);
+   assert(run_summed(shader) == 32 + 5);
+   stela_metal_release(shader);
+}
+
 /* TEMPORARY host harness (not for commit). */
 static void
 harness(void)
@@ -4699,6 +4733,7 @@ main(void)
    kernels_reflect_and_compile_their_threadgroup_memory();
    dynamic_kernels_take_their_dispatch_shape();
    untyped_threadgroup_buffers_take_their_dispatch_lengths();
+   thread_constants_are_constant_data();
    render_stages_compile_at_their_linked_locations();
    patch_functions_compile_behind_their_tessellation_stages();
    kernels_compile_with_their_stage_in();

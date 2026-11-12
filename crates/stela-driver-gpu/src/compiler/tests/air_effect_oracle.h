@@ -276,6 +276,20 @@ air_effect_execute_in(nir_shader *shader, unsigned budget, struct air_effect_sto
                air_effect_read((global ? memory->bytes : memory->push) + offset, dest);
                break;
             }
+            /* Constant data is the shader's own bytes. */
+            if (intrinsic->intrinsic == nir_intrinsic_load_constant) {
+               const struct air_effect_value *at = air_effect_get(values, count, intrinsic->src[0].ssa);
+               size_t offset;
+               if (!at || at->components != 1)
+                  AIR_EFFECT_FAIL(AIR_EFFECT_UNDEFINED, "constant load offset is not defined");
+               if (!air_effect_within(shader->constant_data_size, 0,
+                                      nir_const_value_as_uint(at->lanes[0], at->bits) +
+                                         (uint64_t)nir_intrinsic_base(intrinsic),
+                                      dest, &offset))
+                  AIR_EFFECT_FAIL(AIR_EFFECT_UNDEFINED, "load outside the shader's constant data");
+               air_effect_read((const uint8_t *)shader->constant_data + offset, dest);
+               break;
+            }
             if (memory && memory->images &&
                 (intrinsic->intrinsic == nir_intrinsic_image_deref_size ||
                  intrinsic->intrinsic == nir_intrinsic_image_deref_load ||
