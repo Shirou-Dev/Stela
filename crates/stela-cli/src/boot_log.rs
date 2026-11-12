@@ -126,6 +126,7 @@ pub(crate) fn write_logs(
     headings: bool,
     output: Option<&Path>,
 ) -> Result<()> {
+    let replaced = output.is_some_and(Path::exists);
     let mut sink: Box<dyn Write> = match output {
         Some(path) => Box::new(
             File::create(path).with_context(|| format!("cannot create {}", path.display()))?,
@@ -155,16 +156,21 @@ pub(crate) fn write_logs(
     if let Some(path) = output {
         #[cfg(unix)]
         crate::setup::hand_to_invoker(path);
-        eprintln!("{}", saved(logs.len(), path));
+        eprintln!("{}", saved(logs.len(), path, replaced));
     }
     Ok(())
 }
 
 /// Where `count` logs were written, as the full path to attach.
-fn saved(count: usize, path: &Path) -> String {
+fn saved(count: usize, path: &Path, replaced: bool) -> String {
+    let path = shown(path);
+    let over = match replaced {
+        true => ", replacing the file that was there",
+        false => "",
+    };
     match count {
-        1 => format!("Saved the boot log to {}", shown(path).display()),
-        _ => format!("Saved {count} boot logs to {}", shown(path).display()),
+        1 => format!("Saved the boot log to {}{over}", path.display()),
+        _ => format!("Saved {count} boot logs to {}{over}", path.display()),
     }
 }
 
@@ -1093,9 +1099,15 @@ pub(crate) mod tests {
         expected.extend_from_slice(b"=== disk ===\n");
         expected.extend_from_slice(&logs[1].1.stream);
         assert_eq!(std::fs::read(&output).unwrap(), expected);
-        let said = saved(2, &output);
+        let said = saved(2, &output, false);
         assert!(said.starts_with("Saved 2 boot logs to "), "{said}");
         assert!(said.ends_with("log.txt"), "{said}");
+        // A log.txt that was there is said to be replaced.
+        let said = saved(1, &output, true);
+        assert!(
+            said.ends_with("log.txt, replacing the file that was there"),
+            "{said}"
+        );
         let error = write_logs(&logs, false, Some(&dir.path().join("no/such/dir")));
         assert!(format!("{:#}", error.unwrap_err()).contains("cannot create"));
     }
