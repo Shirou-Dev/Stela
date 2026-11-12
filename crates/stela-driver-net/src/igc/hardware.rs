@@ -656,21 +656,12 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     }
 
     /// Linux igc_check_for_copper_link, entered while a link status change
-    /// is pending. The latched-low MII link bit is read twice. On link the
-    /// MAC adopts the autonegotiated pause resolution, and LTR follows the
+    /// is pending, reading the latched-low MII link bit `status_reads`
+    /// times: twice, or once when the last check found no link and no link
+    /// change came since, as its read cleared the latch. On link the MAC
+    /// adopts the autonegotiated pause resolution, and LTR follows the
     /// observed link either way. A failed PHY exchange reports no link, as
     /// Linux's watchdog treats it; an absent function is a register error.
-    pub(super) fn check_for_copper_link(&mut self) -> Result<Option<Negotiated>, BlockError> {
-        block_on(self.copper_link(2))
-    }
-
-    /// The same check repeated after one that found no link, with no link
-    /// change since: that check's read cleared the latched-low bit, so one
-    /// read gives the present state.
-    pub(super) fn recheck_copper_link(&mut self) -> Result<Option<Negotiated>, BlockError> {
-        block_on(self.copper_link(1))
-    }
-
     pub(super) async fn copper_link(
         &mut self,
         status_reads: usize,
@@ -795,9 +786,6 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
 
     /// The 1000BASE-T status register's remote receiver OK bit, which Linux
     /// waits on for up to two seconds before reporting a 1 Gb/s carrier.
-    pub(super) fn remote_receiver_ready(&mut self) -> Result<bool, BlockError> {
-        block_on(self.remote_receiver_ready_steps())
-    }
     pub(super) async fn remote_receiver_ready_steps(&mut self) -> Result<bool, BlockError> {
         Ok(self.phy_read(PHY_GIGABIT_STATUS).await? & REMOTE_RECEIVER_OK != 0)
     }

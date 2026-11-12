@@ -545,7 +545,8 @@ impl Igc {
                 self.location
             ));
         }
-        if status & STATUS_TXOFF == 0 && held >= TRANSMIT_HANG_US * factor {
+        // A PHY read under way holds a semaphore the reset must not cut.
+        if status & STATUS_TXOFF == 0 && held >= TRANSMIT_HANG_US * factor && !self.link.reading() {
             let reset = self.reinitialize();
             if let Some(Err(error)) = &reset
                 && matches!(error, BlockError::PciPower(_))
@@ -571,11 +572,14 @@ impl Igc {
 impl Drop for Igc {
     /// Linux igc_down then igc_release_hw_control. The rings are freed only
     /// once the controller verifiably stopped; otherwise they stay allocated.
-    /// Its waits stay under 120 ms, inside a processor's exit.
+    /// Its waits stay under 120 ms, plus one 40 ms step of a PHY read under
+    /// way, inside a processor's exit.
     ///
     /// This drives the controller's registers, so the owner drops it where
     /// its MMIO window is mapped; anywhere else the first read faults.
     fn drop(&mut self) {
+        // A PHY read under way gets one more step to finish first.
+        self.link.settle();
         if self.stop(hardware::DROP_MASTER_POLLS).is_ok() {
             let _ =
                 hardware::Hardware::new(&self.device, &self.clock).map(|hw| hw.release_control());
@@ -768,12 +772,21 @@ mod tests {
         // A link change whose PHY check finds no link (here: no PHY answers).
         let _clock = crate::test_clock::virtualize();
         fixture.registers[ICR / 4] = 1 << 2;
+        // The check runs a step per call; the carrier holds until it ends.
+        // This model's cause register does not clear on read.
+        assert!(fixture.net.carrier());
+        fixture.registers[ICR / 4] = 0;
+        let mut calls = 0;
+        while fixture.net.carrier() {
+            calls += 1;
+            assert!(calls < 100);
+        }
+        assert!(calls > 0);
         assert_eq!(fixture.net.transmit(&[1; 60]), Err(LinkError::NoCarrier));
         assert_eq!(fixture.net.negotiated(), None);
         assert!(!fixture.net.transmit.pending());
         assert_eq!(fixture.registers[TDT / 4], 0);
         assert_ne!(fixture.registers[TXDCTL / 4] & QUEUE_ENABLE, 0);
-        fixture.registers[ICR / 4] = 0;
         fixture.net.link = link::Supervisor::established(LINK);
         fixture.net.transmit(&[2; 60]).unwrap();
         assert_eq!(fixture.registers[TDT / 4], 1);
