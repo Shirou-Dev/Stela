@@ -760,6 +760,13 @@ impl Taken {
         self.segment == segment && self.requesters.borrow().contains(&rid)
     }
 
+    /// Whether the unit attaches each of `aliases` with requester `rid`.
+    pub(super) fn arrives_under(&self, rid: u16, aliases: &[u16]) -> bool {
+        self.unit
+            .try_borrow()
+            .is_ok_and(|unit| unit.arrives_under(rid, aliases))
+    }
+
     /// Whether its requesters started in the drivers' window rather than
     /// blocked.
     pub(super) fn windowed(&self) -> bool {

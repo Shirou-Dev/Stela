@@ -374,6 +374,9 @@ struct LiveMapping {
 
 struct DomainState {
     did: u16,
+    /// The other requester IDs a bridge forwards this requester's DMA
+    /// under, whose context entries lead to the same tables.
+    aliases: Vec<u16>,
     generation: u64,
     lifetime: Arc<RequesterLifetime>,
     tables: Vec<Table>,
@@ -440,32 +443,84 @@ pub struct InitialBlock<R: Registers> {
     unit: Arc<Unit<R>>,
 }
 
-/// One original requester in the blocked cohort. It retains the same unit
-/// and supplies no configuration, IRQ, or engine-stop authority.
+/// One original requester in the blocked cohort, with the IDs a bridge
+/// forwards its DMA under. It retains the same unit and supplies no
+/// configuration, IRQ, or engine-stop authority.
 pub struct BlockedRequester<R: Registers> {
     unit: Arc<Unit<R>>,
     rid: u16,
+    aliases: Vec<u16>,
 }
 
 impl<R: Registers> InitialBlock<R> {
-    pub fn claim(&self, rid: u16) -> Result<BlockedRequester<R>, DmaError> {
+    /// Claim requester `rid` of the cohort and each of its `aliases`, the
+    /// other IDs its DMA may arrive under. An alias is either a requester
+    /// of the cohort no one claimed, whose function then stays parked with
+    /// its Bus Master clear since it can never claim it, or an ID this unit
+    /// allows that no function of the cohort has. Each stays blocked until
+    /// the requester attaches, and nothing else can claim or attach it.
+    pub fn claim(&self, rid: u16, aliases: &[u16]) -> Result<BlockedRequester<R>, DmaError> {
+        let aliases = distinct_aliases(rid, aliases).map_err(|_| DmaError::IommuUnavailable)?;
         let mut guard = self.unit.lock();
         let state = guard.state();
-        self.unit.check_blocked_requester(state, rid)?;
-        let claimed = state.initial_claim(rid)?;
-        if core::mem::replace(claimed, true) {
+        for &id in core::iter::once(&rid).chain(&aliases) {
+            self.unit.check_blocked_requester(state, id)?;
+        }
+        if *state.initial_claim(rid)? {
             return Err(DmaError::IommuUnavailable);
+        }
+        let InitialState::Issued(claims) = &mut state.initial_block else {
+            return Err(DmaError::IommuUnavailable);
+        };
+        claims
+            .try_reserve(aliases.len())
+            .map_err(|_| DmaError::MappingFailed)?;
+        for &alias in &aliases {
+            if let Ok(index) = claims.binary_search_by_key(&alias, |&(id, _)| id)
+                && claims[index].1
+            {
+                return Err(DmaError::IommuUnavailable);
+            }
+        }
+        for &id in core::iter::once(&rid).chain(&aliases) {
+            match claims.binary_search_by_key(&id, |&(id, _)| id) {
+                Ok(index) => claims[index].1 = true,
+                Err(index) => claims.insert(index, (id, true)),
+            }
         }
         Ok(BlockedRequester {
             unit: self.unit.clone(),
             rid,
+            aliases,
         })
     }
+}
+
+/// `aliases` without `rid`, refused when one repeats.
+fn distinct_aliases(rid: u16, aliases: &[u16]) -> Result<Vec<u16>, VtdError> {
+    let mut distinct = Vec::new();
+    distinct
+        .try_reserve_exact(aliases.len())
+        .map_err(|_| VtdError::Exhausted)?;
+    for &alias in aliases {
+        if distinct.contains(&alias) {
+            return Err(VtdError::Unsupported);
+        }
+        if alias != rid {
+            distinct.push(alias);
+        }
+    }
+    Ok(distinct)
 }
 
 impl<R: Registers> BlockedRequester<R> {
     pub fn requester(&self) -> u16 {
         self.rid
+    }
+
+    /// The other IDs claimed with the requester.
+    pub fn aliases(&self) -> &[u16] {
+        &self.aliases
     }
 
     /// Check this kept, one-shot owner's original blocked context without
@@ -484,9 +539,11 @@ impl<R: Registers> BlockedRequester<R> {
     ) -> Result<(), DmaError> {
         let mut guard = self.unit.lock();
         let state = guard.state();
-        self.unit.check_blocked_requester(state, self.rid)?;
-        if !*state.initial_claim(self.rid)? {
-            return Err(DmaError::IommuUnavailable);
+        for &id in core::iter::once(&self.rid).chain(&self.aliases) {
+            self.unit.check_blocked_requester(state, id)?;
+            if !*state.initial_claim(id)? {
+                return Err(DmaError::IommuUnavailable);
+            }
         }
         action(&self.unit, state)
     }
@@ -810,10 +867,7 @@ impl<R: Registers> Unit<R> {
 
     fn check_blocked_requester(&self, state: &State, rid: u16) -> Result<(), DmaError> {
         self.check_installed_root(state)?;
-        if state.window.is_some()
-            || state.domains.contains_key(&rid)
-            || !state.allowed.contains(&rid)
-        {
+        if state.window.is_some() || state.held(rid) || !state.allowed.contains(&rid) {
             return Err(DmaError::IommuUnavailable);
         }
         let (table, index) = state.context(rid);
@@ -834,11 +888,7 @@ impl<R: Registers> Unit<R> {
     pub fn drain_initial_requester(&self, rid: u16) -> Result<(), DmaError> {
         let mut guard = self.lock();
         let state = guard.state();
-        if state.shutdown
-            || state.poisoned
-            || !state.allowed.contains(&rid)
-            || state.domains.contains_key(&rid)
-        {
+        if state.shutdown || state.poisoned || !state.allowed.contains(&rid) || state.held(rid) {
             return Err(DmaError::IommuUnavailable);
         }
         self.drain_initial(state)
@@ -897,7 +947,11 @@ impl<R: Registers> Unit<R> {
         Ok(())
     }
 
-    /// Publish one owned stopped requester into this already owned unit.
+    /// Publish one owned stopped requester into this already owned unit,
+    /// with a context entry for its own ID and one for each of `aliases`,
+    /// the other IDs a bridge forwards its DMA under, all leading to the
+    /// same domain. Aliases need a blocked root ([`InitialBlock::claim`]
+    /// claimed each of them with the requester); detach clears them all.
     ///
     /// # Safety
     /// The claim's engine/reset/IRQ/work epoch is stopped and drained,
@@ -906,6 +960,7 @@ impl<R: Registers> Unit<R> {
     pub unsafe fn attach_requester(
         self: &Arc<Self>,
         claim: RequesterClaim,
+        aliases: &[u16],
     ) -> Result<BoundRequester<R>, AttachRequesterFailure<R>> {
         let mut original = RequesterActor::prepare(self.clone(), claim);
         let mut unwind = RequesterUnwind::new(original.lifetime.clone());
@@ -919,9 +974,10 @@ impl<R: Registers> Unit<R> {
                 claim.check_stopped()?;
                 claim.requester()
             };
+            let aliases = distinct_aliases(rid, aliases)?;
             let (did, generation) = {
                 let mut guard = self.lock();
-                self.requester_slot(guard.state(), rid)?
+                self.requester_slot(guard.state(), rid, &aliases)?
             };
             // Page providers can reenter the unit. Keep the claim and root in
             // the parked actor while preparing outside its hardware lock.
@@ -945,20 +1001,22 @@ impl<R: Registers> Unit<R> {
             let state = guard.state();
             // A concurrent attachment or provider callback can consume a DID
             // or change admission while the root is being prepared.
-            if self.requester_slot(state, rid)? != (did, generation) {
+            if self.requester_slot(state, rid, &aliases)? != (did, generation) {
                 return Err(VtdError::Busy);
             }
-            if let InitialState::Issued(claims) = &mut state.initial_block
-                && let Ok(index) = claims.binary_search_by_key(&rid, |&(rid, _)| rid)
-            {
-                claims.remove(index);
+            if let InitialState::Issued(claims) = &mut state.initial_block {
+                claims.retain(|(id, _)| *id != rid && !aliases.contains(id));
             }
+            let ids: Vec<u16> = core::iter::once(rid)
+                .chain(aliases.iter().copied())
+                .collect();
             state.next_generation = generation + 1;
             tables.push(original.staged.take().expect("prepared requester root"));
             state.domains.insert(
                 rid,
                 DomainState {
                     did,
+                    aliases,
                     generation,
                     lifetime: original.lifetime.clone(),
                     tables,
@@ -993,17 +1051,20 @@ impl<R: Registers> Unit<R> {
                     return Err(error);
                 }
             }
-            let (context, index) = state.context(rid);
-            context.write(index + 1, u64::from(did) << 8 | u64::from(self.levels - 2));
-            if let Some(line) = self.table_cacheline {
-                context.flush(&*self.registers, line);
+            // Each alias's entry was checked blocked under its claim.
+            for &id in &ids {
+                let (context, index) = state.context(id);
+                context.write(index + 1, u64::from(did) << 8 | u64::from(self.levels - 2));
+                if let Some(line) = self.table_cacheline {
+                    context.flush(&*self.registers, line);
+                }
+                publish();
+                context.write(index, physical | 1);
+                if let Some(line) = self.table_cacheline {
+                    context.flush(&*self.registers, line);
+                }
+                publish();
             }
-            publish();
-            context.write(index, physical | 1);
-            if let Some(line) = self.table_cacheline {
-                context.flush(&*self.registers, line);
-            }
-            publish();
             if let Err(error) = self.invalidate(true) {
                 state.poisoned = true;
                 return Err(error);
@@ -1024,13 +1085,33 @@ impl<R: Registers> Unit<R> {
     }
 
     /// Read-only admission preflight; no provider, allocation or register IO.
-    fn requester_slot(&self, state: &State, rid: u16) -> Result<(u16, u64), VtdError> {
-        if state.shutdown
-            || state.poisoned
-            || !state.allowed.contains(&rid)
-            || state.domains.contains_key(&rid)
-        {
+    /// Each of `aliases` must be claimed with the requester under a
+    /// blocked root, allowed here and held by no domain.
+    fn requester_slot(
+        &self,
+        state: &State,
+        rid: u16,
+        aliases: &[u16],
+    ) -> Result<(u16, u64), VtdError> {
+        if state.shutdown || state.poisoned || !state.allowed.contains(&rid) || state.held(rid) {
             return Err(VtdError::Busy);
+        }
+        if !aliases.is_empty() {
+            let InitialState::Issued(claims) = &state.initial_block else {
+                return Err(VtdError::Unsupported);
+            };
+            let claimed = |id: u16| {
+                claims
+                    .binary_search_by_key(&id, |&(id, _)| id)
+                    .is_ok_and(|index| claims[index].1)
+            };
+            if state.window.is_some()
+                || aliases
+                    .iter()
+                    .any(|&id| !state.allowed.contains(&id) || state.held(id) || !claimed(id))
+            {
+                return Err(VtdError::Unsupported);
+            }
         }
         let first = if state.window.is_some() {
             u32::from(WINDOW_DID) + 1
@@ -1291,6 +1372,15 @@ impl<R: Registers> Drop for Unit<R> {
 }
 
 impl State {
+    /// Whether a domain holds `rid`'s context entry, as its own or an alias.
+    fn held(&self, rid: u16) -> bool {
+        self.domains.contains_key(&rid)
+            || self
+                .domains
+                .values()
+                .any(|domain| domain.aliases.contains(&rid))
+    }
+
     fn initial_claim(&mut self, rid: u16) -> Result<&mut bool, DmaError> {
         let InitialState::Issued(claims) = &mut self.initial_block else {
             return Err(DmaError::IommuUnavailable);

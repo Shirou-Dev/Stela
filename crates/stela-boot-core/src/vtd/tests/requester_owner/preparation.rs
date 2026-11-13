@@ -44,7 +44,7 @@ fn root_provider_reentry_rechecks_generation_and_shutdown_before_publication() {
                 let released = Arc::new(AtomicU64::new(0));
                 // SAFETY: distinct stopped model requester, no IRQ/work users.
                 let sibling = unsafe {
-                    original.attach_requester(RequesterClaim::model(16, released.clone()))
+                    original.attach_requester(RequesterClaim::model(16, released.clone()), &[])
                 }
                 .unwrap();
                 // SAFETY: the sibling has no mappings, engine or posted work.
@@ -59,9 +59,10 @@ fn root_provider_reentry_rechecks_generation_and_shutdown_before_publication() {
         }));
         let released = Arc::new(AtomicU64::new(0));
         // SAFETY: independent stopped model claim; provider changes unit state.
-        let failure = unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone())) }
-            .err()
-            .expect("stale preparation must not publish");
+        let failure =
+            unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone()), &[]) }
+                .err()
+                .expect("stale preparation must not publish");
         assert_eq!(failure.error, VtdError::Busy);
         assert!(unit.lock().state().domains.is_empty());
         assert_eq!(
@@ -96,7 +97,7 @@ fn source_check_unwind_before_publication_retains_the_whole_preparation() {
     let allocations = pages.next.load(Ordering::Relaxed);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: same stopped model source; validation deliberately unwinds.
-        let _ = unsafe { unit.attach_requester(claim) };
+        let _ = unsafe { unit.attach_requester(claim, &[]) };
     }));
     assert!(caught.is_err());
     assert_eq!(released.load(Ordering::Relaxed), 0);

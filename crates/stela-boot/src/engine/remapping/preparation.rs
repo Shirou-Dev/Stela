@@ -49,8 +49,8 @@ unsafe impl Root for VtdRoot {
         let claim = unsafe { RequesterClaim::from_binding(binding) }
             .map_err(|_| DmaError::MappingFailed)?;
         // SAFETY: same consumed receipt and original root/configuration epoch.
-        let domain =
-            unsafe { self.unit.attach_requester(claim) }.map_err(|_| DmaError::MappingFailed)?;
+        let domain = unsafe { self.unit.attach_requester(claim, self.blocked.aliases()) }
+            .map_err(|_| DmaError::MappingFailed)?;
         Ok(Box::new(VtdAttachment {
             address: self.address,
             domain,
@@ -162,7 +162,7 @@ impl Remappers {
             .map_err(|_| DmaError::IommuUnavailable)?
             .ok_or(DmaError::IommuUnavailable)?;
         let blocked = self
-            .initial_requester(source, taken, rid)?
+            .initial_requester(source, taken, rid, &[])?
             .ok_or(DmaError::DrainUnavailable)?;
         if blocked.requester() != rid {
             return Err(DmaError::IommuUnavailable);
@@ -256,7 +256,7 @@ impl Remappers {
             // fabric is empty and no root can block or translate this RID.
             // The parked master seal holds, and the kept line paths and
             // source exclude every other configuration and topology writer.
-            let config = unsafe { source.promote_cold_config(address, lines, || Ok(()), false) }
+            let config = unsafe { source.promote_cold_config(address, lines, || Ok(())) }
                 .map_err(PreparationError::Configuration)?;
             Ok((config, lines.clone()))
         })())
@@ -283,13 +283,24 @@ impl Remappers {
                 .as_ref()
                 .ok_or(PreparationError::Interrupt(MappingError::Unavailable))?;
             lines.check(source).map_err(PreparationError::Interrupt)?;
+            // The unit attaches the IVRS aliases with the requester and
+            // refuses a requester whose alias another one shares; an alias
+            // the IVRS does not name would reach no domain of this one.
+            let aliases = source
+                .requester_aliases(address)
+                .map_err(PreparationError::Configuration)?;
+            if !taken.arrives_under(rid, &aliases) {
+                return Err(PreparationError::Configuration(
+                    native_mmio::ContainmentError::bridge_alias(address),
+                ));
+            }
             let root = taken.preparation(address, lines.clone())?;
             // SAFETY: the complete original AMD fabric is blocked, the
-            // selected unit owns this exact entry, and the kept line/source
-            // owners exclude prior configuration and topology writers.
-            let config =
-                unsafe { source.promote_cold_config(address, lines, || root.check(), true) }
-                    .map_err(PreparationError::Configuration)?;
+            // selected unit owns this exact entry and gives its domain each
+            // alias, and the kept line/source owners exclude prior
+            // configuration and topology writers.
+            let config = unsafe { source.promote_cold_config(address, lines, || root.check()) }
+                .map_err(PreparationError::Configuration)?;
             return Ok((config, Box::new(root)));
         }
         let taken = self
@@ -302,24 +313,25 @@ impl Remappers {
             .as_ref()
             .ok_or(PreparationError::Interrupt(MappingError::Unavailable))?;
         lines.check(source).map_err(PreparationError::Interrupt)?;
+        let aliases = self
+            .vtd_aliases(source, address, taken)
+            .map_err(PreparationError::Configuration)?;
+        // The claim keeps each alias blocked for this requester alone: a
+        // function sharing one cannot claim it and stays parked.
         let blocked = self
-            .initial_requester(source, taken, rid)?
+            .initial_requester(source, taken, rid, &aliases)?
             .ok_or(DmaError::DrainUnavailable)?;
         // SAFETY: this root is selected from the same fully contained fabric
-        // and this slot's exact firmware route. Legacy probing is read-only
+        // and this slot's exact firmware route, and its claim holds each
+        // alias for the requester's domain. Legacy probing is read-only
         // while this fabric is active, and AML's ECAM writers are excluded.
         let config = unsafe {
-            source.promote_cold_config(
-                address,
-                lines,
-                || {
-                    if blocked.requester() != rid {
-                        return Err(DmaError::IommuUnavailable);
-                    }
-                    blocked.check()
-                },
-                true,
-            )
+            source.promote_cold_config(address, lines, || {
+                if blocked.requester() != rid {
+                    return Err(DmaError::IommuUnavailable);
+                }
+                blocked.check()
+            })
         }
         .map_err(PreparationError::Configuration)?;
         let root = Box::new(VtdRoot {

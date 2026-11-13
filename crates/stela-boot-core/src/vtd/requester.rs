@@ -175,20 +175,28 @@ impl<R: Registers> BoundRequester<R> {
         if state.shutdown || !current.mappings.is_empty() {
             return Err(VtdError::Busy);
         }
+        // The requester's own entry and each alias's lead to this domain.
+        let ids: Vec<u16> = core::iter::once(self.rid)
+            .chain(current.aliases.iter().copied())
+            .collect();
         // Poison before the first publication callback, including caught unwind.
         let was_poisoned = state.poisoned;
         state.poisoned = true;
-        let (context, index) = state.context(self.rid);
-        context.write(index, 0);
-        if let Some(line) = self.unit.table_cacheline {
-            context.flush(&*self.unit.registers, line);
+        for &id in &ids {
+            let (context, index) = state.context(id);
+            context.write(index, 0);
+            if let Some(line) = self.unit.table_cacheline {
+                context.flush(&*self.unit.registers, line);
+            }
         }
         publish();
         self.unit.invalidate(true)?;
-        let (context, index) = state.context(self.rid);
-        context.write(index + 1, 0);
-        if let Some(line) = self.unit.table_cacheline {
-            context.flush(&*self.unit.registers, line);
+        for &id in &ids {
+            let (context, index) = state.context(id);
+            context.write(index + 1, 0);
+            if let Some(line) = self.unit.table_cacheline {
+                context.flush(&*self.unit.registers, line);
+            }
         }
         publish();
         state.poisoned = was_poisoned;
@@ -205,9 +213,11 @@ impl<R: Registers> BoundRequester<R> {
         if !current.mappings.is_empty() {
             return Err(VtdError::Busy);
         }
-        let (context, index) = state.context(self.rid);
-        if context.read(index) != 0 || context.read(index + 1) != 0 {
-            return Err(VtdError::Invalidation);
+        for &id in &ids {
+            let (context, index) = state.context(id);
+            if context.read(index) != 0 || context.read(index + 1) != 0 {
+                return Err(VtdError::Invalidation);
+            }
         }
         state
             .domains

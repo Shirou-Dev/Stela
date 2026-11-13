@@ -536,6 +536,17 @@ fn alias_domain_ownership() {
     ));
 }
 
+/// A requester's domain takes the IDs the IVRS names as its alias, and no
+/// other: a bridge alias the firmware does not name reaches no domain.
+#[test]
+fn a_requester_arrives_under_only_its_firmware_aliases() {
+    let (unit, _) = unit_with_entries(&[0x42, 0x20, 0, 0, 0, 0x21, 0, 0]);
+    assert!(unit.arrives_under(0x20, &[]));
+    assert!(unit.arrives_under(0x20, &[0x21]));
+    assert!(!unit.arrives_under(0x20, &[0x21, 0x18]));
+    assert!(!unit.arrives_under(0x21, &[0x20]));
+}
+
 #[test]
 fn an_alias_cannot_take_an_independently_routed_requester() {
     let (mut unit, peer) = unit_with_entries(&[0x42, 0x20, 0, 0, 0, 0x21, 0, 0, 2, 0x21, 0, 0]);

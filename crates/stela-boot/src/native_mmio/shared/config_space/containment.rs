@@ -15,7 +15,11 @@ use stela_drivers::{
             },
         },
         regs::{COMMAND, COMMAND_MASTER},
-        requester::{ClaimError, containment::Plan, wait_for_pending_transactions},
+        requester::{
+            ClaimError,
+            containment::{Plan, requester_aliases},
+            wait_for_pending_transactions,
+        },
     },
     sync::{FaultState, FirstFault},
 };
@@ -289,9 +293,27 @@ impl fmt::Display for ContainmentError {
             Cause::Topology(cause) => write!(f, "the PCI topology is inconsistent ({cause:?})"),
             Cause::BridgeForwarding => f.write_str("upstream bridge forwarding is unavailable"),
             Cause::BridgeAlias => f.write_str(
-                "this bridge may forward the DMA below it under its own requester ID, which \
-                 a remapping context for each function cannot follow",
+                "a bridge above it may forward its DMA under another requester ID, which \
+                 its remapping unit cannot give the function's domain",
             ),
+        }
+    }
+}
+
+/// The requester ID of the function at `address` on its segment.
+fn requester_id(address: Address) -> u16 {
+    u16::from(address.bus) << 8 | u16::from(address.device) << 3 | u16::from(address.function)
+}
+
+impl ContainmentError {
+    /// The function at `address`, whose DMA may arrive under requester IDs
+    /// of a bridge above it ([`Source::requester_aliases`]), cannot have
+    /// each of them in its domain.
+    pub(crate) fn bridge_alias(address: Address) -> Self {
+        Self {
+            address: Some(address),
+            cause: Cause::BridgeAlias,
+            effect: ConfigEffect::None,
         }
     }
 }
@@ -504,26 +526,33 @@ impl Fabric {
         }))
     }
 
-    /// Refuse a function whose DMA crosses a bridge that may forward it
-    /// under the bridge's own requester ID: a remapping context attached
-    /// for the function's own ID would not see that DMA.
-    fn check_requester_ids(&self, mut route: topology::Parent) -> Result<(), ContainmentError> {
-        while let topology::Parent::Bridge(address) = route {
+    /// The requester IDs other than its own that the DMA of the function
+    /// at `address` may arrive under, through each bridge on its `route`
+    /// that forwards under an ID of its own.
+    fn requester_aliases(
+        &self,
+        address: Address,
+        mut route: topology::Parent,
+    ) -> Result<Vec<u16>, ContainmentError> {
+        let mut forwarded = Vec::new();
+        while let topology::Parent::Bridge(bridge) = route {
             let index = self
                 .slots
-                .binary_search_by_key(&address, |slot| slot.address)
+                .binary_search_by_key(&bridge, |slot| slot.address)
                 .expect("original parent remains in the fabric");
-            let bridge = &self.slots[index];
-            if !bridge.plan.keeps_requester_ids() {
-                return Err(ContainmentError {
-                    address: Some(address),
-                    cause: Cause::BridgeAlias,
-                    effect: ConfigEffect::None,
-                });
-            }
-            route = bridge.route;
+            let slot = &self.slots[index];
+            let secondary = slot
+                .header
+                .bridge
+                .and_then(|buses| topology::secondary_bus(bridge, buses))
+                .ok_or_else(|| ContainmentError::from(Error::OutsideResource).at(bridge))?;
+            forwarded.extend(
+                slot.plan
+                    .forwarded_requester(requester_id(bridge), secondary),
+            );
+            route = slot.route;
         }
-        Ok(())
+        Ok(requester_aliases(requester_id(address), forwarded))
     }
 
     fn check_upstream(&self, mut route: topology::Parent) -> Result<(), ContainmentError> {
@@ -1023,35 +1052,40 @@ unsafe impl PrepublicationCustody for SlotCustody {}
 unsafe impl DriverCustody for SlotCustody {}
 
 impl Source {
+    /// The requester IDs other than its own that the DMA of the parked
+    /// function at `address` may arrive under: each a bridge above it
+    /// forwards it under, as Linux's `pci_for_each_dma_alias` visits them.
+    /// A remapping unit that translates the function must give each one the
+    /// function's domain. The routing seal keeps them fixed.
+    pub(crate) fn requester_aliases(&self, address: Address) -> Result<Vec<u16>, ContainmentError> {
+        let cohort = self.pci_slots.0.try_borrow().map_err(|_| Error::Busy)?;
+        let Cohort::Parked(fabric) = &*cohort else {
+            return Err(Error::Unavailable.into());
+        };
+        let index = fabric
+            .slots
+            .binary_search_by_key(&address, |slot| slot.address)
+            .map_err(|_| ContainmentError::from(Error::OutsideResource).at(address))?;
+        fabric.requester_aliases(address, fabric.slots[index].route)
+    }
+
     /// Take the original parked endpoint, preserving its grant and negative
     /// operation state. A refusal after taking it keeps the exact envelope in
-    /// the same slot and prevents a second attempt. `translated`: the
-    /// endpoint's DMA will be remapped by its own requester ID, so a bridge
-    /// above it that may substitute another ID refuses it.
+    /// the same slot and prevents a second attempt.
     ///
     /// # Safety
     /// The caller owns the original complete remapping fabric. The check
-    /// observes the exact firmware-selected unit for this segment and RID. Prior PCI
-    /// writers and any legacy writer or reassignment of the topology stay
-    /// excluded. This grants no endpoint stop, root binding or IRQ route.
+    /// observes the exact firmware-selected unit for this segment and RID,
+    /// and, on a translated machine, that unit gives the function's domain
+    /// each of its [`Self::requester_aliases`]. Prior PCI writers and any
+    /// legacy writer or reassignment of the topology stay excluded. This
+    /// grants no endpoint stop, root binding or IRQ route.
     pub(crate) unsafe fn promote_cold_config(
         &self,
         address: Address,
         lines: &InitialPciLines,
         check_blocked: impl Fn() -> Result<(), DmaError>,
-        translated: bool,
     ) -> Result<OwnedConfig, ContainmentError> {
-        if translated {
-            let cohort = self.pci_slots.0.try_borrow().map_err(|_| Error::Busy)?;
-            let Cohort::Parked(fabric) = &*cohort else {
-                return Err(Error::Unavailable.into());
-            };
-            let index = fabric
-                .slots
-                .binary_search_by_key(&address, |slot| slot.address)
-                .map_err(|_| ContainmentError::from(Error::OutsideResource).at(address))?;
-            fabric.check_requester_ids(fabric.slots[index].route)?;
-        }
         // SAFETY: same original exclusive, blocked requester and line paths.
         unsafe { self.promote_parked(address, lines, check_blocked, false) }
     }

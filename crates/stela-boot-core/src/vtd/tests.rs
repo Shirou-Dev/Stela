@@ -323,7 +323,7 @@ fn a_requester_that_arrives_later_joins_the_unit() {
     assert!(!unit.allows(0x300));
     assert!(matches!(
         // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-        unsafe { unit.attach_requester(stopped_claim(0x300)) },
+        unsafe { unit.attach_requester(stopped_claim(0x300), &[]) },
         Err(AttachRequesterFailure {
             error: VtdError::Busy,
             ..
@@ -335,9 +335,9 @@ fn a_requester_that_arrives_later_joins_the_unit() {
     assert!(unit.allows(0x300));
     assert!(unit.allows(9));
     // SAFETY: as above.
-    let later = unsafe { unit.attach_requester(stopped_claim(0x300)) }.unwrap();
+    let later = unsafe { unit.attach_requester(stopped_claim(0x300), &[]) }.unwrap();
     // SAFETY: as above.
-    let sibling = unsafe { unit.attach_requester(stopped_claim(9)) }.unwrap();
+    let sibling = unsafe { unit.attach_requester(stopped_claim(9), &[]) }.unwrap();
     assert_ne!(later.domain_id(), sibling.domain_id());
 }
 
@@ -349,9 +349,9 @@ fn coherent_words_observe_only_the_live_domains_pins() {
             // process-context owner.
             unsafe { Unit::take_over(registers.clone(), source(), &[8, 16], 48, &[]) }.unwrap();
     // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-    let first = unsafe { unit.attach_requester(stopped_claim(8)) }.unwrap();
+    let first = unsafe { unit.attach_requester(stopped_claim(8), &[]) }.unwrap();
     // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-    let second = unsafe { unit.attach_requester(stopped_claim(16)) }.unwrap();
+    let second = unsafe { unit.attach_requester(stopped_claim(16), &[]) }.unwrap();
     let released = Arc::new(AtomicU64::new(0));
     let pin = pages(PAGE, 12, 0x810000, released.clone());
     let cpu = pin.cpu_mapping(CacheAttribute::WriteBack).unwrap();
@@ -435,7 +435,7 @@ fn payload_drain_requires_real_write_capability_and_acknowledged_visibility() {
                 // process-context owner.
                 unsafe { Unit::take_over(registers.clone(), source(), &[8], 48, &[]) }.unwrap();
         // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-        let domain = unsafe { unit.attach_requester(stopped_claim(8)) }.unwrap();
+        let domain = unsafe { unit.attach_requester(stopped_claim(8), &[]) }.unwrap();
         let pin = pages(PAGE, 12, 0xa10000, Arc::new(AtomicU64::new(0)));
         let cpu = pin.cpu_mapping(CacheAttribute::WriteBack).unwrap();
         let pointer = cpu.address(0, 4).unwrap().as_ptr().cast::<u32>();
@@ -497,7 +497,7 @@ fn withheld_drain_bad_granularity_and_write_buffer_fault_keep_all_backing() {
         let domain =
                 // SAFETY: the model requester is stopped and owned by this test, with no DMA in
                 // flight.
-                unsafe { unit.attach_requester(RequesterClaim::model(8, claim_drops.clone())) }
+                unsafe { unit.attach_requester(RequesterClaim::model(8, claim_drops.clone()), &[]) }
                     .unwrap();
         let pin_drops = Arc::new(AtomicU64::new(0));
         let pin = pages(PAGE, 12, 0xb10000, pin_drops.clone());
@@ -556,7 +556,7 @@ fn scatter_maps_kept_native_subranges_and_releases_only_after_invalidation() {
     // SAFETY: exclusive deterministic register/requester model; no device.
     let unit = unsafe { Unit::take_over(registers.clone(), source, &[8], 48, &[]) }.unwrap();
     // SAFETY: the model supplies the exact stopped requester claim.
-    let domain = unsafe { unit.attach_requester(stopped_claim(8)) }.unwrap();
+    let domain = unsafe { unit.attach_requester(stopped_claim(8), &[]) }.unwrap();
     let released = Arc::new(AtomicU64::new(0));
     let granule = 2 * PAGE;
     let first = pages(2 * granule, 13, 0x900000, released.clone());
@@ -637,7 +637,7 @@ fn covered_requesters_reach_only_the_window_until_attached_to_their_own_domain()
         assert_eq!(m.translation(24, 0x80_0000), None);
     }
     // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-    let own = unsafe { unit.attach_requester(stopped_claim(8)) }.unwrap();
+    let own = unsafe { unit.attach_requester(stopped_claim(8), &[]) }.unwrap();
     assert_eq!(own.domain_id(), WINDOW_DID + 1);
     let m = registers.0.lock().unwrap();
     assert_eq!(m.translation(8, 0x80_0000), None);
@@ -676,16 +676,16 @@ fn contexts_separate_same_iova_and_reject_cross_domain_or_stale_tokens() {
             // process-context owner.
             unsafe { Unit::take_over(registers.clone(), source, &[8, 16, 24], 48, &[]) }.unwrap();
     // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-    let first = unsafe { unit.attach_requester(stopped_claim(8)) }.unwrap();
+    let first = unsafe { unit.attach_requester(stopped_claim(8), &[]) }.unwrap();
     // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-    let second = unsafe { unit.attach_requester(stopped_claim(16)) }.unwrap();
+    let second = unsafe { unit.attach_requester(stopped_claim(16), &[]) }.unwrap();
     assert_ne!(first.domain_id(), second.domain_id());
     let next_table = source.next.load(Ordering::Relaxed);
     for rejected in [8, 0x20] {
         assert!(matches!(
             // SAFETY: the model requester is stopped and owned by this test, with no DMA in
             // flight.
-            unsafe { unit.attach_requester(stopped_claim(rejected)) },
+            unsafe { unit.attach_requester(stopped_claim(rejected), &[]) },
             Err(AttachRequesterFailure {
                 error: VtdError::Busy,
                 ..
@@ -751,7 +751,7 @@ fn contexts_separate_same_iova_and_reject_cross_domain_or_stale_tokens() {
     drop(unsafe { first.detach() }.unwrap());
     assert_eq!(registers.0.lock().unwrap().translation(8, address), None);
     // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-    let replacement = unsafe { unit.attach_requester(stopped_claim(8)) }.unwrap();
+    let replacement = unsafe { unit.attach_requester(stopped_claim(8), &[]) }.unwrap();
     assert_eq!(replacement.domain_id(), old_did);
     assert!(replacement.generation() > old_epoch);
     let mut c = DmaMapping::map(
@@ -808,9 +808,9 @@ fn failed_context_detach_keeps_hardware_did_claim_and_tables_until_ack() {
     let released = Arc::new(AtomicU64::new(0));
     let first =
             // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-            unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone())) }.unwrap();
+            unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone()), &[]) }.unwrap();
     // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-    let second = unsafe { unit.attach_requester(stopped_claim(16)) }.unwrap();
+    let second = unsafe { unit.attach_requester(stopped_claim(16), &[]) }.unwrap();
     let before = source.released.load(Ordering::Relaxed);
     registers.0.lock().unwrap().block_context = true;
     // SAFETY: the model device is stopped, so no transfer reaches this domain's mappings.
@@ -826,7 +826,7 @@ fn failed_context_detach_keeps_hardware_did_claim_and_tables_until_ack() {
     }
     assert!(matches!(
         // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-        unsafe { unit.attach_requester(stopped_claim(8)) },
+        unsafe { unit.attach_requester(stopped_claim(8), &[]) },
         Err(AttachRequesterFailure {
             error: VtdError::Busy,
             ..
@@ -916,11 +916,11 @@ fn hardware_did_capacity_quarantine_and_software_epochs_never_wrap_or_reuse_earl
     let mut domains = Vec::new();
     for rid in 0..15 {
         // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-        domains.push(unsafe { unit.attach_requester(stopped_claim(rid)) }.unwrap());
+        domains.push(unsafe { unit.attach_requester(stopped_claim(rid), &[]) }.unwrap());
     }
     assert!(matches!(
         // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-        unsafe { unit.attach_requester(stopped_claim(15)) },
+        unsafe { unit.attach_requester(stopped_claim(15), &[]) },
         Err(AttachRequesterFailure {
             error: VtdError::Busy,
             ..
@@ -939,7 +939,7 @@ fn hardware_did_capacity_quarantine_and_software_epochs_never_wrap_or_reuse_earl
     drop(unsafe { retired.detach() }.unwrap());
     drop(retired);
     // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-    let replacement = unsafe { unit.attach_requester(stopped_claim(15)) }.unwrap();
+    let replacement = unsafe { unit.attach_requester(stopped_claim(15), &[]) }.unwrap();
     assert_eq!(replacement.domain_id(), reusable);
     assert_ne!(replacement.domain_id(), quarantined_did);
     // SAFETY: the model device is stopped, so no transfer reaches this domain's mappings.
@@ -951,7 +951,7 @@ fn hardware_did_capacity_quarantine_and_software_epochs_never_wrap_or_reuse_earl
     }
     assert!(matches!(
         // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-        unsafe { unit.attach_requester(stopped_claim(15)) },
+        unsafe { unit.attach_requester(stopped_claim(15), &[]) },
         Err(AttachRequesterFailure {
             error: VtdError::Unsupported,
             ..
@@ -995,7 +995,7 @@ fn active_noncoherent_walker_never_reaches_unpublished_children() {
     let unit = unsafe { Unit::take_over(registers.clone(), source, &[8], 48, &[]) }.unwrap();
     let domain =
             // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-            unsafe { unit.attach_requester(RequesterClaim::model(8, Arc::new(AtomicU64::new(0)))) }
+            unsafe { unit.attach_requester(RequesterClaim::model(8, Arc::new(AtomicU64::new(0))), &[]) }
                 .unwrap();
     let mut first = DmaMapping::map(
         domain.clone(),
@@ -1141,9 +1141,10 @@ fn unmap_invalidates_the_aligned_page_block_when_the_unit_takes_psi() {
         // SAFETY: exclusive stopped model.
         let unit = unsafe { Unit::take_over(registers.clone(), source(), &[8], 48, &[]) }.unwrap();
         // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-        let domain =
-            unsafe { unit.attach_requester(RequesterClaim::model(8, Arc::new(AtomicU64::new(0)))) }
-                .unwrap();
+        let domain = unsafe {
+            unit.attach_requester(RequesterClaim::model(8, Arc::new(AtomicU64::new(0))), &[])
+        }
+        .unwrap();
         let pin = pages(3 * PAGE, 12, 0xa000000, Arc::new(AtomicU64::new(0)));
         let mut mapping =
             DmaMapping::map(domain.clone(), pin, Direction::Bidirectional, u64::MAX).unwrap();
@@ -1189,7 +1190,7 @@ fn noncoherent_table_flushes_precede_root_and_each_mapping_invalidation() {
     let unit = unsafe { Unit::take_over(registers.clone(), source(), &[8], 48, &[]) }.unwrap();
     let domain =
             // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-            unsafe { unit.attach_requester(RequesterClaim::model(8, Arc::new(AtomicU64::new(0)))) }
+            unsafe { unit.attach_requester(RequesterClaim::model(8, Arc::new(AtomicU64::new(0))), &[]) }
                 .unwrap();
     assert!(unit.table_cacheline.is_some());
     let root_position = registers
@@ -1270,9 +1271,13 @@ fn native_page_array_maps_through_real_tables_and_reclaims_after_acknowledged_un
     // SAFETY: exclusively owned stopped requester in the explicit model.
     let unit = unsafe { Unit::take_over(registers.clone(), source, &[0x18], 48, &[]) }.unwrap();
     // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-    let domain =
-        unsafe { unit.attach_requester(RequesterClaim::model(0x18, Arc::new(AtomicU64::new(0)))) }
-            .unwrap();
+    let domain = unsafe {
+        unit.attach_requester(
+            RequesterClaim::model(0x18, Arc::new(AtomicU64::new(0))),
+            &[],
+        )
+    }
+    .unwrap();
     let released = Arc::new(AtomicU64::new(0));
     // One 16 KiB native page; VT-d uses four 4 KiB leaves.
     let pin = pages(16384, 14, 0x8000000, released.clone());
@@ -1361,7 +1366,7 @@ fn failed_translation_disable_keeps_tables_until_acknowledgement() {
     let unit = unsafe { Unit::take_over(registers.clone(), source, &[8], 48, &[]) }.unwrap();
     let domain =
             // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-            unsafe { unit.attach_requester(RequesterClaim::model(8, Arc::new(AtomicU64::new(0)))) }
+            unsafe { unit.attach_requester(RequesterClaim::model(8, Arc::new(AtomicU64::new(0))), &[]) }
                 .unwrap();
     // SAFETY: the model device is stopped, so no transfer reaches this domain's mappings.
     unsafe { domain.detach() }.unwrap();
@@ -1409,7 +1414,7 @@ fn failed_map_quarantines_the_domain_and_keeps_pins() {
     let unit = unsafe { Unit::take_over(registers.clone(), source, &[8], 48, &[]) }.unwrap();
     let domain =
             // SAFETY: the model requester is stopped and owned by this test, with no DMA in flight.
-            unsafe { unit.attach_requester(RequesterClaim::model(8, Arc::new(AtomicU64::new(0)))) }
+            unsafe { unit.attach_requester(RequesterClaim::model(8, Arc::new(AtomicU64::new(0))), &[]) }
                 .unwrap();
     let released = Arc::new(AtomicU64::new(0));
     let pin = pages(4096, 12, 0x9000000, released.clone());
@@ -1487,7 +1492,7 @@ fn initial_root_drain_precedes_private_attachment_and_requires_write_drain() {
             assert_eq!(u32::from_le(unsafe { pointer.read_volatile() }), 0x76543210);
             assert!(registers.0.lock().unwrap().pending_payload.is_empty());
             // SAFETY: the model has no more DMA, IRQ or worker producers.
-            let domain = unsafe { unit.attach_requester(stopped_claim(8)) }.unwrap();
+            let domain = unsafe { unit.attach_requester(stopped_claim(8), &[]) }.unwrap();
             let before = registers.0.lock().unwrap().writes.len();
             assert_eq!(
                 unit.drain_initial_requester(8),
@@ -1613,7 +1618,7 @@ fn dynamic_bus_root_publication_preserves_reserved_halves_and_other_buses() {
         after
     };
     // SAFETY: this real model claim is stopped and paired to the new RID.
-    let domain = unsafe { unit.attach_requester(stopped_claim(0x0108)) }.unwrap();
+    let domain = unsafe { unit.attach_requester(stopped_claim(0x0108), &[]) }.unwrap();
     let mut mapping = DmaMapping::map(
         domain.clone(),
         pages(PAGE, 12, 0x990000, Arc::new(AtomicU64::new(0))),
@@ -1687,26 +1692,86 @@ fn blocked_initial_cohort_is_exact_and_each_requester_is_claimed_once() {
         unit.acknowledge_initial_block(&requesters),
         Err(DmaError::IommuUnavailable)
     ));
-    let first = cohort.claim(requesters[0]).unwrap();
+    let first = cohort.claim(requesters[0], &[]).unwrap();
     assert_eq!(first.requester(), requesters[0]);
     let before_check = registers.0.lock().unwrap().writes.len();
     first.check().unwrap();
     assert_eq!(registers.0.lock().unwrap().writes.len(), before_check);
     assert!(matches!(
-        cohort.claim(requesters[0]),
+        cohort.claim(requesters[0], &[]),
         Err(DmaError::IommuUnavailable)
     ));
     first.drain().unwrap();
 
     // SAFETY: model requester remains stopped with no DMA, IRQ or worker users.
-    let domain = unsafe { unit.attach_requester(stopped_claim(requesters[0])) }.unwrap();
+    let domain = unsafe { unit.attach_requester(stopped_claim(requesters[0]), &[]) }.unwrap();
     assert_eq!(first.check(), Err(DmaError::IommuUnavailable));
     assert_eq!(first.drain(), Err(DmaError::IommuUnavailable));
     // SAFETY: the model has no live users or payload mappings.
     drop(unsafe { domain.detach() }.unwrap());
     drop(domain);
     assert_eq!(first.drain(), Err(DmaError::IommuUnavailable));
-    cohort.claim(requesters[1]).unwrap().drain().unwrap();
+    cohort.claim(requesters[1], &[]).unwrap().drain().unwrap();
+    // SAFETY: every modeled requester and transfer remains stopped.
+    unsafe { unit.shut_down() }.unwrap();
+}
+
+/// A requester behind a PCI Express to PCI bridge attaches its own ID and
+/// the bridge's secondary bus ID to one domain. The alias is claimed once,
+/// so a sibling sharing it can neither claim nor attach it, and detach
+/// blocks both entries again.
+#[test]
+fn blocked_requester_attaches_and_detaches_its_aliases_with_it() {
+    let registers = ModelRegisters::new();
+    let requesters = [0x0620, 0x0628];
+    // SAFETY: this test exclusively owns the stopped model and its register bank.
+    let unit =
+        unsafe { Unit::take_over(registers.clone(), source(), &requesters, 48, &[]) }.unwrap();
+    let cohort = unit.acknowledge_initial_block(&requesters).unwrap();
+    // No function has the bridge's ID: it is allowed without joining the cohort.
+    unit.admit_requester(0x0600).unwrap();
+    assert!(matches!(
+        cohort.claim(0x0620, &[0x0600, 0x0600]),
+        Err(DmaError::IommuUnavailable)
+    ));
+    let first = cohort.claim(0x0620, &[0x0600]).unwrap();
+    assert!(matches!(
+        cohort.claim(0x0628, &[0x0600]),
+        Err(DmaError::IommuUnavailable)
+    ));
+    first.drain().unwrap();
+    let entry = |rid| {
+        let mut guard = unit.lock();
+        let (table, index) = guard.state().context(rid);
+        (table.read(index), table.read(index + 1))
+    };
+    // SAFETY: model requester remains stopped with no DMA, IRQ or worker users.
+    let domain = unsafe { unit.attach_requester(stopped_claim(0x0620), &[0x0600]) }.unwrap();
+    assert_ne!(entry(0x0620).0, 0);
+    assert_eq!(entry(0x0600), entry(0x0620));
+    // SAFETY: the sibling's model claim stays stopped; refused before effects.
+    assert!(unsafe { unit.attach_requester(stopped_claim(0x0628), &[0x0600]) }.is_err());
+    // SAFETY: the model has no live users or payload mappings.
+    drop(unsafe { domain.detach() }.unwrap());
+    assert_eq!(entry(0x0620), (0, 0));
+    assert_eq!(entry(0x0600), (0, 0));
+    // SAFETY: every modeled requester and transfer remains stopped.
+    unsafe { unit.shut_down() }.unwrap();
+}
+
+/// Without a blocked root no alias was claimed, so none attaches.
+#[test]
+fn a_requester_attaches_no_alias_before_the_initial_block() {
+    let registers = ModelRegisters::new();
+    // SAFETY: this test exclusively owns the stopped model and its register bank.
+    let unit = unsafe { Unit::take_over(registers.clone(), source(), &[0x0600, 0x0620], 48, &[]) }
+        .unwrap();
+    // SAFETY: the model claim stays stopped; refused before effects.
+    assert!(unsafe { unit.attach_requester(stopped_claim(0x0620), &[0x0600]) }.is_err());
+    // SAFETY: model requester remains stopped with no DMA, IRQ or worker users.
+    let domain = unsafe { unit.attach_requester(stopped_claim(0x0620), &[]) }.unwrap();
+    // SAFETY: the model has no live users or payload mappings.
+    drop(unsafe { domain.detach() }.unwrap());
     // SAFETY: every modeled requester and transfer remains stopped.
     unsafe { unit.shut_down() }.unwrap();
 }

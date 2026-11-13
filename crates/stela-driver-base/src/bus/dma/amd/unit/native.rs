@@ -577,6 +577,14 @@ impl<P: ColdPlatform, C: UnitConfig> Unit<P, C> {
         group
     }
 
+    /// Whether requester `rid`'s domain also takes each of `ids`: the
+    /// firmware names each one as its alias, as Linux's IVRS alias table
+    /// does for a device behind a bridge that forwards under its own ID.
+    pub fn arrives_under(&self, rid: u16, ids: &[u16]) -> bool {
+        let group = self.group(rid);
+        ids.iter().all(|id| group.contains(id))
+    }
+
     /// Whether another requester can address a member of this group, either
     /// through a firmware alias or by using its own independently routed ID.
     fn shared(&self, rid: u16, group: &[u16]) -> bool {

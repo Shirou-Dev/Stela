@@ -113,6 +113,7 @@ impl BlockedFabric {
         source: &native_mmio::Source,
         descriptor: usize,
         rid: u16,
+        aliases: &[u16],
     ) -> Result<BlockedRequester<MmioRegisters>, DmaError> {
         if !core::ptr::eq(self.source, source) {
             return Err(DmaError::IommuUnavailable);
@@ -122,7 +123,7 @@ impl BlockedFabric {
             .iter()
             .find(|(index, _)| *index == descriptor)
             .ok_or(DmaError::IommuUnavailable)?;
-        cohort.claim(rid)
+        cohort.claim(rid, aliases)
     }
 }
 
@@ -760,6 +761,7 @@ impl Remappers {
         source: &native_mmio::Source,
         taken: &Taken,
         rid: u16,
+        aliases: &[u16],
     ) -> Result<Option<BlockedRequester<MmioRegisters>>, DmaError> {
         match taken.initial {
             InitialContexts::Window => Ok(None),
@@ -767,7 +769,7 @@ impl Remappers {
                 .initial_fabric
                 .as_ref()
                 .ok_or(DmaError::DrainUnavailable)?
-                .requester(source, taken.descriptor, rid)
+                .requester(source, taken.descriptor, rid, aliases)
                 .map(Some),
         }
     }
@@ -1061,7 +1063,8 @@ impl Remappers {
         source: &native_mmio::Source,
         binding: RequesterBinding,
     ) -> Result<Result<Arc<dyn DmaDomain>, VtdError>, RequesterBinding> {
-        let segment = binding.address().segment;
+        let binding_address = binding.address();
+        let segment = binding_address.segment;
         let rid = binding.requester();
         let amd = match self.amd(segment, rid) {
             Ok(taken) => taken,
@@ -1096,21 +1099,35 @@ impl Remappers {
                 return Ok(Err(error));
             }
         };
-        let initial = self
-            .initial_requester(source, taken, rid)
-            .and_then(|blocked| blocked.map_or(Ok(()), |requester| requester.drain()));
-        if let Err(error) = initial {
-            output::arguments(format_args!(
-                "HOST IOMMU VT-d requester {rid:#06x} initial handoff refused: {error:?}\n"
-            ));
-            let _kept = core::mem::ManuallyDrop::new(claim);
-            return Ok(Err(match error {
-                DmaError::InvalidationFailed => VtdError::Invalidation,
-                _ => VtdError::Unsupported,
-            }));
-        }
-        // SAFETY: the same checked stopped claim and original unit remain held.
-        let owner = match unsafe { taken.unit.attach_requester(claim) } {
+        // A unit beside the drivers' window claims no alias, so it attaches
+        // the requester's own ID alone, as before any requester attached.
+        let aliases = match taken.initial {
+            InitialContexts::Blocked => self.vtd_aliases(source, binding_address, taken),
+            InitialContexts::Window => Ok(Vec::new()),
+        };
+        let initial = aliases
+            .map_err(|_| DmaError::IommuUnavailable)
+            .and_then(|aliases| {
+                let blocked = self.initial_requester(source, taken, rid, &aliases)?;
+                blocked.map_or(Ok(()), |requester| requester.drain())?;
+                Ok(aliases)
+            });
+        let aliases = match initial {
+            Ok(aliases) => aliases,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "HOST IOMMU VT-d requester {rid:#06x} initial handoff refused: {error:?}\n"
+                ));
+                let _kept = core::mem::ManuallyDrop::new(claim);
+                return Ok(Err(match error {
+                    DmaError::InvalidationFailed => VtdError::Invalidation,
+                    _ => VtdError::Unsupported,
+                }));
+            }
+        };
+        // SAFETY: the same checked stopped claim and original unit remain
+        // held, and the blocked claim covered each alias.
+        let owner = match unsafe { taken.unit.attach_requester(claim, &aliases) } {
             Ok(owner) => owner,
             Err(failure) => return Ok(Err(failure.error)),
         };
@@ -1119,5 +1136,29 @@ impl Remappers {
         // DMA projection contains no command/configuration callback.
         self.requesters.borrow_mut().push(owner);
         Ok(Ok(domain as Arc<dyn DmaDomain>))
+    }
+
+    /// The other requester IDs the DMA of the function at `address` may
+    /// arrive under ([`native_mmio::Source::requester_aliases`]), each
+    /// routed to the same `taken` unit and allowed there. An ID no function
+    /// has is admitted: no function uses it, so its context entry only
+    /// ever carries this requester's DMA once the requester claims it.
+    fn vtd_aliases(
+        &self,
+        source: &native_mmio::Source,
+        address: Address,
+        taken: &Taken,
+    ) -> Result<Vec<u16>, native_mmio::ContainmentError> {
+        let aliases = source.requester_aliases(address)?;
+        for &alias in &aliases {
+            let same = matches!(
+                self.vtd(address.segment, alias),
+                Ok(Some(unit)) if Arc::ptr_eq(&unit.unit, &taken.unit)
+            );
+            if !same || taken.unit.admit_requester(alias).is_err() {
+                return Err(native_mmio::ContainmentError::bridge_alias(address));
+            }
+        }
+        Ok(aliases)
     }
 }

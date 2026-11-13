@@ -14,11 +14,12 @@ fn rejected_and_published_requester_failures_keep_original_claim_and_unit() {
         let rid = if published { 8 } else { 0x300 };
         let before = Arc::strong_count(&unit);
         // SAFETY: explicit stopped isolated claim; this grants no native receipt.
-        let failure =
-            match unsafe { unit.attach_requester(RequesterClaim::model(rid, released.clone())) } {
-                Err(failure) => failure,
-                Ok(_) => panic!("injected requester failure was ignored"),
-            };
+        let failure = match unsafe {
+            unit.attach_requester(RequesterClaim::model(rid, released.clone()), &[])
+        } {
+            Err(failure) => failure,
+            Ok(_) => panic!("injected requester failure was ignored"),
+        };
         assert_eq!(
             failure.error,
             if published {
@@ -97,7 +98,7 @@ fn context_publication_unwind_closes_sibling_admission_and_retains_the_unit() {
     armed.store(true, Ordering::Relaxed);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: the model claim is stopped; fault interrupts real publication.
-        let _ = unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone())) };
+        let _ = unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone()), &[]) };
     }));
     assert!(caught.is_err());
     assert_eq!(released.load(Ordering::Relaxed), 0);
@@ -110,11 +111,12 @@ fn context_publication_unwind_closes_sibling_admission_and_retains_the_unit() {
     let allocation = pages.next.load(Ordering::Relaxed);
     for rid in [8, 16] {
         // SAFETY: separate stopped model claims must be rejected before effects.
-        let refusal =
-            match unsafe { unit.attach_requester(RequesterClaim::model(rid, released.clone())) } {
-                Err(failure) => failure,
-                Ok(_) => panic!("resumed after interrupted context publication"),
-            };
+        let refusal = match unsafe {
+            unit.attach_requester(RequesterClaim::model(rid, released.clone()), &[])
+        } {
+            Err(failure) => failure,
+            Ok(_) => panic!("resumed after interrupted context publication"),
+        };
         assert_eq!(refusal.error, VtdError::Busy);
         drop(refusal);
     }

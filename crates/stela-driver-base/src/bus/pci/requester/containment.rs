@@ -34,6 +34,21 @@ struct Control {
 const PCIE_TO_PCI_BRIDGE: u8 = 0x7;
 const PCI_TO_PCIE_BRIDGE: u8 = 0x8;
 
+/// The requester IDs other than `own` that a function's DMA may arrive
+/// under: each one a bridge on its route upward forwards it under
+/// ([`Plan::forwarded_requester`]), nearest first, once each. Linux's
+/// `pci_for_each_dma_alias` visits the same IDs; the quirk aliases it adds
+/// for single devices are not included.
+pub fn requester_aliases(own: u16, forwarded: impl IntoIterator<Item = u16>) -> Vec<u16> {
+    let mut aliases = Vec::new();
+    for id in forwarded {
+        if id != own && !aliases.contains(&id) {
+            aliases.push(id);
+        }
+    }
+    aliases
+}
+
 /// This plan describes PCI-level controls only. It conveys no physical
 /// ownership, engine stop, or authority to release old DMA or IRQ state.
 pub struct Plan {
@@ -222,18 +237,20 @@ impl Plan {
         Ok(())
     }
 
-    /// Whether this function, as a bridge, passes on the requester ID of
-    /// each function below it unchanged, so each keeps a remapping context
-    /// of its own. A PCI Express root port, switch port or port of any other
-    /// type does. A PCI Express to PCI/PCI-X bridge, a PCI/PCI-X to PCI
-    /// Express bridge and a bridge without a PCI Express capability may
-    /// take over the transactions of the functions below it under an ID of
-    /// its own, as Linux's `pci_for_each_dma_alias` assumes.
-    pub fn keeps_requester_ids(&self) -> bool {
-        !matches!(
-            self.express_port,
-            None | Some(PCIE_TO_PCI_BRIDGE | PCI_TO_PCIE_BRIDGE)
-        )
+    /// The requester ID under which this function, as a bridge with
+    /// requester ID `own` and secondary bus `secondary`, may forward the
+    /// DMA of the functions below it; none when it passes on each one's ID
+    /// unchanged, as a PCI Express root port, switch port or port of any
+    /// other type does. As Linux's `pci_for_each_dma_alias`: a PCI Express
+    /// to PCI/PCI-X bridge takes over transactions under its secondary bus
+    /// with device and function 0, and a PCI/PCI-X to PCI Express bridge or
+    /// a bridge without a PCI Express capability under its own ID.
+    pub fn forwarded_requester(&self, own: u16, secondary: u8) -> Option<u16> {
+        match self.express_port {
+            Some(PCIE_TO_PCI_BRIDGE) => Some(u16::from(secondary) << 8),
+            None | Some(PCI_TO_PCIE_BRIDGE) => Some(own),
+            Some(_) => None,
+        }
     }
 
     /// Does this exact write narrow one observed control?

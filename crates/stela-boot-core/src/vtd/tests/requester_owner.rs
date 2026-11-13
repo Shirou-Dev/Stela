@@ -15,7 +15,7 @@ fn shared_dma_projection_is_send_sync_without_the_config_actor() {
     let released = Arc::new(AtomicU64::new(0));
     // SAFETY: independently owned stopped model claim.
     let owner =
-        unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone())) }.unwrap();
+        unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone()), &[]) }.unwrap();
     let projection = owner.domain();
     let effects = registers.0.lock().unwrap().writes.len();
     std::thread::spawn(move || drop(projection)).join().unwrap();
@@ -38,7 +38,7 @@ fn abandoned_actor_closes_clones_without_taking_the_unit_lock() {
     let released = Arc::new(AtomicU64::new(0));
     // SAFETY: isolated stopped model source.
     let owner =
-        unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone())) }.unwrap();
+        unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone()), &[]) }.unwrap();
     let projection = owner.domain();
     let before = Arc::strong_count(&unit);
     let effects = registers.0.lock().unwrap().writes.len();
@@ -73,7 +73,7 @@ fn global_drop_after_ack_is_metadata_only_and_cannot_detach_twice() {
     let released = Arc::new(AtomicU64::new(0));
     // SAFETY: same isolated claim, no concurrent producer.
     let owner =
-        unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone())) }.unwrap();
+        unsafe { unit.attach_requester(RequesterClaim::model(8, released.clone()), &[]) }.unwrap();
     let projection = owner.domain();
     // SAFETY: all model source/mapping/IRQ/work joins are empty.
     drop(unsafe { owner.detach() }.unwrap());
@@ -111,7 +111,7 @@ fn original_config_checks_never_run_under_the_unit_lock() {
         }),
     );
     // SAFETY: this same claim has no real engine or pending IRQ/work.
-    let owner = unsafe { unit.attach_requester(claim) }.unwrap();
+    let owner = unsafe { unit.attach_requester(claim, &[]) }.unwrap();
     // SAFETY: no actual DMA can issue from the isolated peer.
     unsafe { owner.set_bus_master(false) }.unwrap();
     // SAFETY: all model source/mapping joins are empty.
@@ -143,7 +143,7 @@ fn source_callback_unwind_keeps_the_actor_and_denies_global_clones() {
         }),
     );
     // SAFETY: same stopped model source with no IRQ/work or hidden producer.
-    let owner = unsafe { unit.attach_requester(claim) }.unwrap();
+    let owner = unsafe { unit.attach_requester(claim, &[]) }.unwrap();
     let projection = owner.domain();
     armed.store(true, Ordering::Release);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

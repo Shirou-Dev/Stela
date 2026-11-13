@@ -997,29 +997,51 @@ fn containment_plan_on(config: &Config, root_bus: bool) -> Result<containment::P
     )
 }
 
-/// Root, switch and other PCI Express ports pass requester IDs on; a
-/// PCI Express to PCI bridge, a PCI to PCI Express bridge and a bridge
-/// with no PCI Express capability may substitute their own.
+/// Root, switch and other PCI Express ports pass requester IDs on. A
+/// PCI Express to PCI bridge forwards under its secondary bus with device
+/// and function 0; a PCI to PCI Express bridge and a bridge with no PCI
+/// Express capability forward under their own ID.
 #[test]
-fn containment_plan_tells_which_bridges_keep_requester_ids() {
+fn containment_plan_tells_under_which_id_a_bridge_forwards() {
     let mut conventional = endpoint();
     let plan = containment_plan(conventional.config()).unwrap();
-    assert!(!plan.keeps_requester_ids());
-    for (port, keeps) in [
-        (0x4, true),
-        (0x5, true),
-        (0x6, true),
-        (0x0, true),
-        (0xb, true),
-        (0x7, false),
-        (0x8, false),
+    assert_eq!(plan.forwarded_requester(0x0010, 5), Some(0x0010));
+    for (port, forwarded) in [
+        (0x4, None),
+        (0x5, None),
+        (0x6, None),
+        (0x0, None),
+        (0xb, None),
+        (0x7, Some(0x0500)),
+        (0x8, Some(0x0010)),
     ] {
         let mut function = endpoint();
         cap(&mut function, 0x40, PCIE, 0);
         function.config().write16(0x42, 2 | port << 4).unwrap();
         let plan = containment_plan(function.config()).unwrap();
-        assert_eq!(plan.keeps_requester_ids(), keeps, "port type {port:#x}");
+        assert_eq!(
+            plan.forwarded_requester(0x0010, 5),
+            forwarded,
+            "port type {port:#x}"
+        );
     }
+}
+
+/// A function's aliases are the IDs each forwarding bridge above it uses,
+/// nearest first, without its own ID or repeats.
+#[test]
+fn requester_aliases_list_each_forwarded_id_once() {
+    use containment::requester_aliases;
+    assert!(requester_aliases(0x0628, []).is_empty());
+    assert_eq!(requester_aliases(0x0628, [0x0600]), [0x0600]);
+    // A device at the secondary bus's device 0 function 0 is its own alias.
+    assert!(requester_aliases(0x0600, [0x0600]).is_empty());
+    // A conventional bridge behind a PCI Express to PCI bridge: its own ID,
+    // then the outer bridge's secondary bus ID.
+    assert_eq!(
+        requester_aliases(0x0708, [0x0620, 0x0600, 0x0600]),
+        [0x0620, 0x0600]
+    );
 }
 
 #[test]
