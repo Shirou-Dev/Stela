@@ -453,16 +453,27 @@ impl Shared {
     /// None means disabled, not yet observed, or currently held by an owner.
     /// This snapshot grants no DMA, mapping or quiescence permission.
     pub fn callback_stats(&self) -> Option<CallbackStats> {
-        if !self.0.profile_callbacks.load(Ordering::Relaxed)
-            || self
-                .0
-                .held
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-        {
+        if !self.0.profile_callbacks.load(Ordering::Relaxed) {
             return None;
         }
-        Held(&self.0).requests().stats.callbacks
+        self.try_lock()?.requests().stats.callbacks
+    }
+
+    /// The disk, unless another owner is using it now: an owner that may
+    /// not wait, as a service turn, which holds its processor inside one
+    /// exit, comes back later. The holder may itself wait for a lock its
+    /// device needs, such as the host drivers'.
+    pub(super) fn try_lock(&self) -> Option<Held<'_>> {
+        self.0
+            .held
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+            .then(|| Held(&self.0))
+    }
+
+    /// Whether another owner is using the disk now.
+    fn held(&self) -> bool {
+        self.0.held.load(Ordering::Relaxed)
     }
 
     /// The disk, once no other owner is using it.
@@ -529,6 +540,7 @@ impl Shared {
             first: 0,
             identity,
             started: Vec::new(),
+            uncommitted: false,
         }
     }
 
@@ -545,6 +557,7 @@ impl Shared {
             first,
             identity,
             started: Vec::new(),
+            uncommitted: false,
         })
     }
 
@@ -572,12 +585,21 @@ impl Shared {
 pub(super) const WINDOW_DEPTH: usize = 64;
 
 /// A run of blocks of a [`Shared`] disk.
+///
+/// A look never waits for the disk while another owner uses it, as that
+/// owner may itself wait long for a lock its device needs (the host
+/// drivers'): [`BlockDevice::finish`] and [`BlockDevice::finished`] answer
+/// nothing yet, [`BlockDevice::room`] no room, [`BlockDevice::posted`] that
+/// a finish may find a result, and a commit is made by the next call that
+/// takes the disk. A start, once room said the disk was free, takes it.
 pub struct Window {
     pub(super) disk: Shared,
     pub(super) first: u64,
     pub(super) identity: Identity,
     /// The tickets of this window's started commands not yet finished.
     pub(super) started: Vec<u32>,
+    /// A commit put off while another owner held the disk.
+    pub(super) uncommitted: bool,
 }
 
 impl Window {
@@ -601,6 +623,8 @@ impl Window {
             return Err(BlockError::Protocol("the disk window queue is full"));
         }
         let ticket = self.disk.lock().submit(command, more);
+        // Without more to follow it told the device of every start.
+        self.uncommitted &= more;
         self.started.push(ticket);
         Ok(ticket)
     }
@@ -675,7 +699,7 @@ impl BlockDevice for Window {
     }
 
     fn room(&self) -> bool {
-        self.started.len() < WINDOW_DEPTH
+        self.started.len() < WINDOW_DEPTH && !self.disk.held()
     }
 
     fn start(&mut self, command: Command) -> Result<u32, BlockError> {
@@ -687,11 +711,19 @@ impl BlockDevice for Window {
     }
 
     fn commit(&mut self) {
-        self.disk.lock().commit();
+        match self.disk.try_lock() {
+            Some(mut disk) => disk.commit(),
+            None => self.uncommitted = true,
+        }
     }
 
+    /// Takes the disk's completions and commits what waits.
     fn finish(&mut self, tag: u32) -> Option<Finished> {
-        let finished = self.disk.lock().take(tag)?;
+        let finished = {
+            let mut disk = self.disk.try_lock()?;
+            self.uncommitted = false;
+            disk.take(tag)
+        }?;
         self.started.retain(|&ticket| ticket != tag);
         Some(finished)
     }
@@ -702,7 +734,7 @@ impl BlockDevice for Window {
     }
 
     fn finished(&mut self, tag: u32) -> Option<Finished> {
-        let finished = self.disk.lock().requests().finished.remove(&tag)?;
+        let finished = self.disk.try_lock()?.requests().finished.remove(&tag)?;
         self.started.retain(|&ticket| ticket != tag);
         Some(finished)
     }
@@ -710,7 +742,9 @@ impl BlockDevice for Window {
     /// One of this window's commands has a result, or the disk has posted
     /// a completion: another window's results never count.
     fn posted(&self) -> bool {
-        let mut disk = self.disk.lock();
+        let Some(mut disk) = self.disk.try_lock() else {
+            return true;
+        };
         let finished = &disk.requests().finished;
         self.started
             .iter()
