@@ -67,10 +67,40 @@ index aab5a73f467a1cc4a28ef1ef6000c929d1e0b43d..6e4f97c092267f830d43fb966bf7308c
  }
  
 diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
-index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..4335aced843d5d1f480ca0281edd8462c3eb6de9 100644
+index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..3956feb95fdb7dff2a3358ff3ec2c6d5dc5b4b4b 100644
 --- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
 +++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
-@@ -191,6 +191,8 @@
+@@ -85,6 +85,7 @@
+ 	u32 loc, sig, cnt;
+ 	int ret;
+ 
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: %s starting (size %zu)\n", name, blob ? blob->size : 0);
+ 	hdr = nvfw_bin_hdr(subdev, blob->data);
+ 	hshdr = nvfw_hs_header_v2(subdev, blob->data + hdr->header_offset);
+ 	loc = *(u32 *)(blob->data + hshdr->patch_loc);
+@@ -93,11 +94,13 @@
+ 
+ 	ret = nvkm_falcon_fw_ctor(func, name, subdev->device, true,
+ 				  blob->data + hdr->data_offset, hdr->data_size, falcon, fw);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: %s falcon_fw_ctor ret=%d\n", name, ret);
+ 	if (ret)
+ 		goto done;
+ 
+ 	ret = nvkm_falcon_fw_sign(fw, loc, hshdr->sig_prod_size / cnt, blob->data,
+ 				  cnt, hshdr->sig_prod_offset + sig, 0, 0);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: %s falcon_fw_sign ret=%d\n", name, ret);
+ 	if (ret)
+ 		goto done;
+ 
+@@ -114,6 +117,7 @@
+ 	fw->dmem_size = lhdr->os_data_size;
+ 	fw->dmem_sign = loc - fw->dmem_base_img;
+ 	fw->boot_addr = lhdr->os_code_offset;
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: %s complete (boot_addr=%x)\n", name, fw->boot_addr);
+ 
+ done:
+ 	if (ret)
+@@ -191,6 +195,8 @@
  	u32 mbox0, mbox1;
  	int ret;
  
@@ -79,7 +109,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..4335aced843d5d1f480ca0281edd8462
  	if (!gsp->sr.meta.data) {
  		mbox0 = lower_32_bits(gsp->wpr_meta.addr);
  		mbox1 = upper_32_bits(gsp->wpr_meta.addr);
-@@ -202,11 +204,16 @@
+@@ -202,11 +208,16 @@
  	}
  
  	/* Execute booter to handle (eventually...) booting GSP-RM. */
@@ -97,7 +127,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..4335aced843d5d1f480ca0281edd8462
  }
  
  static int
-@@ -275,20 +282,9 @@
+@@ -275,20 +286,9 @@
  static u64
  tu102_gsp_vga_workspace_addr(struct nvkm_gsp *gsp, u64 fb_size)
  {
@@ -120,7 +150,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..4335aced843d5d1f480ca0281edd8462
  }
  
  /*
-@@ -333,19 +329,17 @@
+@@ -333,19 +333,17 @@
  	struct nvkm_device *device = gsp->subdev.device;
  	int ret;
  
@@ -145,7 +175,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..4335aced843d5d1f480ca0281edd8462
  	if (device->chipset == 0x170) {
  		u64 lock_lo = ga100_gsp_mmu_lock_lo(gsp);
  
-@@ -353,17 +347,23 @@
+@@ -353,17 +351,23 @@
  			gsp->fb.bios.addr = min(gsp->fb.bios.addr, lock_lo);
  	}
  
@@ -175,7 +205,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..4335aced843d5d1f480ca0281edd8462
  	if (ret)
  		return ret;
  
-@@ -393,24 +393,33 @@
+@@ -393,24 +397,33 @@
  	gsp->fb.heap.size = 0x100000;
  	gsp->fb.heap.addr = gsp->fb.wpr2.addr - gsp->fb.heap.size;
  

@@ -137,6 +137,34 @@ static void free_coherent(struct device *dev, size_t size, void *cpu, dma_addr_t
 	__free_pages(virt_to_page(cpu), (unsigned int)get_order(size));
 }
 
+static struct page *alloc_pages_op(struct device *dev, size_t size, dma_addr_t *dma_handle,
+				   enum dma_data_direction dir, gfp_t gfp)
+{
+	unsigned int order = (unsigned int)get_order(size);
+	dev_info(dev, "alloc_pages_op: size=%zu order=%u dir=%d\n", size, order, (int)dir);
+	struct page *page = alloc_pages(gfp | __GFP_ZERO, order);
+
+	if (!page) {
+		dev_warn(dev, "alloc_pages_op: failed to allocate %zu bytes (order %u)\n", size, order);
+		return NULL;
+	}
+	*dma_handle = map_phys(dev, page_to_phys(page), size, dir, 0);
+	if (*dma_handle == DMA_MAPPING_ERROR) {
+		dev_warn(dev, "alloc_pages_op: map_phys failed for %zu bytes\n", size);
+		__free_pages(page, order);
+		return NULL;
+	}
+	dev_info(dev, "alloc_pages_op: success, phys=0x%llx\n", (unsigned long long)*dma_handle);
+	return page;
+}
+
+static void free_pages_op(struct device *dev, size_t size, struct page *page,
+			  dma_addr_t dma_handle, enum dma_data_direction dir)
+{
+	unmap_phys(dev, dma_handle, size, dir, 0);
+	__free_pages(page, (unsigned int)get_order(size));
+}
+
 /* The device reaches whatever its owner hands it: its addresses, not physical
  * memory, are what a mask must cover. */
 static int mask_supported(struct device *dev, u64 mask)
@@ -151,6 +179,8 @@ static const struct dma_map_ops mapping_ops = {
 	.unmap_sg = unmap_scatter,
 	.alloc = alloc_coherent,
 	.free = free_coherent,
+	.alloc_pages_op = alloc_pages_op,
+	.free_pages = free_pages_op,
 	.dma_supported = mask_supported,
 };
 
