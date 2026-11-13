@@ -19,6 +19,12 @@
 //! [`Display::flush`] on the boot processor. A flip the engine has not
 //! finished answers `EBUSY` and stays queued for the next flush; a newer
 //! frame meanwhile replaces the queued one in the same hidden buffer.
+//!
+//! Hot-plug: a connector's state as the driver last detected it, which its
+//! hot-plug interrupt keeps current, is read with no probe ([`detected`]).
+//! An output that returns after it was seen disconnected gets its mode set
+//! again ([`Display::watch`]), as Linux's fbdev helper does on a hot-plug
+//! event.
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ops::Range;
@@ -241,6 +247,22 @@ pub struct Display<D> {
     queued: bool,
     /// The row a producer fills before it is copied to video memory.
     row: Vec<u8>,
+    /// The connector and mode the controller runs.
+    connector: u32,
+    mode: ModeInfo,
+    /// The connector was last read disconnected ([`Self::watch`]).
+    lost: bool,
+}
+
+/// What [`Display::watch`] read of the output's connector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Watched {
+    /// As at the last read.
+    Unchanged,
+    /// Disconnected since the last read.
+    Lost,
+    /// Connected again, and its mode set again.
+    Restored,
 }
 
 // SAFETY: the buffers' mappings go with the display, which one PE uses at a
@@ -379,6 +401,35 @@ pub fn survey<D: Drm>(drm: &mut D) -> Result<Vec<Seen>, Error> {
             })
         })
         .collect()
+}
+
+/// Whether connector `id` has a display as the driver last detected it.
+/// Linux probes a connector only for a request that lists no modes
+/// (`drm_mode_getconnector`), so this one has room for one mode, which
+/// Linux fills only when it is the whole list.
+fn detected_on<D: Drm>(drm: &mut D, id: u32) -> Result<bool, Error> {
+    let mut mode = ModeInfo::default();
+    let mut connector = Connector {
+        id,
+        modes: ptr::from_mut(&mut mode) as u64,
+        mode_count: 1,
+        ..Connector::default()
+    };
+    call(drm, GET_CONNECTOR, &mut connector)?;
+    Ok(connector.connection == CONNECTED)
+}
+
+/// Whether any connector of `drm` has a display as its driver last
+/// detected it, with no probe: cheap enough to ask often, and current where
+/// hot-plug interrupts arrive.
+pub fn detected<D: Drm>(drm: &mut D) -> Result<bool, Error> {
+    let (_, connectors) = resources(drm)?;
+    for id in connectors {
+        if detected_on(drm, id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn output<D: Drm>(drm: &mut D, id: u32) -> Result<Output, Error> {
@@ -547,18 +598,7 @@ impl<D: Drm> Display<D> {
         let front = buffer(&mut drm, width, height)?;
         let back = buffer(&mut drm, width, height)?;
         let spare = buffer(&mut drm, width, height)?;
-        let mut connectors = connector;
-        let mut set = Crtc {
-            connectors: ptr::from_mut(&mut connectors) as u64,
-            connector_count: 1,
-            id: crtc,
-            framebuffer: front.framebuffer,
-            mode_valid: 1,
-            mode,
-            ..Crtc::default()
-        };
-        call(&mut drm, SET_CRTC, &mut set)?;
-        Ok(Self {
+        let mut display = Self {
             drm,
             crtc,
             width,
@@ -570,7 +610,58 @@ impl<D: Drm> Display<D> {
             stale: [0..height as usize, 0..height as usize, 0..height as usize],
             queued: false,
             row: Vec::new(),
-        })
+            connector,
+            mode,
+            lost: false,
+        };
+        display.set_mode()?;
+        Ok(display)
+    }
+
+    /// Run the controller in the mode on the connector, showing the buffer
+    /// on screen.
+    fn set_mode(&mut self) -> Result<(), Error> {
+        let mut connectors = self.connector;
+        let mut set = Crtc {
+            connectors: ptr::from_mut(&mut connectors) as u64,
+            connector_count: 1,
+            id: self.crtc,
+            framebuffer: self.buffers[0].framebuffer,
+            mode_valid: 1,
+            mode: self.mode,
+            ..Crtc::default()
+        };
+        call(&mut self.drm, SET_CRTC, &mut set)
+    }
+
+    /// Read the output's connector as the driver last detected it, with no
+    /// probe, where a request completes now. Once it is connected again
+    /// after a read found it disconnected, the controller is turned off and
+    /// set again on the buffer on screen: a full mode set, which trains a
+    /// DisplayPort link anew, where an unchanged one would change nothing.
+    /// A refused mode set leaves it lost, to be tried at the next read.
+    pub fn watch(&mut self) -> Result<Watched, Error> {
+        if !self.drm.immediate() {
+            return Ok(Watched::Unchanged);
+        }
+        let connected = detected_on(&mut self.drm, self.connector)?;
+        match (connected, self.lost) {
+            (false, false) => {
+                self.lost = true;
+                Ok(Watched::Lost)
+            }
+            (true, true) => {
+                let mut off = Crtc {
+                    id: self.crtc,
+                    ..Crtc::default()
+                };
+                call(&mut self.drm, SET_CRTC, &mut off)?;
+                self.set_mode()?;
+                self.lost = false;
+                Ok(Watched::Restored)
+            }
+            _ => Ok(Watched::Unchanged),
+        }
     }
 
     /// Pixels across and down.

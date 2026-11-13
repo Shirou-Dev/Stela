@@ -51,6 +51,12 @@ struct Card {
     invalid_buffer: Option<(u32, u64)>,
     resource_changes: usize,
     mode_changes: usize,
+    /// Whether the second connector has a display.
+    connected: bool,
+    /// Connector requests that probed: those that list no modes.
+    probes: u32,
+    /// Controller mode sets, the ones that turned it off included.
+    mode_sets: u32,
 }
 
 impl Card {
@@ -70,6 +76,9 @@ impl Card {
             invalid_buffer: None,
             resource_changes: 0,
             mode_changes: 0,
+            connected: true,
+            probes: 0,
+            mode_sets: 0,
         }
     }
 
@@ -105,9 +114,10 @@ unsafe impl Drm for &mut Card {
                 }
                 GET_CONNECTOR => {
                     let connector = &mut *argument.cast::<Connector>();
-                    let connected = connector.id == 51;
+                    let connected = connector.id == 51 && self.connected;
                     connector.connection = if connected { CONNECTED } else { 2 };
                     let modes: &[ModeInfo] = if connected { &self.modes } else { &[] };
+                    self.probes += u32::from(connector.mode_count == 0);
                     // Linux fills a list only when all of it fits.
                     if connector.mode_count as usize >= modes.len() && connector.mode_count != 0 {
                         let list = connector.modes as *mut ModeInfo;
@@ -116,9 +126,6 @@ unsafe impl Drm for &mut Card {
                     if connector.encoder_count != 0 {
                         (connector.encoders as *mut u32).write(60);
                     }
-                    assert!(
-                        connector.mode_count == 0 || connector.mode_count == modes.len() as u32
-                    );
                     connector.mode_count = modes.len() as u32;
                     connector.encoder_count = 1;
                     if connected && connector.modes != 0 && self.mode_changes != 0 {
@@ -155,8 +162,11 @@ unsafe impl Drm for &mut Card {
                 SET_CRTC => {
                     let crtc = &*argument.cast::<Crtc>();
                     assert_eq!(crtc.id, 41);
-                    assert_eq!((crtc.connectors as *const u32).read(), 51);
-                    self.set = Some((crtc.mode, crtc.framebuffer));
+                    self.mode_sets += 1;
+                    self.set = (crtc.connector_count != 0).then(|| {
+                        assert_eq!((crtc.connectors as *const u32).read(), 51);
+                        (crtc.mode, crtc.framebuffer)
+                    });
                 }
                 PAGE_FLIP => {
                     assert!(self.immediate, "a flip requested where it must wait");
@@ -345,4 +355,40 @@ fn each_buffer_is_filled_with_its_own_stale_rows_and_the_damage() {
     assert_eq!(asked[..3], [every.clone(), every.clone(), every]);
     assert_eq!(asked[3], [0, 1, 2]);
     assert_eq!(asked[4], [1, 2]);
+}
+
+#[test]
+fn a_detected_display_is_read_without_a_probe() {
+    let mut card = Card::new(vec![mode(4, 2, PREFERRED), mode(2, 2, 0)]);
+    assert_eq!(detected(&mut &mut card), Ok(true));
+    card.connected = false;
+    assert_eq!(detected(&mut &mut card), Ok(false));
+    assert_eq!(card.probes, 0);
+}
+
+#[test]
+fn an_output_that_returns_gets_a_full_mode_set_on_the_buffer_on_screen() {
+    let modes = vec![mode(2, 2, PREFERRED)];
+    let mut card = Card::new(modes.clone());
+    let front;
+    {
+        let mut display = Display::take(&mut card, (2, 2)).unwrap();
+        front = display.buffers[0].framebuffer;
+        assert_eq!(display.watch(), Ok(Watched::Unchanged));
+        display.drm.connected = false;
+        assert_eq!(display.watch(), Ok(Watched::Lost));
+        assert_eq!(display.watch(), Ok(Watched::Unchanged));
+        // Where a request must wait, nothing is read.
+        display.drm.connected = true;
+        display.drm.immediate = false;
+        assert_eq!(display.watch(), Ok(Watched::Unchanged));
+        display.drm.immediate = true;
+        let probes = display.drm.probes;
+        assert_eq!(display.watch(), Ok(Watched::Restored));
+        assert_eq!(display.drm.probes, probes);
+        assert_eq!(display.watch(), Ok(Watched::Unchanged));
+    }
+    // The first set, then off and on again.
+    assert_eq!(card.mode_sets, 3);
+    assert_eq!(card.set, Some((modes[0], front)));
 }
