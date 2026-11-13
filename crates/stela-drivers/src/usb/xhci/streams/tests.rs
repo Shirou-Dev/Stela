@@ -404,6 +404,7 @@ fn controller(
             slots,
             pending: Vec::new(),
             error: None,
+            settle_from: None,
             command_poisoned: false,
             command_ring_stopped: false,
             unpublished: 0,

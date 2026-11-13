@@ -298,6 +298,7 @@ fn address_controller_with_capabilities(
         power: power::Ledger::new(2),
         pending: Vec::new(),
         error: None,
+        settle_from: None,
         command_poisoned: false,
         command_ring_stopped: false,
         unpublished: 0,

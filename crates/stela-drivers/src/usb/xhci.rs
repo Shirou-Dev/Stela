@@ -476,6 +476,10 @@ pub struct Controller {
     pending: Vec<Event>,
     /// USBSTS once the controller reported a fatal error.
     error: Option<u32>,
+    /// When the root ports were last seen powered after the controller's
+    /// reset: the connect settle time runs from here, so a controller whose
+    /// devices are enumerated later has already spent it.
+    settle_from: Option<u64>,
     /// An unacknowledged command still owns its ring entry. Never wrap/reuse
     /// that entry or mutate command-dependent DMA without a controller reset.
     command_poisoned: bool,
@@ -777,6 +781,7 @@ impl Controller {
             slots,
             pending: Vec::new(),
             error: None,
+            settle_from: None,
             command_poisoned: false,
             command_ring_stopped: false,
             unpublished: 0,
@@ -1214,6 +1219,20 @@ pub fn attach_with_provider(
         .map_err(renesas::Error::transport)
 }
 
+/// [`attach_with_provider`] up to the running controller with its root
+/// ports powered, for a caller that starts other devices while the ports
+/// settle and calls [`Started::finish`] afterwards.
+pub fn begin_with_provider(
+    function: &mut Function,
+    handoff: &Handoff,
+    dma: &mut dyn DmaAllocator,
+    firmware: &dyn crate::firmware::Provider,
+    minimum: Rc<dyn crate::bus::pci::power::Timer>,
+) -> Result<Started, BlockError> {
+    begin_with_firmware_diagnostics(function, handoff, dma, firmware, minimum)
+        .map_err(renesas::Error::transport)
+}
+
 /// Attach with the original exact-target firmware and controller errors. The
 /// compatibility entry point keeps its BlockError signature; callers that
 /// need provider diagnostics can use this additive boundary directly.
@@ -1224,6 +1243,21 @@ pub fn attach_with_firmware_diagnostics(
     firmware: &dyn crate::firmware::Provider,
     minimum: Rc<dyn crate::bus::pci::power::Timer>,
 ) -> Result<Found, renesas::Error> {
+    Ok(
+        begin_with_firmware_diagnostics(function, handoff, dma, firmware, minimum)?
+            .finish(dma, firmware),
+    )
+}
+
+/// [`attach_with_firmware_diagnostics`] up to the running controller with
+/// its root ports powered: [`Started::finish`] enumerates its devices.
+pub fn begin_with_firmware_diagnostics(
+    function: &mut Function,
+    handoff: &Handoff,
+    dma: &mut dyn DmaAllocator,
+    firmware: &dyn crate::firmware::Provider,
+    minimum: Rc<dyn crate::bus::pci::power::Timer>,
+) -> Result<Started, renesas::Error> {
     let minimum = Minimum::retain(minimum);
     minimum.check()?;
     clock_ready(handoff.clock)?;
@@ -1255,23 +1289,29 @@ pub fn attach_with_firmware_diagnostics(
         "xhci {:04x}:{:02x}:{:02x}.{}",
         address.segment, address.bus, address.device, address.function
     );
-    let mut found = start_with_policies(
+    let mut controller = Controller::with_hardware_profile(
         Box::new(registers),
         handoff.clock,
         dma,
         location,
-        firmware,
         hardware::Policy {
             streams: stream_policy,
             dma: dma_profile,
             quirks,
         },
-        signalled,
         || quirks::after_reset(function, handoff.clock),
         minimum,
     )?;
-    found.controller_firmware = controller_firmware;
-    Ok(found)
+    if signalled {
+        controller.signal();
+    }
+    // Powered now, so the ports settle while the caller starts other
+    // devices; an error here is found again, and reported, by `finish`.
+    let _ = controller.power_roots();
+    Ok(Started {
+        controller,
+        controller_firmware,
+    })
 }
 
 /// Starts the controller behind `registers`, enumerates its devices and
@@ -1343,20 +1383,50 @@ fn start_with_policies(
     if signal {
         controller.signal();
     }
-    // The policy came from this same PCI function before BAR access,
-    // and applies only to the controller reset just completed above. No public
-    // raw-register caller can supply a guessed PCI identity or enable streams.
-    let mut found = Found::default();
-    let devices = controller.enumerate_timed(dma, &mut found.failures, &mut found.probes);
-    let shared: Shared = Rc::new(RefCell::new(controller));
-    for device in &devices {
-        bind_with_provider(&shared, device.clone(), dma, &mut found, firmware);
+    Ok(Started {
+        controller,
+        controller_firmware: None,
     }
-    found
-        .hosts
-        .push(Host::new(shared, &devices, dma, &mut found.failures));
-    found.devices = devices;
-    Ok(found)
+    .finish(dma, firmware))
+}
+
+/// A controller that is reset and running with its root ports powered,
+/// whose devices are not enumerated yet. Its ports' connect settle time
+/// runs from its start, so the wait overlaps whatever the caller does
+/// before [`Started::finish`], as Linux's hub threads settle in parallel.
+pub struct Started {
+    controller: Controller,
+    controller_firmware: Option<renesas::Receipt>,
+}
+
+impl Started {
+    /// Enumerate the controller's devices and bind the class drivers.
+    pub fn finish(
+        self,
+        dma: &mut dyn DmaAllocator,
+        firmware: &dyn crate::firmware::Provider,
+    ) -> Found {
+        let Self {
+            mut controller,
+            controller_firmware,
+        } = self;
+        // The policy came from this same PCI function before BAR access,
+        // and applies only to the controller reset just completed. No public
+        // raw-register caller can supply a guessed PCI identity or enable
+        // streams.
+        let mut found = Found::default();
+        let devices = controller.enumerate_timed(dma, &mut found.failures, &mut found.probes);
+        let shared: Shared = Rc::new(RefCell::new(controller));
+        for device in &devices {
+            bind_with_provider(&shared, device.clone(), dma, &mut found, firmware);
+        }
+        found
+            .hosts
+            .push(Host::new(shared, &devices, dma, &mut found.failures));
+        found.devices = devices;
+        found.controller_firmware = controller_firmware;
+        found
+    }
 }
 
 #[cfg(test)]

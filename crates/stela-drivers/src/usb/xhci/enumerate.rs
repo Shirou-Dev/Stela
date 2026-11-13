@@ -36,6 +36,12 @@ fn debounce_with_delay(
     }
 }
 
+/// What is left of [`CONNECT_SETTLE_US`] once the ports have been powered
+/// for `waited_us`.
+fn settle_left(waited_us: u64) -> u64 {
+    CONNECT_SETTLE_US.saturating_sub(waited_us)
+}
+
 /// Linux `hub_port_debounce` for several ports at once, as its hub threads
 /// debounce in parallel: every unsettled port is sampled at each step, so the
 /// whole set settles in one window. A port with no connection and no connect
@@ -394,9 +400,10 @@ impl Controller {
         devices
     }
 
-    /// Power every unpowered root port and wait once for them all, then
-    /// debounce every port together.
-    fn debounce_roots(&mut self) -> Result<Vec<Debounced>, BlockError> {
+    /// Power every unpowered root port and wait once for them all. The
+    /// connect settle time runs from the first call that finds them all
+    /// powered, or from a later one that had to power one again.
+    pub(super) fn power_roots(&mut self) -> Result<(), BlockError> {
         self.check_minimum()?;
         let mut powered = false;
         for port in 1..=self.max_ports {
@@ -409,11 +416,26 @@ impl Controller {
         if powered {
             self.minimum_wait(PORT_POWER_US)?;
         }
+        if powered || self.settle_from.is_none() {
+            self.settle_from = Some(self.clock.now_us());
+        }
+        Ok(())
+    }
+
+    /// Power the root ports ([`Self::power_roots`]), then debounce every
+    /// port together. What is left of the connect settle time since the
+    /// ports were powered is waited here, once for them all.
+    fn debounce_roots(&mut self) -> Result<Vec<Debounced>, BlockError> {
+        self.power_roots()?;
+        let waited = self
+            .clock
+            .now_us()
+            .saturating_sub(self.settle_from.unwrap_or(u64::MAX));
         let minimum = self.minimum.clone();
         minimum.check()?;
         let settled = debounce_ports_with_delay(
             usize::from(self.max_ports),
-            CONNECT_SETTLE_US,
+            settle_left(waited),
             |index| Ok(self.sample_root(index as u8 + 1)),
             || minimum.wait_us(DEBOUNCE_STEP_US),
         );

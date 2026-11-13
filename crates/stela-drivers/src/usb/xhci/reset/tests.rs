@@ -941,6 +941,7 @@ fn fixture_profile_peer(
         power: power::Ledger::new(max_slots + 1),
         pending: Vec::new(),
         error: None,
+        settle_from: None,
         command_poisoned: false,
         command_ring_stopped: false,
         unpublished: 0,

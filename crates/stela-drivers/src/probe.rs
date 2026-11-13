@@ -1566,6 +1566,9 @@ pub unsafe fn probe_observed(
                 + usb4_hosts.len()
         }};
     }
+    // xHCI controllers started in the scan, whose devices are enumerated
+    // after it.
+    let mut xhci_started = Vec::new();
     let mut claimed = Claimed::default();
     // A driver that enables a function needs every bridge above it to
     // forward the function's DMA and message interrupts upstream: Linux's
@@ -1789,46 +1792,49 @@ pub unsafe fn probe_observed(
                 })
             } else if function.class == xhci::CLASS {
                 let minimum = minimum_for_function!().clone();
-                let mut attached = xhci::attach_with_provider(
+                // Every controller but the boot's own is started here and
+                // its devices are enumerated after the scan: its ports
+                // settle while the other devices start, as Linux's hub
+                // threads settle beside its other drivers.
+                if observer.first() != Some(address) {
+                    match xhci::begin_with_provider(
+                        &mut function,
+                        handoff,
+                        dma,
+                        firmware,
+                        minimum.clone(),
+                    ) {
+                        Ok(started) => {
+                            claimed.started();
+                            drop(start);
+                            xhci_started.push((function, minimum, started));
+                        }
+                        Err(error) => {
+                            start.quiesce(&mut function);
+                            devices.failures.push((address, error.into()));
+                        }
+                    }
+                    continue;
+                }
+                let attached = xhci::attach_with_provider(
                     &mut function,
                     handoff,
                     dma,
                     firmware,
                     minimum.clone(),
                 );
-                // A controller that stopped answering while its devices
-                // started has lost every device below it, the boot stick
-                // and the keyboard among them. Its reset starts it again,
-                // so it is attached once more. The first attachment's
-                // owners are kept, never dropped: their rings stay
-                // allocated and they touch no register again.
-                if let Ok(found) = &attached
-                    && found.controller_died()
-                {
-                    devices
-                        .warnings
-                        .push((address, Warning::Message(XHCI_RESTARTED)));
-                    if let Ok(found) = core::mem::replace(
-                        &mut attached,
-                        Err(BlockError::Unsupported("xHCI host controller died")),
-                    ) {
-                        core::mem::forget(found);
-                    }
-                    attached = xhci::attach_with_provider(
-                        &mut function,
+                absorb_xhci(
+                    attached,
+                    &mut function,
+                    &XhciInputs {
                         handoff,
-                        dma,
                         firmware,
-                        minimum.clone(),
-                    );
-                }
-                match attached {
-                    Ok(found) => devices.absorb_usb(Some(address), found, firmware),
-                    Err(error) => {
-                        start.quiesce(&mut function);
-                        devices.failures.push((address, error.into()));
-                    }
-                }
+                        minimum: &minimum,
+                    },
+                    dma,
+                    &start,
+                    &mut devices,
+                );
                 continue;
             } else if net::virtio::matches(&function) {
                 let minimum = minimum_for_function!().clone();
@@ -2066,6 +2072,29 @@ pub unsafe fn probe_observed(
     if first_pending {
         observer.first_started(&mut devices);
     }
+    for (mut function, minimum, started) in xhci_started {
+        let address = function.address;
+        crate::working(&alloc::format!("PCI {address}"));
+        // Named again, so a start that never ends is this controller's.
+        if let Start::Skip(why) = observer.starting(&function.identity()) {
+            devices.unsupported.push((address, function.class, why));
+            core::mem::forget(started);
+            continue;
+        }
+        let start = DeviceStart::begin(address, handoff.clock, &mut abandoned);
+        absorb_xhci(
+            Ok(started.finish(dma, firmware)),
+            &mut function,
+            &XhciInputs {
+                handoff,
+                firmware,
+                minimum: &minimum,
+            },
+            dma,
+            &start,
+            &mut devices,
+        );
+    }
     devices.abandoned = abandoned;
     let companions_released = pci_scan_complete
         && !usb_handoff_failures
@@ -2092,6 +2121,56 @@ pub unsafe fn probe_observed(
     #[cfg(feature = "native-acpi")]
     attach_platform(services, smbus_functions, &bridges, handoff, &mut devices);
     devices
+}
+
+/// What an xHCI controller's attachment needs again when it is retried.
+struct XhciInputs<'a> {
+    handoff: &'a Handoff,
+    firmware: &'static dyn crate::firmware::Provider,
+    minimum: &'a Rc<dyn crate::bus::pci::power::Timer>,
+}
+
+/// Record an xHCI controller's attachment. A controller that stopped
+/// answering while its devices started has lost every device below it, the
+/// boot stick and the keyboard among them. Its reset starts it again, so
+/// it is attached once more. The first attachment's owners are kept, never
+/// dropped: their rings stay allocated and they touch no register again.
+fn absorb_xhci(
+    mut attached: Result<xhci::Found, BlockError>,
+    function: &mut Function,
+    inputs: &XhciInputs<'_>,
+    dma: &mut dyn DmaAllocator,
+    start: &DeviceStart<'_>,
+    devices: &mut Devices,
+) {
+    let address = function.address;
+    if let Ok(found) = &attached
+        && found.controller_died()
+    {
+        devices
+            .warnings
+            .push((address, Warning::Message(XHCI_RESTARTED)));
+        if let Ok(found) = core::mem::replace(
+            &mut attached,
+            Err(BlockError::Unsupported("xHCI host controller died")),
+        ) {
+            core::mem::forget(found);
+        }
+        attached = xhci::attach_with_provider(
+            function,
+            inputs.handoff,
+            dma,
+            inputs.firmware,
+            inputs.minimum.clone(),
+        );
+    }
+    match attached {
+        Ok(found) => devices.absorb_usb(Some(address), found, inputs.firmware),
+        Err(error) => {
+            start.quiesce(function);
+            devices.failures.push((address, error.into()));
+        }
+    }
 }
 
 /// What the USB hosts' firmware handoffs in one scan share.

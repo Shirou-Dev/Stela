@@ -485,3 +485,29 @@ fn an_untrainable_usb3_link_is_an_empty_port_and_a_usb2_port_ignores_cold_attach
     assert!(failures.is_empty() && !probes[0].connected);
     assert_eq!(model.borrow().root_status, Some(PP | CAS));
 }
+
+/// A controller whose devices are enumerated after other devices started
+/// has spent its connect settle time already: what is left is waited, and
+/// nothing once the time has passed.
+#[test]
+fn the_settle_time_left_falls_with_the_time_the_ports_were_powered() {
+    assert_eq!(settle_left(0), CONNECT_SETTLE_US);
+    assert_eq!(settle_left(200_000), CONNECT_SETTLE_US - 200_000);
+    assert_eq!(settle_left(CONNECT_SETTLE_US), 0);
+    assert_eq!(settle_left(u64::MAX), 0);
+    // With none left an empty port is empty at its first sample, and a
+    // connected one still debounces for its 100 ms.
+    let mut delays = 0;
+    let settled = debounce_ports_with_delay(
+        2,
+        settle_left(CONNECT_SETTLE_US),
+        |port| Ok((port == 1, false)),
+        || {
+            delays += 1;
+            Ok(())
+        },
+    );
+    assert_eq!(settled[0], Ok((false, 0)));
+    assert_eq!(settled[1], Ok((true, DEBOUNCE_STABLE_US)));
+    assert_eq!(delays, DEBOUNCE_STABLE_US / DEBOUNCE_STEP_US);
+}
