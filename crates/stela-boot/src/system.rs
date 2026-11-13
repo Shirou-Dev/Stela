@@ -24,6 +24,7 @@ use stela_boot_core::options::{DEFAULT_WIFI_KEY, System};
 use stela_contracts::refuse;
 use stela_engine::machine::mmu::placement::Placement;
 use stela_runtime::pc;
+use stela_runtime::pc::disk_plan::Plan;
 use stela_runtime::pc::gpt::Guid;
 use uefi::{
     boot::{self, AllocateType, MemoryType},
@@ -583,10 +584,13 @@ pub fn held_at_start(options: &[u8]) -> Option<&'static str> {
 }
 
 /// Run the engine; never returns.
-/// `log` is the partition holding the USB's boot log, when the loader keeps
-/// one there (`log_file`).
+/// `plan` is the change the disk picker planned for the disk `options`
+/// name, which the engine's drivers make (`pc::disk_plan`). `log` is the
+/// partition holding the USB's boot log, when the loader keeps one there
+/// (`log_file`).
 pub(crate) fn boot(
     mut options: Vec<u8>,
+    mut plan: Option<Plan>,
     mut volume: FileSystem,
     log: Option<Guid>,
     host_firmware: crate::host_firmware::Resources,
@@ -597,7 +601,7 @@ pub(crate) fn boot(
     // waits for a restore host, until one that boots is chosen.
     let options = loop {
         crate::status::begin("Reading the startup request in NVRAM");
-        let routed = crate::selection::route(options);
+        let routed = crate::selection::route(options, plan.as_ref());
         crate::status::done("");
         match routed {
             Ok(routed) => break routed,
@@ -606,12 +610,15 @@ pub(crate) fn boot(
                 if let Refusal::Stale(stale) = &refusal {
                     log_stale(*stale);
                 }
-                options = crate::choice::hold(&mut volume, held(refusal)).unwrap_or_else(|| {
-                    output::fatal(
-                        "the machine can only be restored and this volume has no startup \
-                         choices to restore it from",
-                    )
-                });
+                // The new choice replaces the options and their plan: a
+                // plan dropped here wrote nothing.
+                crate::choice::Chosen { options, plan } =
+                    crate::choice::hold(&mut volume, held(refusal)).unwrap_or_else(|| {
+                        output::fatal(
+                            "the machine can only be restored and this volume has no startup \
+                             choices to restore it from",
+                        )
+                    });
                 if !options.starts_with(b"--system") {
                     output::fatal("the chosen startup option is not a system-mode boot");
                 }
@@ -625,6 +632,7 @@ pub(crate) fn boot(
     let result = inputs.and_then(|inputs| {
         load(
             options,
+            plan,
             inputs,
             log,
             host_firmware,
@@ -698,6 +706,7 @@ fn translation_store(
 
 fn load(
     options: Vec<u8>,
+    plan: Option<Plan>,
     inputs: Inputs,
     log: Option<Guid>,
     host_firmware: crate::host_firmware::Resources,
@@ -712,6 +721,20 @@ fn load(
     } = inputs;
     let text = core::str::from_utf8(&options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let system = System::parse(text).map_err(stela_boot_core::options::Error::message)?;
+    // The engine's drivers apply the plan to the `--storage` partition's
+    // disk and no other.
+    if let Some(plan) = &plan
+        && !system
+            .storage
+            .as_ref()
+            .is_some_and(|target| plan.is_for(target))
+    {
+        return Err(refuse!(
+            "the disk chosen for macOS is not this boot's --storage, so it cannot be prepared; \
+             nothing was written to it"
+        ));
+    }
+    let disk_plan = plan.map(|plan| plan.encode()).unwrap_or_default();
     let (native_processors, available_cores) = crate::native_smp::firmware::capture_inventory()
         .map_err(crate::native_smp::firmware::Error::message)?;
     let cores = system.assigned_native_cores(available_cores, bundle_pes)?;
@@ -790,7 +813,8 @@ fn load(
         source: source_region,
         files,
         file_count,
-    } = handoff_phase::retain_files(options, source, bundle)?;
+        disk_plan,
+    } = handoff_phase::retain_files(options, source, bundle, disk_plan)?;
     let handoff = handoff_page.physical as *mut Handoff;
     let engine_entry =
         layout::image() + (crate::engine::entry as *const () as u64 - image.start as u64);
@@ -930,6 +954,7 @@ fn load(
         handoff.write(Handoff {
             magic: MAGIC,
             options: options_region,
+            disk_plan,
             random_seed,
             source: source_region,
             files,

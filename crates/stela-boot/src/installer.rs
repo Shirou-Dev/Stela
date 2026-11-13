@@ -5,12 +5,16 @@
 //! take free space or a Stela partition already there, a partition can be
 //! deleted, the whole disk erased, and the new partition's size set.
 //!
-//! Nothing is written until the last page confirms it. Then the disk's GPT
-//! gains the partition (the Stela Apple region type, `payload::gpt`), which
-//! holds the Mac's internal SSD and, in its tail, the machine state
-//! (`pc::machine_state`); its first MiB and that tail are zeroed, so the
-//! restore and the NOR start blank. The caller records the choice
-//! (`mount_interface::DISK_FILE`).
+//! The picker writes nothing to any disk: it reads the disks through the
+//! firmware and, when the last page confirms a choice, makes a plan of the
+//! change (`pc::disk_plan`). Stela's own drivers make that change after the
+//! firmware has exited, before the engine looks the partition up: the
+//! disk's GPT gains the partition (the Stela Apple region type,
+//! `payload::gpt`), which holds the Mac's internal SSD and, in its tail,
+//! the machine state (`pc::machine_state`); its first MiB and that tail are
+//! zeroed, so the restore and the NOR start blank. The caller records the
+//! choice (`mount_interface::DISK_FILE`) and hands the plan on. A boot
+//! that stops before the plan is applied leaves the disk as it was.
 //!
 //! Disks are listed as the engine finds them after boot (`pc::storage`): by
 //! serial number, so one without a serial cannot be chosen, and the USB
@@ -39,7 +43,8 @@ use uefi::{
 use {
     stela_formats::payload::gpt, stela_formats::payload::gpt::Found,
     stela_formats::payload::gpt::Guid, stela_formats::payload::gpt::Role,
-    stela_formats::payload::gpt::Table, stela_runtime::pc::machine_state,
+    stela_formats::payload::gpt::Table, stela_runtime::pc::disk_plan,
+    stela_runtime::pc::disk_plan::Plan, stela_runtime::pc::machine_state,
     stela_runtime::pc::storage::Target,
 };
 
@@ -53,8 +58,6 @@ const MIN_BYTES: u64 = gpt::DEFAULT_MIN_APPLE_BYTES + machine_state::MINIMUM_BYT
 const _: () = assert!(gpt::DEFAULT_MIN_APPLE_BYTES == 60 * GB);
 /// The new partition's GPT name.
 const NAME: &str = "Stela macOS";
-/// The most bytes one firmware write takes.
-const WRITE_BYTES: u64 = MIB;
 
 /// One disk of this PC.
 struct Disk {
@@ -97,25 +100,27 @@ impl Disk {
         Ok(buffer.bytes().to_vec())
     }
 
-    fn write(&mut self, lba: u64, bytes: &[u8]) -> Result<()> {
-        let mut buffer = Aligned::new(bytes.len());
-        buffer.bytes().copy_from_slice(bytes);
-        self.io
-            .write_blocks(self.media, lba, buffer.bytes())
-            .map_err(|_| refuse!("the disk refused a write"))
+    /// The digest of the disk's first blocks as they are now, which the
+    /// plan's disk is told by (`disk_plan::seen`).
+    fn seen(&mut self) -> Result<[u8; 32]> {
+        Ok(disk_plan::seen(&self.read(0, disk_plan::SEEN_BLOCKS)?))
     }
 
-    /// Zero `bytes` from block `lba`.
-    fn zero(&mut self, lba: u64, bytes: u64) -> Result<()> {
-        let block = self.geometry.block_bytes;
-        let zeros = vec![0u8; WRITE_BYTES as usize];
-        let mut done = 0;
-        while done < bytes {
-            let span = (bytes - done).min(WRITE_BYTES);
-            self.write(lba + done / block, &zeros[..span as usize])?;
-            done += span;
+    /// GUIDs for a new partition or table on this disk.
+    fn entropy(&self) -> impl FnMut() -> Guid + use<> {
+        let serial = self.serial.clone().unwrap_or_default();
+        let mut seed = 0u64;
+        move || {
+            seed += 1;
+            // SAFETY: RDTSC only reads the time-stamp counter.
+            let time = unsafe { core::arch::x86_64::_rdtsc() };
+            let digest = Sha256::new()
+                .chain_update(serial.as_bytes())
+                .chain_update(time.to_le_bytes())
+                .chain_update(seed.to_le_bytes())
+                .finalize();
+            Guid::from_entropy(digest[..16].try_into().expect("16 bytes"))
         }
-        Ok(())
     }
 }
 
@@ -158,7 +163,8 @@ enum Page {
 enum Step {
     Stay,
     Leave,
-    Write,
+    /// The last page confirmed the choice.
+    Confirm,
 }
 
 struct Picker {
@@ -178,10 +184,10 @@ struct Picker {
     notice: Option<Refusal>,
 }
 
-/// Choose the partition macOS is installed on, creating it if need be; its
-/// `SERIAL:GUID`. `None` when the user leaves, or without a framebuffer or
-/// keyboard to choose with.
-pub fn choose() -> Option<String> {
+/// Choose the partition macOS is installed on; the plan that makes it, new
+/// if need be, and blank. `None` when the user leaves, or without a
+/// framebuffer or keyboard to choose with.
+pub fn choose() -> Option<Plan> {
     let Some((screen, font)) = Framebuffer::from_firmware().zip(font::console()) else {
         output::arguments(format_args!(
             "INSTALLER refused: no framebuffer to draw on\n"
@@ -224,10 +230,10 @@ pub fn choose() -> Option<String> {
         match picker.press(press) {
             Step::Stay => {}
             Step::Leave => return None,
-            Step::Write => match picker.write() {
-                Ok(target) => return Some(target),
+            Step::Confirm => match picker.plan() {
+                Ok(plan) => return Some(plan),
                 Err(error) => {
-                    output::arguments(format_args!("INSTALLER write refused: {error}\n"));
+                    output::arguments(format_args!("INSTALLER plan refused: {error}\n"));
                     picker.notice = Some(error);
                 }
             },
@@ -403,7 +409,7 @@ impl Picker {
         match press {
             Press::Escape => self.page = back,
             Press::Left | Press::Right | Press::Character('\t') => self.install = !self.install,
-            Press::Enter if self.install => return Step::Write,
+            Press::Enter if self.install => return Step::Confirm,
             Press::Enter => self.page = back,
             _ => {}
         }
@@ -418,145 +424,96 @@ impl Picker {
         }
     }
 
-    /// Write the confirmed change; the partition's `SERIAL:GUID`.
-    fn write(&mut self) -> Result<String> {
-        let place = self.place.ok_or(refuse!("nothing was chosen"))?;
-        let deleting = self.deleting();
-        let size = self.size;
-        let erased = self.erased;
-        let disk = &mut self.disks[self.disk];
-        let serial = disk
-            .serial
-            .clone()
-            .ok_or(refuse!("the disk reports no serial number"))?;
-        let block = disk.geometry.block_bytes;
-        let mut seed = 0u64;
-        let mut entropy = || {
-            seed += 1;
-            // SAFETY: RDTSC only reads the time-stamp counter.
-            let time = unsafe { core::arch::x86_64::_rdtsc() };
-            let digest = Sha256::new()
-                .chain_update(serial.as_bytes())
-                .chain_update(time.to_le_bytes())
-                .chain_update(seed.to_le_bytes())
-                .finalize();
-            Guid::from_entropy(digest[..16].try_into().expect("16 bytes"))
-        };
-        let mut table = match &disk.table {
-            Some(table) => table.clone(),
-            None => Table {
-                disk_guid: entropy(),
-                partitions: Vec::new(),
+    /// The plan of the confirmed change. Nothing is written here.
+    fn plan(&mut self) -> Result<Plan> {
+        let place = match self.place.ok_or(refuse!("nothing was chosen"))? {
+            Place::Reuse(n) => disk_plan::Place::Reuse(n),
+            Place::Free { first, .. } => disk_plan::Place::Free {
+                first_lba: first,
+                bytes: self.size,
             },
         };
-        let (guid, first, blocks) = match place {
-            Place::Reuse(n) => {
-                let partition = &table.partitions[n];
-                (
-                    partition.unique_guid,
-                    partition.first_lba,
-                    partition.blocks(),
-                )
-            }
-            Place::Free { first, .. } => (entropy(), first, size / block),
-        };
-        let mut deleting = deleting;
-        deleting.sort_unstable();
-        for n in deleting.iter().rev() {
-            table.partitions.remove(*n);
-        }
-        if erased && disk.table.is_none() {
-            table.partitions.clear();
-        }
-        let changed = matches!(place, Place::Free { .. }) || !deleting.is_empty() || erased;
-        if let Place::Free { .. } = place {
-            if table.partitions.len() >= 128 {
-                return Err(refuse!("the disk's partition table is full"));
-            }
-            table.partitions.push(gpt::Partition {
-                type_guid: Role::AppleRegion.type_guid(),
-                unique_guid: guid,
-                first_lba: first,
-                last_lba: first + blocks - 1,
-                attributes: 0,
-                name: NAME.into(),
-            });
-            table.partitions.sort_by_key(|p| p.first_lba);
-        }
-        let target = format!("{serial}:{guid}");
-        target.parse::<Target>()?;
-        output::arguments(format_args!(
-            "INSTALLER writing {target} first_lba={first} blocks={blocks} deleting={} \
-             table={changed}\n",
-            deleting.len()
-        ));
-        if changed {
-            let writes = gpt::encode(disk.geometry, &table)
-                .map_err(|_| refuse!("the new partition table is invalid"))?;
-            for write in writes {
-                disk.write(write.lba, &write.bytes)?;
-            }
-        }
-        disk.blank(first, blocks)?;
-        Ok(target)
+        let deleted = self.deleted.clone();
+        let erased = self.erased;
+        let disk = &mut self.disks[self.disk];
+        let seen = disk.seen()?;
+        let plan = disk_plan::plan(
+            &disk_plan::Decision {
+                serial: disk.serial.as_deref().unwrap_or_default(),
+                geometry: disk.geometry,
+                seen,
+                table: disk.table.as_ref(),
+                deleted: &deleted,
+                erased,
+                place,
+                name: NAME,
+            },
+            &mut disk.entropy(),
+        )
+        .map_err(|error| refuse!("{error}", %error))?;
+        log(&plan, "chosen");
+        Ok(plan)
     }
 }
 
-impl Disk {
-    /// Zero the first MiB and the machine state's tail of the partition of
-    /// `blocks` from `first`, so the restore and the NOR start blank, and
-    /// make it durable.
-    fn blank(&mut self, first: u64, blocks: u64) -> Result<()> {
-        let block = self.geometry.block_bytes;
-        let bytes = blocks * block;
-        let split =
-            machine_state::split(bytes).map_err(|_| refuse!("the partition is too small"))?;
-        self.zero(first, MIB)?;
-        self.zero(
-            first + split.namespace_bytes / block,
-            bytes - split.namespace_bytes,
-        )?;
-        self.io
-            .flush_blocks()
-            .map_err(|_| refuse!("the disk did not finish writing"))
-    }
+/// Log `plan`, which Stela's drivers apply after the firmware has exited.
+fn log(plan: &Plan, how: &str) {
+    output::arguments(format_args!(
+        "INSTALLER plan for {}:{} ({how}) first_lba={} blocks={} table_writes={}: nothing is \
+         written now; Stela's drivers write it after the firmware has exited\n",
+        plan.serial,
+        plan.partition.guid,
+        plan.partition.first_lba,
+        plan.partition.blocks,
+        plan.table.len()
+    ));
 }
 
 /// Install macOS again on the Stela partition chosen before (`SERIAL:GUID`),
-/// as choosing it again in the picker does: its table unchanged, its first
-/// MiB and machine state blank.
-pub fn again(chosen: &str) -> Result<()> {
+/// as choosing it again in the picker does: the plan that leaves its table
+/// unchanged and makes its first MiB and machine state blank.
+pub fn again(chosen: &str) -> Result<Plan> {
     let target: Target = chosen.parse()?;
     let mut disks = disks();
     let disk = disks
         .iter_mut()
         .find(|disk| disk.serial.as_deref() == Some(target.serial.as_str()))
         .ok_or(refuse!("the disk chosen before is not there"))?;
-    let partition = disk
+    let index = disk
         .table
         .as_ref()
         .and_then(|table| {
-            table.partitions.iter().find(|partition| {
+            table.partitions.iter().position(|partition| {
                 partition.unique_guid == target.partition
                     && partition.role() == Some(Role::AppleRegion)
             })
         })
-        .map(|partition| (partition.first_lba, partition.blocks()))
         .ok_or(refuse!("the partition chosen before is not there"))?;
     if let Some(refusal) = disk.refusal {
         return Err(refuse!("{refusal}", refusal));
     }
-    output::arguments(format_args!(
-        "INSTALLER again on the partition chosen before first_lba={} blocks={}\n",
-        partition.0, partition.1
-    ));
-    disk.blank(partition.0, partition.1)
+    let seen = disk.seen()?;
+    let plan = disk_plan::plan(
+        &disk_plan::Decision {
+            serial: &target.serial,
+            geometry: disk.geometry,
+            seen,
+            table: disk.table.as_ref(),
+            deleted: &[],
+            erased: false,
+            place: disk_plan::Place::Reuse(index),
+            name: NAME,
+        },
+        &mut disk.entropy(),
+    )
+    .map_err(|error| refuse!("{error}", %error))?;
+    log(&plan, "the partition chosen before, again");
+    Ok(plan)
 }
 
 /// Open `handle`'s block I/O, without taking it from its driver.
 fn block_io(handle: Handle) -> Option<ScopedProtocol<BlockIO>> {
-    // SAFETY: only the disk the user confirms is written, after its partition
-    // driver's last read.
+    // SAFETY: the protocol is only read: media, and blocks of whole disks.
     unsafe {
         boot::open_protocol::<BlockIO>(
             OpenProtocolParams {

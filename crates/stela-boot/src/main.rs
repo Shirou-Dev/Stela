@@ -285,10 +285,17 @@ fn main() -> Status {
     selection::carry_failure_record(&options);
     status::done("");
     let held = system::held_at_start(&options);
-    let options = choice::choose(&mut volume, options, held);
+    let choice::Chosen { options, plan } = choice::choose(&mut volume, options, held);
     status::take_screen(console::Framebuffer::from_firmware());
     if options.starts_with(b"--system") {
-        system::boot(options, volume, log, host_firmware, snapshot);
+        system::boot(options, plan, volume, log, host_firmware, snapshot);
+    }
+    // Only the system engine starts Stela's disk drivers, which apply it.
+    if plan.is_some() {
+        output::fatal(
+            "the chosen startup option is not a system-mode boot, so the disk chosen for macOS \
+             cannot be prepared; nothing was written to it",
+        );
     }
     drop(snapshot);
     if options.starts_with(stela_boot_core::options::HOST_CHECK.as_bytes()) {

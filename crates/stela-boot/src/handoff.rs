@@ -16,6 +16,11 @@ pub struct Handoff {
     pub magic: u64,
     /// `stela.cfg`.
     pub options: Region,
+    /// The change Install macOS's disk picker planned for the `--storage`
+    /// partition's disk (`pc::disk_plan`, encoded), which the engine's
+    /// drivers make once, before that partition is looked up. Empty when
+    /// the picker did not run this boot. It lives only in this memory.
+    pub disk_plan: Region,
     /// Exclusive 256-bit pre-EBS seed, erased by the engine on consumption.
     /// An empty region means no checked entropy source was available.
     pub random_seed: Region,

@@ -39,7 +39,9 @@ use stela_drivers::{
     probe::{NativeServices, native::usb4, probe_observed},
 };
 use stela_runtime::pc::{
-    device_starts, failure_record,
+    device_starts,
+    disk_plan::{LocateError, Plan},
+    failure_record,
     gpt::{Guid, PartitionDevice},
     machine_state,
     storage::{self, Named, Target},
@@ -1415,6 +1417,9 @@ impl HostDisks {
 pub struct Selection<'a> {
     /// The guest's disks, in order: one service each.
     pub targets: &'a [&'a Target],
+    /// The change Install macOS's disk picker planned for one target's
+    /// disk, made before the targets are looked up ([`prepare`]).
+    pub plan: Option<&'a Plan>,
     /// The install medium, by its GUID.
     pub medium: Option<Guid>,
     /// The installed system `--preboot` names.
@@ -1448,7 +1453,8 @@ pub struct Selection<'a> {
 
 /// Open the explicitly selected partitions in the loader's identity root
 /// `root` ([`RestoreRoot`]), and bring up every host input device and
-/// network adapter. No guessed disk/partition, no writes at open. Ownership lasts
+/// network adapter. No guessed disk/partition, and no writes at open but
+/// the selection's disk plan ([`prepare`]). Ownership lasts
 /// with the returned services. Probe once for all consumers;
 /// do not reset a controller or reuse its DMA pages for a second probe.
 ///
@@ -1468,6 +1474,7 @@ pub unsafe fn open(
 ) -> Result<Opened, Refused> {
     let Selection {
         targets,
+        plan,
         medium,
         preboot,
         store,
@@ -1570,53 +1577,113 @@ pub unsafe fn open(
         .chain(preboot.map(|target| Named::Disk(target.clone())))
         .chain(fdr.map(Named::Host))
         .collect();
+    let service = |partition: PartitionDevice<Window>, role: &str| -> Box<dyn BlockDevice> {
+        output::arguments(format_args!(
+            "HOST PARTITION serial={} partition={} blocks={} block_size={}{role}\n",
+            partition.disk().serial,
+            partition.partition().unique_guid,
+            partition.identity().blocks,
+            partition.identity().block_size
+        ));
+        Box::new(Service {
+            inner: Box::new(partition),
+            root,
+            running: 0,
+            signals: Cell::new(None),
+            looked: Cell::new(staged_disk::LookGate::default()),
+            heard: staged_disk::SignalWatch::default(),
+            failures: 0,
+        })
+    };
+    // The USB's log, when its disk is here and the start does not write on
+    // to it already: a stop keeps the step's lines there.
+    let boot_log = |disks: &mut Vec<Box<dyn BlockDevice>>| {
+        log.and_then(|guid| storage::open_shared(disks, &[Named::Host(guid)]).ok())
+            .and_then(|mut opened| opened.pop())
+            .map(|partition| service(partition, " (boot log)"))
+    };
     let waited = {
         let clock = handoff.clock;
         let mut late = Vec::new();
         let usb_hosts = &mut devices.usb_hosts;
         let dma = &mut dma;
         let mut announced = false;
-        let waited = storage::wait_for_named(
-            &mut devices.disks,
-            &required,
-            storage::PATIENCE,
-            &mut || clock.now_us(),
-            &mut || {
-                if !announced {
-                    announced = true;
-                    output::arguments(format_args!(
-                        "HOST DISKS waiting for a partition this boot needs\n"
-                    ));
-                    crate::status::progress("waiting for the USB devices");
+        let mut now_us = || clock.now_us();
+        let mut look = || {
+            if !announced {
+                announced = true;
+                output::arguments(format_args!(
+                    "HOST DISKS waiting for a disk or partition this boot needs\n"
+                ));
+                crate::status::progress("waiting for the USB devices");
+            }
+            let mut arrival = storage::Arrival::default();
+            for host in usb_hosts.iter_mut() {
+                let mut changes = host.poll(&mut *dma, firmware);
+                firmware.report();
+                for device in &changes.removed {
+                    output::arguments(format_args!("USB removed {}\n", device.location));
                 }
-                let mut arrival = storage::Arrival::default();
-                for host in usb_hosts.iter_mut() {
-                    let mut changes = host.poll(&mut *dma, firmware);
-                    firmware.report();
-                    for device in &changes.removed {
-                        output::arguments(format_args!("USB removed {}\n", device.location));
-                    }
-                    for device in &changes.added.devices {
-                        output::arguments(format_args!("USB added {}\n", device.location));
-                    }
-                    arrival.news |= !changes.removed.is_empty()
-                        || !changes.added.devices.is_empty()
-                        || !changes.added.failures.is_empty();
-                    arrival.disks.extend(
-                        core::mem::take(&mut changes.added.disks)
-                            .into_iter()
-                            .map(|disk| Box::new(disk) as Box<dyn BlockDevice>),
-                    );
-                    late.push(changes.added);
+                for device in &changes.added.devices {
+                    output::arguments(format_args!("USB added {}\n", device.location));
                 }
-                arrival
-            },
-            &mut |us| clock.delay(us),
-        );
+                arrival.news |= !changes.removed.is_empty()
+                    || !changes.added.devices.is_empty()
+                    || !changes.added.failures.is_empty();
+                arrival.disks.extend(
+                    core::mem::take(&mut changes.added.disks)
+                        .into_iter()
+                        .map(|disk| Box::new(disk) as Box<dyn BlockDevice>),
+                );
+                late.push(changes.added);
+            }
+            arrival
+        };
+        let mut pause = |us| clock.delay(us);
+        // The picker's plan first: the partition it makes is one the
+        // search below looks for.
+        let prepared = match plan {
+            Some(plan) => {
+                // Still the device start: its steps' lines are stored
+                // between two drivers' calls, as each device's are.
+                STARTING_GS.store(this_gs(), Ordering::Release);
+                let prepared = prepare(
+                    plan,
+                    targets,
+                    &mut devices.disks,
+                    &mut now_us,
+                    &mut look,
+                    &mut pause,
+                );
+                observer.store();
+                STARTING_GS.store(0, Ordering::Release);
+                prepared
+            }
+            None => Ok(()),
+        };
+        let waited = prepared.map(|()| {
+            storage::wait_for_named(
+                &mut devices.disks,
+                &required,
+                storage::PATIENCE,
+                &mut now_us,
+                &mut look,
+                &mut pause,
+            )
+        });
         for found in late {
             devices.absorb_usb(None, found, firmware);
         }
         waited
+    };
+    let waited = match waited {
+        Ok(waited) => waited,
+        Err(refusal) => {
+            return Err(Refused {
+                refusal,
+                log: boot_log(&mut devices.disks),
+            });
+        }
     };
     if waited.looks != 0 {
         output::arguments(format_args!(
@@ -1790,24 +1857,6 @@ pub unsafe fn open(
             refuse!("partition {guid}: {error}", %guid, %error)
         }
     };
-    let service = |partition: PartitionDevice<Window>, role: &str| -> Box<dyn BlockDevice> {
-        output::arguments(format_args!(
-            "HOST PARTITION serial={} partition={} blocks={} block_size={}{role}\n",
-            partition.disk().serial,
-            partition.partition().unique_guid,
-            partition.identity().blocks,
-            partition.identity().block_size
-        ));
-        Box::new(Service {
-            inner: Box::new(partition),
-            root,
-            running: 0,
-            signals: Cell::new(None),
-            looked: Cell::new(staged_disk::LookGate::default()),
-            heard: staged_disk::SignalWatch::default(),
-            failures: 0,
-        })
-    };
     let mut opened = loop {
         named.truncate(required);
         named.extend(optional.iter().map(|(named, _)| named.clone()));
@@ -1826,12 +1875,7 @@ pub unsafe fn open(
                 let refusal = describe(&named[at], error);
                 // The USB's log, when its disk is here though a required
                 // partition is not, keeps this step's lines and the account.
-                let log = log
-                    .and_then(|guid| {
-                        storage::open_shared(&mut devices.disks, &[Named::Host(guid)]).ok()
-                    })
-                    .and_then(|mut opened| opened.pop())
-                    .map(|partition| service(partition, " (boot log)"));
+                let log = boot_log(&mut devices.disks);
                 let refusal = refuse!("{role}: {refusal}", role, %refusal);
                 // Without it, the chosen partition's machine state keeps the
                 // step's record for the next boot to copy into the log.
@@ -1969,6 +2013,99 @@ pub unsafe fn open(
         disks: host_disks,
         power: core::mem::take(&mut devices.power),
     })
+}
+
+/// Make the change Install macOS's disk picker planned (`pc::disk_plan`),
+/// as a step of its own on the screen: wait for the plan's disk as a
+/// missing partition is waited for, find it, and apply the plan with the
+/// disk's driver. Called once a boot, inside the device start and under its
+/// bound, with the host drivers' lock held; every wait in it is the
+/// driver's own bounded one for a single command, the largest of them a
+/// MiB of zeroes. `Err` is why the boot stops: the disk as the screen names
+/// it, the step, its block and the driver's error. The plan was in memory
+/// only, so the next boot finds the disk as this one left it.
+fn prepare(
+    plan: &Plan,
+    targets: &[&Target],
+    disks: &mut Vec<Box<dyn BlockDevice>>,
+    now_us: &mut dyn FnMut() -> u64,
+    look: &mut dyn FnMut() -> storage::Arrival,
+    pause: &mut dyn FnMut(u64),
+) -> Result<()> {
+    crate::status::begin("Preparing the chosen disk");
+    output::arguments(format_args!(
+        "INSTALLER preparing {}:{} first_lba={} blocks={} table_writes={} zeroed_ranges={}\n",
+        plan.serial,
+        plan.partition.guid,
+        plan.partition.first_lba,
+        plan.partition.blocks,
+        plan.table.len(),
+        plan.zero.len()
+    ));
+    let stop = |refusal: crate::Refusal| {
+        output::arguments(format_args!("INSTALLER prepare refused: {refusal}\n"));
+        crate::status::fail("the disk was not prepared");
+        refusal
+    };
+    if !targets.iter().any(|target| plan.is_for(target)) {
+        return Err(stop(refuse!(
+            "the disk chosen for macOS is not this boot's --storage; nothing was written to it"
+        )));
+    }
+    let waited = storage::wait_for(
+        disks,
+        &mut |disks| matches!(plan.locate(disks), Err(LocateError::NoDisk)).then_some(()),
+        storage::PATIENCE,
+        now_us,
+        look,
+        pause,
+    );
+    if waited.looks != 0 {
+        output::arguments(format_args!(
+            "INSTALLER waited {} ms for the chosen disk, {} disks arrived\n",
+            waited.waited_us / 1000,
+            waited.arrived
+        ));
+    }
+    let index = plan.locate(disks).map_err(|error| {
+        stop(refuse!(
+            "the disk chosen for macOS could not be prepared: {error}; nothing was written. \
+             Start again and choose Install macOS",
+            %error
+        ))
+    })?;
+    let identity = disks[index].identity().clone();
+    // The log only: the serials stay off the screen.
+    if identity.serial != plan.serial {
+        output::arguments(format_args!(
+            "INSTALLER no disk reports serial {:?}; the chosen disk's size and first blocks are \
+             on the disk reporting {:?}, which is taken\n",
+            plan.serial, identity.serial
+        ));
+    }
+    let name = storage::describe(&identity);
+    crate::status::progress(&name);
+    match plan.apply(&mut *disks[index]) {
+        Ok(()) => {
+            output::arguments(format_args!(
+                "INSTALLER prepared {}:{} on {name}\n",
+                plan.serial, plan.partition.guid
+            ));
+            crate::status::done(if plan.table.is_empty() {
+                "its macOS partition is blank again"
+            } else {
+                "its partition table holds the new macOS partition"
+            });
+            crate::status::begin("Finding the partitions this boot uses");
+            Ok(())
+        }
+        Err(error) => Err(stop(refuse!(
+            "the disk chosen for macOS ({name}) could not be prepared: {error}. Start again \
+             and choose Install macOS",
+            name,
+            %error
+        ))),
+    }
 }
 
 /// What the required partition at `at` of `open`'s list is for.
