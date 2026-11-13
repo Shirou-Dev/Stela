@@ -340,11 +340,17 @@ impl ContainmentError {
     /// on past each: a stop control that does not read back (INTx Disable,
     /// Bus Master, a capability's enable, Secondary Bus Reset), a control
     /// left in a state Stela does not change, or transactions still
-    /// pending after the wait. A configuration space that cannot be mapped
+    /// pending after the wait, or a capability its plan left as found
+    /// (`Plan::refusal`). A configuration space that cannot be mapped
     /// or owned, or a header that changed, still stops the whole fabric.
     fn per_function(&self) -> bool {
         match self.cause {
-            Cause::Claim(ClaimError::Active { .. }) => true,
+            Cause::Claim(
+                ClaimError::Active { .. }
+                | ClaimError::MalformedCapability { .. }
+                | ClaimError::UnsupportedCapability { .. }
+                | ClaimError::UnsupportedVersion { .. },
+            ) => true,
             Cause::Claim(ClaimError::Config(error)) => match error.reason {
                 ConfigFailure::Readback { offset, .. } => !matches!(offset, 0 | 8 | 0x0c | 0x18),
                 ConfigFailure::BusMasterSealed | ConfigFailure::UnqualifiedControl => true,
@@ -553,6 +559,15 @@ impl SlotRefusal {
             error: error.into(),
             master_stopped: false,
             _original: original,
+        }
+    }
+
+    /// Refuse a function that is stopped and sealed, whose plan left a
+    /// capability's control as found.
+    fn left(cause: ClaimError, parked: PreparedConfig<PrepublicationGrant>) -> Self {
+        Self {
+            master_stopped: true,
+            ..Self::new(cause, parked.into_parts())
         }
     }
 
@@ -1231,7 +1246,14 @@ impl Source {
                     slot.plan.clone(),
                 )
             };
-            let result = self.contain_slot(prepared, header, &plan, tsc_hz);
+            // A function stopped and sealed with a capability its plan left
+            // as found is refused alone (`Plan::refusal`).
+            let result = self
+                .contain_slot(prepared, header, &plan, tsc_hz)
+                .and_then(|parked| match plan.refusal() {
+                    Some(cause) => Err(SlotRefusal::left(cause, parked)),
+                    None => Ok(parked),
+                });
             let mut cohort = self.pci_slots.0.borrow_mut();
             let Cohort::Incomplete(fabric) = &mut *cohort else {
                 unreachable!("exclusive containment owns the incomplete fabric");

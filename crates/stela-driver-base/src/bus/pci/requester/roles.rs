@@ -231,7 +231,7 @@ fn function(
                 _ => value,
             })
         });
-        for entry in ExtendedCapabilities::new(transport) {
+        for entry in ExtendedCapabilities::census(transport) {
             let entry = entry.map_err(|error| match error {
                 CapabilityError::Config { error, .. } => Issue::Config { address, error },
                 error => Issue::Capability { address, error },
@@ -438,13 +438,7 @@ mod tests {
         assert_eq!(inventory.role(PF), FunctionRole::Unverified);
     }
     #[test]
-    fn malformed_duplicate_and_unsupported_capabilities_refuse_classification() {
-        let mut cycle = pf(2, 8, 1);
-        cycle[0x100 / 4] |= 0x100 << 20;
-        assert_eq!(
-            capture(&BTreeMap::from([(PF, cycle)])).role(PF),
-            FunctionRole::Unverified
-        );
+    fn duplicate_and_unsupported_sriov_refuse_classification() {
         let mut duplicate = pf(2, 8, 1);
         duplicate[0x100 / 4] |= 0x140 << 20;
         duplicate[0x140 / 4] = 0x10010;
@@ -462,6 +456,25 @@ mod tests {
             capture(&BTreeMap::from([(PF, conventional)])).role(PF),
             FunctionRole::Physical
         );
+    }
+
+    /// Linux `pci_find_next_ext_capability`: a loop, a pointer with its low
+    /// bits set or a vendor entry whose length cannot be read ends or passes
+    /// the walk, and the PF is still classified.
+    #[test]
+    fn an_odd_extended_list_still_classifies_the_pf() {
+        let mut cycle = pf(2, 8, 1);
+        cycle[0x100 / 4] |= 0x100 << 20;
+        let mut unaligned = pf(2, 8, 1);
+        unaligned[0x100 / 4] |= 0x142 << 20;
+        let mut vendor = pf(2, 8, 1);
+        vendor[0x100 / 4] |= 0x200 << 20;
+        vendor[0x200 / 4] = 0x1000b;
+        for words in [cycle, unaligned, vendor] {
+            let inventory = capture(&BTreeMap::from([(PF, words)]));
+            assert!(inventory.issues().is_empty());
+            assert_eq!(inventory.role(PF), FunctionRole::Physical);
+        }
     }
 
     #[test]

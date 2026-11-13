@@ -399,3 +399,117 @@ fn extended_refuses_loops_overlaps_and_null_entries() {
         Err(CapabilityError::OutOfRange { offset: 0xff8 })
     );
 }
+
+impl Space {
+    fn census(&self) -> Vec<Result<(u16, u8, u16, Layout), CapabilityError>> {
+        Capabilities::census(Config(self))
+            .map(|entry| entry.map(|c| (c.offset, c.id, c.bytes, c.layout)))
+            .collect()
+    }
+    fn census_extended(&self) -> Vec<Result<(u16, u16, u16, Layout), CapabilityError>> {
+        ExtendedCapabilities::census(Config(self))
+            .map(|entry| entry.map(|c| (c.offset, c.id, c.bytes, c.layout)))
+            .collect()
+    }
+}
+
+/// Linux `__pci_find_next_cap_ttl`: the census masks a pointer's low bits
+/// and ends quietly at a pointer below 0x40, a revisit or an ID of 0xff.
+#[test]
+fn a_census_ends_an_odd_standard_list_quietly() {
+    let mut space = Space::new();
+    space.0[0x34] = 0x43;
+    space.standard(0x40, 0x11, 0x52);
+    space.standard(0x50, 0x01, 0x20);
+    let expected = [
+        Ok((0x40, 0x11, 12, Layout::Sized)),
+        Ok((0x50, 0x01, 2, Layout::Header)),
+    ];
+    assert_eq!(space.census(), expected);
+    space.standard(0x50, 0x01, 0x40);
+    assert_eq!(space.census(), expected);
+    space.standard(0x50, 0x01, 0x60);
+    space.standard(0x60, 0xff, 0x70);
+    space.standard(0x70, 0x05, 0);
+    assert_eq!(space.census(), expected);
+    space.put16(0x60, u16::MAX);
+    assert_eq!(space.census(), expected);
+    space.0[0x34] = 0x3c;
+    assert!(space.census().is_empty());
+    // The same lists are refused by the driver walk.
+    space.0[0x34] = 0x43;
+    assert_eq!(
+        space.walk().last(),
+        Some(&Err(CapabilityError::Misaligned { offset: 0x43 }))
+    );
+}
+
+/// The census sizes only the bodies it writes, walks a header inside
+/// another body, and reserves only the header of a body it cannot place.
+#[test]
+fn a_census_sizes_only_the_bodies_it_writes() {
+    let mut space = Space::new();
+    space.0[0x34] = 0x40;
+    space.standard(0x40, 0x09, 0x44); // vendor, its length past the end
+    space.0[0x42] = 0xf0;
+    space.standard(0x44, 0x11, 0x48); // MSI-X, 0x44..0x50
+    space.standard(0x48, 0x05, 0x60); // MSI inside the MSI-X body
+    space.standard(0x60, 0x10, 0xf8);
+    space.put16(0x62, u16::MAX);
+    space.standard(0xf8, 0x11, 0);
+    assert_eq!(
+        space.census(),
+        [
+            Ok((0x40, 0x09, 2, Layout::Header)),
+            Ok((0x44, 0x11, 12, Layout::Sized)),
+            Ok((0x48, 0x05, 2, Layout::Unsupported)),
+            Ok((0x60, 0x10, 2, Layout::Unsupported)),
+            Ok((0xf8, 0x11, 2, Layout::Unsupported)),
+        ]
+    );
+}
+
+#[test]
+fn a_census_still_reports_a_failed_status_read() {
+    let mut space = Space::new();
+    space.put16(regs::STATUS, u16::MAX);
+    assert_eq!(
+        space.census(),
+        [Err(CapabilityError::FailedRead {
+            offset: regs::STATUS
+        })]
+    );
+}
+
+/// Linux `pci_find_next_ext_capability`: the census masks a pointer, ends
+/// at a pointer below 0x100, a revisit or a zero or all-ones header, and
+/// sizes only ATS, PRI and PASID.
+#[test]
+fn a_census_ends_an_odd_extended_list_quietly() {
+    let mut space = Space::new();
+    space.extended(0x100, 0x0b, 0x142); // vendor with no length
+    space.extended(0x140, 0x0f, 0x180);
+    space.extended(0x180, 0x23, 0x1c0);
+    space.extended(0x1c0, 0x13, 0x1c4); // PRI, with a header in its body
+    space.extended(0x1c4, 0x1b, 0x100);
+    let expected = [
+        Ok((0x100, 0x0b, 4, Layout::Header)),
+        Ok((0x140, 0x0f, 8, Layout::Sized)),
+        Ok((0x180, 0x23, 4, Layout::Header)),
+        Ok((0x1c0, 0x13, 16, Layout::Sized)),
+        Ok((0x1c4, 0x1b, 4, Layout::Unsupported)),
+    ];
+    assert_eq!(space.census_extended(), expected);
+    for next in [0x0f0, 0x200] {
+        space.extended(0x1c4, 0x1b, next);
+        assert_eq!(space.census_extended(), expected);
+    }
+    space.put32(0x200, u32::MAX);
+    assert_eq!(space.census_extended(), expected);
+    space.extended(0x1c4, 0x1b, 0xff8);
+    space.extended(0xff8, 0x13, 0);
+    assert_eq!(
+        space.census_extended().last(),
+        Some(&Ok((0xff8, 0x13, 4, Layout::Unsupported)))
+    );
+}

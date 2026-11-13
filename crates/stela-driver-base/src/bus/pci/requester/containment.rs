@@ -40,9 +40,35 @@ pub struct Plan {
     controls: Vec<Control>,
     /// The device/port type of the PCI Express capability, if any.
     express_port: Option<u8>,
+    /// Why one of the function's capabilities could not be planned, which
+    /// keeps the function from a driver ([`Plan::refusal`]).
+    refusal: Option<ClaimError>,
 }
 
 impl Plan {
+    /// Why the function stays stopped and undriven: a capability whose
+    /// control this plan could not stop exactly, left as found. Bus Master,
+    /// which the plan clears and [`Plan::seal`] holds clear, gates every
+    /// memory request the function makes, MSI and MSI-X messages and
+    /// translation and page requests included (PCI Express Base, Command
+    /// register), so such a function makes no request while it is parked.
+    /// Linux drives it anyway; here it is refused alone instead of the
+    /// census refusing the PC.
+    pub fn refusal(&self) -> Option<ClaimError> {
+        self.refusal
+    }
+
+    /// Record a capability this plan leaves as found. Only a function whose
+    /// Bus Master bit the plan clears may keep one: a hard-wired bit stops no
+    /// request, so there the census is refused as before.
+    fn leave(&mut self, error: ClaimError) -> Result<(), ClaimError> {
+        if self.controls[0].hardwired != 0 {
+            return Err(error);
+        }
+        self.refusal.get_or_insert(error);
+        Ok(())
+    }
+
     /// Census the function `read` reaches. `root_bus`: it sits on a root
     /// complex's own bus, which no bridge forwards to.
     pub fn read(
@@ -54,6 +80,7 @@ impl Plan {
         let mut plan = Self {
             controls: Vec::new(),
             express_port: None,
+            refusal: None,
         };
         let command = read(regs::COMMAND, 2)? as u16;
         if command == u16::MAX {
@@ -87,8 +114,12 @@ impl Plan {
         )?;
         plan.controls[0].hardwired = hardwired;
 
+        // Census walks end an odd list where Linux's walk does, so one
+        // function's list never refuses the PC. A control this plan cannot
+        // stop exactly is left as found and the function refused alone
+        // ([`Plan::refusal`]).
         let mut seen = 0u32;
-        for entry in Capabilities::new(Transport(read)) {
+        for entry in Capabilities::census(Transport(read)) {
             let entry = entry?;
             let id = u16::from(entry.id);
             let (relative, mut clear, event) = match id {
@@ -97,24 +128,30 @@ impl Plan {
                 PCIE => (8, 1 << 11, 0),
                 _ => continue,
             };
-            if entry.layout != Layout::Sized {
-                return Err(ClaimError::UnsupportedCapability {
+            let planned = if entry.layout == Layout::Sized {
+                record_capability(&mut seen, id, entry.offset, relative, entry.bytes)
+            } else {
+                Err(ClaimError::UnsupportedCapability {
                     id,
                     extended: false,
-                });
+                })
+            };
+            match planned {
+                Ok(()) => {
+                    if id == PCIE {
+                        let flags = read(entry.offset + 2, 2)?;
+                        plan.express_port = Some((flags >> 4 & 0xf) as u8);
+                        clear |= device_control_reset(flags as u16);
+                    }
+                    plan.disable(read, entry.offset + relative, clear, event)?;
+                }
+                Err(error) => plan.leave(error)?,
             }
-            record_capability(&mut seen, id, entry.offset, relative, entry.bytes)?;
-            if id == PCIE {
-                let flags = read(entry.offset + 2, 2)?;
-                plan.express_port = Some((flags >> 4 & 0xf) as u8);
-                clear |= device_control_reset(flags as u16);
-            }
-            plan.disable(read, entry.offset + relative, clear, event)?;
         }
 
         if plan.express_port.is_some() && read(0x100, 4)? != u32::MAX {
             let mut seen = 0u32;
-            for entry in ExtendedCapabilities::new(Transport(read)) {
+            for entry in ExtendedCapabilities::census(Transport(read)) {
                 let entry = entry?;
                 let (relative, clear, event) = match entry.id {
                     ATS => (6, 1 << 15, 0),
@@ -122,19 +159,22 @@ impl Plan {
                     PRI => (4, 1, 2), // Reset is a command, not persistent state.
                     _ => continue,
                 };
-                if entry.version != 1 {
-                    return Err(ClaimError::UnsupportedVersion {
+                let planned = if entry.version != 1 {
+                    Err(ClaimError::UnsupportedVersion {
                         id: entry.id,
                         version: entry.version,
-                    });
-                }
-                if entry.layout != Layout::Sized {
-                    return Err(ClaimError::MalformedCapability {
+                    })
+                } else if entry.layout != Layout::Sized {
+                    Err(ClaimError::MalformedCapability {
                         offset: entry.offset,
-                    });
+                    })
+                } else {
+                    record_capability(&mut seen, entry.id, entry.offset, relative, entry.bytes)
+                };
+                match planned {
+                    Ok(()) => plan.disable(read, entry.offset + relative, clear, event)?,
+                    Err(error) => plan.leave(error)?,
                 }
-                record_capability(&mut seen, entry.id, entry.offset, relative, entry.bytes)?;
-                plan.disable(read, entry.offset + relative, clear, event)?;
             }
         }
         Ok(plan)

@@ -1389,3 +1389,93 @@ fn containment_plan_refuses_when_the_interrupt_pin_cannot_be_read() {
     );
     assert!(matches!(result, Err(error) if error == refused));
 }
+
+/// Linux `__pci_find_next_cap_ttl` and `pci_find_next_ext_capability`: a
+/// masked pointer, a vendor body that cannot be sized, a loop and an
+/// extended vendor entry with no length leave the census planning every
+/// control it reaches, with no refusal.
+#[test]
+fn containment_walks_an_odd_list_as_linux_does() {
+    let mut function = endpoint();
+    let config = function.config();
+    config.write16(regs::STATUS, regs::STATUS_CAP_LIST).unwrap();
+    config.write16(regs::COMMAND, 7).unwrap();
+    config.write8(0x34, 0x43).unwrap();
+    config.write16(0x40, 0x09 | 0x52 << 8).unwrap();
+    config.write8(0x42, 0xf0).unwrap(); // a body past the list's end
+    config.write16(0x50, MSI | 0x60 << 8).unwrap();
+    config.write16(0x52, 0x81).unwrap();
+    config.write16(0x60, PCIE | 0x40 << 8).unwrap(); // back to the start
+    config.write16(0x62, 2).unwrap();
+    config.write32(0x100, 0x0b | 1 << 16 | 0x202 << 20).unwrap();
+    config.write32(0x200, u32::from(ATS) | 1 << 16).unwrap();
+    config.write16(0x206, 1 << 15).unwrap();
+    let plan = containment_plan(config).unwrap();
+    assert_eq!(plan.refusal(), None);
+    assert!(plan.permits(4, 2, 0x403));
+    assert!(plan.permits(0x52, 2, 0x80));
+    assert!(plan.permits(0x206, 2, 0));
+}
+
+/// A control the census cannot stop exactly is left as found: the plan
+/// still clears Bus Master, which gates the function's MSI-X messages, and
+/// names the refusal that keeps that one function from a driver.
+#[test]
+fn containment_leaves_an_unsizable_control_and_refuses_the_function_alone() {
+    let mut function = endpoint();
+    let config = function.config();
+    config.write16(regs::STATUS, regs::STATUS_CAP_LIST).unwrap();
+    config.write16(regs::COMMAND, 7).unwrap();
+    config.write8(0x34, 0x50).unwrap();
+    config.write16(0x50, MSI | 0xf8 << 8).unwrap();
+    config.write16(0x52, 0x81).unwrap();
+    config.write16(0xf8, MSIX).unwrap(); // a body past the list's end
+    config.write16(0xfa, 1 << 15).unwrap();
+    let plan = containment_plan(config).unwrap();
+    assert_eq!(
+        plan.refusal(),
+        Some(ClaimError::UnsupportedCapability {
+            id: MSIX,
+            extended: false
+        })
+    );
+    assert!(plan.permits(4, 2, 0x403));
+    assert!(plan.permits(0x52, 2, 0x80));
+    assert!(!plan.permits(0xfa, 2, 0));
+    plan.apply(config).unwrap();
+    assert_eq!(config.read16(regs::COMMAND), Ok(0x403));
+    assert_eq!(config.read16(0xfa), Ok(1 << 15));
+
+    // A second MSI capability is left as well.
+    config.write16(0x50, MSI | 0x60 << 8).unwrap();
+    config.write16(0x60, MSI).unwrap();
+    let plan = containment_plan(config).unwrap();
+    assert_eq!(
+        plan.refusal(),
+        Some(ClaimError::MalformedCapability { offset: 0x60 })
+    );
+}
+
+/// A Bus Master bit hardware holds set gates nothing, so a control the
+/// census cannot stop there still refuses the census.
+#[test]
+fn containment_refuses_an_unsizable_control_beside_a_hardwired_bus_master() {
+    let mut function = host_bridge(regs::COMMAND_MASTER, regs::COMMAND_MASTER);
+    let config = function.config();
+    config.write16(regs::STATUS, regs::STATUS_CAP_LIST).unwrap();
+    config.write8(0x34, 0xf8).unwrap();
+    config.write16(0xf8, MSIX).unwrap();
+    assert!(matches!(
+        containment_plan_on(config, true),
+        Err(ClaimError::UnsupportedCapability {
+            id: MSIX,
+            extended: false
+        })
+    ));
+    assert!(
+        containment_plan_on(config, false)
+            .unwrap()
+            .refusal()
+            .is_some()
+    );
+}

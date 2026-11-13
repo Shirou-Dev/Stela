@@ -7,6 +7,18 @@
 //! Register layouts and sizes follow Linux include/uapi/linux/pci_regs.h
 //! (`PCI_CAP_*_SIZEOF`, `PCI_EXT_CAP_*_SIZEOF`). A pointer with its reserved
 //! low two bits set ends the walk.
+//!
+//! A census walk ([`Capabilities::census`], [`ExtendedCapabilities::census`])
+//! is Linux's instead (`__pci_find_next_cap_ttl`,
+//! `pci_find_next_ext_capability`), for the boot's census of every function,
+//! where one odd list must not refuse the PC: it masks a pointer's low two
+//! bits, and a pointer below the list's region, a revisit (Linux's TTL is the
+//! region's dword count), a standard ID of 0xff or an extended header of zero
+//! or all ones ends the list quietly. It sizes only the bodies the census
+//! writes (MSI, MSI-X and PCI Express; ATS, PASID and PRI) and walks a
+//! header inside another body. A sized body past the region or over another
+//! entry reserves only its header, as [`Layout::Unsupported`], for the code
+//! acting on it to refuse. Only a failed configuration read is an error.
 use super::ConfigSpace;
 use super::regs;
 
@@ -264,17 +276,38 @@ impl<const N: usize> Cells<N> {
         Ok(())
     }
 
-    /// Record a header at `offset`, refusing one already visited or reserved.
-    fn visit(&mut self, base: u16, offset: u16) -> Result<(), CapabilityError> {
+    /// Record a header at `offset`, refusing one already visited, or one
+    /// inside reserved bytes unless `inside` allows it.
+    fn visit(&mut self, base: u16, offset: u16, inside: bool) -> Result<(), CapabilityError> {
         let cell = usize::from((offset - base) / 4);
         if Self::get(&self.headers, cell) {
             return Err(CapabilityError::Cycle { offset });
         }
-        if Self::get(&self.reserved, cell) {
+        if !inside && Self::get(&self.reserved, cell) {
             return Err(CapabilityError::Overlap { offset });
         }
         self.headers[cell / 64] |= 1 << (cell % 64);
         Ok(())
+    }
+
+    /// Reserve an entry of `extent` from `offset` in a census walk. A body
+    /// past `end` or over reserved bytes reserves only the `header` bytes,
+    /// when they are free, and a sized one becomes [`Layout::Unsupported`].
+    fn place(
+        &mut self,
+        (base, end): (u16, u16),
+        offset: u16,
+        header: u16,
+        (bytes, layout): (u16, Layout),
+    ) -> (u16, Layout) {
+        if offset + bytes <= end && self.reserve(base, offset, bytes).is_ok() {
+            return (bytes, layout);
+        }
+        let _ = self.reserve(base, offset, header);
+        match layout {
+            Layout::Sized => (header, Layout::Unsupported),
+            layout => (header, layout),
+        }
     }
 }
 
@@ -294,6 +327,8 @@ pub struct Capabilities<R> {
     header_type: Option<u8>,
     /// Whether bodies are sized and reserved, or only headers.
     bodies: bool,
+    /// Whether this is a census walk, which ends quietly where Linux's does.
+    census: bool,
 }
 
 impl<R: CapabilityRead> Capabilities<R> {
@@ -304,6 +339,33 @@ impl<R: CapabilityRead> Capabilities<R> {
             cells: Cells::EMPTY,
             header_type: None,
             bodies: true,
+            census: false,
+        }
+    }
+
+    /// A census walk of the standard list (see the module documentation).
+    pub fn census(read: R) -> Self {
+        Self {
+            census: true,
+            ..Self::new(read)
+        }
+    }
+
+    /// A list fault: an error, or in a census the list's quiet end.
+    fn fault<T>(&self, error: CapabilityError) -> Result<Option<T>, R::Error> {
+        if self.census {
+            Ok(None)
+        } else {
+            Err(error.into())
+        }
+    }
+
+    /// The flags word at `offset` that sizes a body. All ones is a failed
+    /// read, or in a census a body with no layout.
+    fn flags(&mut self, offset: u16) -> Result<Option<u16>, R::Error> {
+        match self.read.read(offset, 2)? as u16 {
+            u16::MAX => self.fault(CapabilityError::FailedRead { offset }),
+            flags => Ok(Some(flags)),
         }
     }
 
@@ -324,28 +386,42 @@ impl<R: CapabilityRead> Capabilities<R> {
         ))
     }
 
-    fn entry(&mut self, offset: u16) -> Result<(Capability, u16), R::Error> {
+    /// The entry at `offset` and its next pointer, or none where a census
+    /// ends the list.
+    fn entry(&mut self, offset: u16) -> Result<Option<(Capability, u16)>, R::Error> {
         if !offset.is_multiple_of(4) {
-            return Err(CapabilityError::Misaligned { offset }.into());
+            return self.fault(CapabilityError::Misaligned { offset });
         }
         if !(STANDARD_START..STANDARD_END).contains(&offset) {
-            return Err(CapabilityError::OutOfRange { offset }.into());
+            return self.fault(CapabilityError::OutOfRange { offset });
         }
-        self.cells.visit(STANDARD_START, offset)?;
-        let header = self.read16(offset)?;
+        if let Err(error) = self.cells.visit(STANDARD_START, offset, self.census) {
+            return self.fault(error);
+        }
+        let header = self.read.read(offset, 2)? as u16;
+        if header == u16::MAX {
+            return self.fault(CapabilityError::FailedRead { offset });
+        }
         let id = header as u8;
         if id == 0xff {
-            return Err(CapabilityError::Malformed { offset }.into());
+            return self.fault(CapabilityError::Malformed { offset });
         }
-        let (bytes, layout) = if self.bodies {
-            self.extent(offset, id)?
-        } else {
+        // A census sizes only the bodies it writes.
+        let extent = if !self.bodies || self.census && !matches!(id, 0x05 | 0x10 | 0x11) {
             (2, Layout::Header)
+        } else {
+            self.extent(offset, id)?
         };
-        if offset + bytes > STANDARD_END {
-            return Err(CapabilityError::OutOfRange { offset }.into());
-        }
-        self.cells.reserve(STANDARD_START, offset, bytes)?;
+        let (bytes, layout) = if self.census {
+            self.cells
+                .place((STANDARD_START, STANDARD_END), offset, 2, extent)
+        } else {
+            if offset + extent.0 > STANDARD_END {
+                return Err(CapabilityError::OutOfRange { offset }.into());
+            }
+            self.cells.reserve(STANDARD_START, offset, extent.0)?;
+            extent
+        };
         let capability = Capability {
             offset,
             id,
@@ -353,7 +429,7 @@ impl<R: CapabilityRead> Capabilities<R> {
             bytes,
             layout,
         };
-        Ok((capability, header >> 8))
+        Ok(Some((capability, header >> 8)))
     }
 
     /// The body size of capability `id` at `offset` (pci_regs.h).
@@ -367,7 +443,9 @@ impl<R: CapabilityRead> Capabilities<R> {
             0x03 => sized(8),  // PCI_CAP_VPD_SIZEOF
             0x04 => sized(4),  // Slot identification
             0x05 => {
-                let flags = self.read16(offset + 2)?;
+                let Some(flags) = self.flags(offset + 2)? else {
+                    return unsupported;
+                };
                 sized(match (flags & 1 << 7 != 0, flags & 1 << 8 != 0) {
                     (false, false) => 10,
                     (true, false) => 14,
@@ -398,7 +476,9 @@ impl<R: CapabilityRead> Capabilities<R> {
             }
             0x0d => sized(8), // Bridge subsystem vendor/device IDs
             0x10 => {
-                let flags = self.read16(offset + 2)?;
+                let Some(flags) = self.flags(offset + 2)? else {
+                    return unsupported;
+                };
                 let kind = (flags >> 4) & 15;
                 let root = matches!(kind, 4 | 10);
                 let slot = flags & 1 << 8 != 0;
@@ -459,14 +539,19 @@ impl<R: CapabilityRead> Iterator for Capabilities<R> {
                 }
             },
         };
+        let offset = if self.census { offset & !3 } else { offset };
         if offset == 0 {
             self.state = State::Done;
             return None;
         }
         match self.entry(offset) {
-            Ok((capability, next)) => {
+            Ok(Some((capability, next))) => {
                 self.state = State::At(next);
                 Some(Ok(capability))
+            }
+            Ok(None) => {
+                self.state = State::Done;
+                None
             }
             Err(error) => {
                 self.state = State::Done;
@@ -482,6 +567,8 @@ pub struct ExtendedCapabilities<R> {
     read: R,
     state: State,
     cells: Cells<16>,
+    /// Whether this is a census walk, which ends quietly where Linux's does.
+    census: bool,
 }
 
 impl<R: CapabilityRead> ExtendedCapabilities<R> {
@@ -490,17 +577,38 @@ impl<R: CapabilityRead> ExtendedCapabilities<R> {
             read,
             state: State::Start,
             cells: Cells::EMPTY,
+            census: false,
         }
     }
 
+    /// A census walk of the extended list (see the module documentation).
+    pub fn census(read: R) -> Self {
+        Self {
+            census: true,
+            ..Self::new(read)
+        }
+    }
+
+    /// A list fault: an error, or in a census the list's quiet end.
+    fn fault<T>(&self, error: CapabilityError) -> Result<Option<T>, R::Error> {
+        if self.census {
+            Ok(None)
+        } else {
+            Err(error.into())
+        }
+    }
+
+    /// The entry at `offset` and its next pointer, or none at the list's end.
     fn entry(&mut self, offset: u16) -> Result<Option<(ExtendedCapability, u16)>, R::Error> {
         if !offset.is_multiple_of(4) {
-            return Err(CapabilityError::Misaligned { offset }.into());
+            return self.fault(CapabilityError::Misaligned { offset });
         }
         if !(EXTENDED_START..EXTENDED_END).contains(&offset) {
-            return Err(CapabilityError::OutOfRange { offset }.into());
+            return self.fault(CapabilityError::OutOfRange { offset });
         }
-        self.cells.visit(EXTENDED_START, offset)?;
+        if let Err(error) = self.cells.visit(EXTENDED_START, offset, self.census) {
+            return self.fault(error);
+        }
         // Linux `pci_cfg_space_size`: only a PCI Express or PCI-X function
         // has configuration space past 0xff. A conventional function read
         // there through ECAM may answer with its first 256 bytes again, as
@@ -513,20 +621,31 @@ impl<R: CapabilityRead> ExtendedCapabilities<R> {
             return Ok(None);
         }
         if header == u32::MAX {
-            return Err(CapabilityError::FailedRead { offset }.into());
+            return self.fault(CapabilityError::FailedRead { offset });
         }
         // ID 0 with a version or a next pointer is a null entry, which only
         // passes the walk on: how a hypervisor hides the list's first entry,
         // whose offset is fixed, and what Linux's walk skips.
         let id = header as u16;
         if header == 0 {
-            return Err(CapabilityError::Malformed { offset }.into());
+            return self.fault(CapabilityError::Malformed { offset });
         }
-        let (bytes, layout) = self.extent(offset, id)?;
-        if offset + bytes > EXTENDED_END {
-            return Err(CapabilityError::OutOfRange { offset }.into());
-        }
-        self.cells.reserve(EXTENDED_START, offset, bytes)?;
+        // A census sizes only the bodies it writes: ATS, PRI and PASID.
+        let (bytes, layout) = if self.census {
+            let extent = match id {
+                0x0f | 0x13 | 0x1b => self.extent(offset, id)?,
+                _ => (4, Layout::Header),
+            };
+            self.cells
+                .place((EXTENDED_START, EXTENDED_END), offset, 4, extent)
+        } else {
+            let (bytes, layout) = self.extent(offset, id)?;
+            if offset + bytes > EXTENDED_END {
+                return Err(CapabilityError::OutOfRange { offset }.into());
+            }
+            self.cells.reserve(EXTENDED_START, offset, bytes)?;
+            (bytes, layout)
+        };
         let capability = ExtendedCapability {
             offset,
             id,
@@ -608,6 +727,7 @@ impl<R: CapabilityRead> Iterator for ExtendedCapabilities<R> {
                 self.state = State::Done;
                 return None;
             }
+            State::At(offset) if self.census => offset & !3,
             State::At(offset) => offset,
         };
         match self.entry(offset) {
