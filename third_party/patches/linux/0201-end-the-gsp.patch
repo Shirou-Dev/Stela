@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:45:00 +0000
+Subject: [PATCH] fix(nouveau): end the GSP unload wait when GSP reports a
+ fatal state by its HALT interrupt, and report how far its logs advanced
+
+---
+ .../gpu/drm/nouveau/include/nvkm/subdev/gsp.h |  5 ++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c | 54 +++++++++++++++----
+ 2 files changed, 49 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+index 181df7bdce4f0412574323e0115e3daa1a0a78bd..9abad5a72edb4465d93f296d574929e69d3f67df 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+@@ -197,6 +197,11 @@ struct nvkm_gsp {
+ 	bool running;
+ 	/* RM answered the last UNLOADING_GUEST_DRIVER. */
+ 	bool unload_replied;
++	/*
++	 * GSP raised its HALT interrupt since the last unload was sent: GSP-RM
++	 * signals a fatal state that way, and answers nothing after it.
++	 */
++	bool halt_reported;
+ 	/* The device is stopping: RPC waits are short, as GSP may be gone. */
+ 	bool stopping;
+ 	/*
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+index 7f49dd8220a029468e23cd9e4ae3c2659da3d742..f6348e09a6e26e95b901ce397637ac0efeaf719b 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+@@ -79,6 +79,13 @@ r535_gsp_intr(struct nvkm_inth *inth)
+ 		stat &= ~0x00000040;
+ 	}
+ 
++	/*
++	 * HALT: GSP-RM raises it when it runs into a fatal state, with its
++	 * core still running. A wait for its answer ends on it.
++	 */
++	if (stat & 0x00000010)
++		WRITE_ONCE(gsp->halt_reported, true);
++
+ 	if (stat) {
+ 		nvkm_error(subdev, "intr %08x\n", stat);
+ 		nvkm_falcon_wr32(&gsp->falcon, 0x014, stat);
+@@ -351,6 +358,7 @@ r535_gsp_rpc_unloading_guest_driver(struct nvkm_gsp *gsp, bool suspend)
+ 	 * it or for the mailbox, whichever comes first, in bounded time.
+ 	 */
+ 	gsp->unload_replied = false;
++	WRITE_ONCE(gsp->halt_reported, false);
+ 	return nvkm_gsp_rpc_wr(gsp, rpc, NVKM_GSP_RPC_REPLY_NOWAIT);
+ }
+ 
+@@ -358,21 +366,38 @@ r535_gsp_rpc_unloading_guest_driver(struct nvkm_gsp *gsp, bool suspend)
+ #define R535_GSP_UNLOAD_MS 4000
+ /* How long its mailbox has to report the unload after RM answered. */
+ #define R535_GSP_UNLOADED_MS 1000
++/* How long an answer has to land after GSP reported a fatal state. */
++#define R535_GSP_HALTED_MS 100
++
++/* The put pointer of a GSP-RM log buffer: where its next record goes. */
++static u64
++r535_gsp_log_put(struct nvkm_gsp_mem *log)
++{
++	return log->data ? READ_ONCE(*(u64 *)log->data) : 0;
++}
+ 
+ /*
+  * Wait for GSP-RM to unload, in bounded time. It is done when mailbox 0
+- * reports the unload, or when RM answered and the mailbox had its 2 s, as
+- * before. Messages RM posts meanwhile, the answer among them, are taken
+- * as the message queue's work takes them. A GSP that did not answer by the
+- * deadline is reported with its queue and mailbox state: whether it took
+- * the command (cmdq r = w), and whether its core still runs.
++ * reports the unload, or when RM answered and the mailbox had its 1 s.
++ * Messages RM posts meanwhile, the answer among them, are taken as the
++ * message queue's work takes them. A GSP that raises its HALT interrupt
++ * reports a fatal state and answers nothing more: its answer gets a short
++ * grace instead of the full wait. A GSP that did not answer is reported
++ * with its queue and mailbox state (whether it took the command, cmdq r =
++ * w), its core state, and how far each of its log buffers advanced during
++ * the unload: LIBOS writes exception dumps to LOGINIT, so an advance there
++ * says GSP-RM crashed in its unload.
+  */
+ static int
+ r535_gsp_unload_wait(struct nvkm_gsp *gsp)
+ {
+ 	struct nvkm_subdev *subdev = &gsp->subdev;
+-	ktime_t deadline = ktime_add_ms(ktime_get(), R535_GSP_UNLOAD_MS);
+-	bool replied = false;
++	const ktime_t start = ktime_get();
++	const u64 init = r535_gsp_log_put(&gsp->loginit);
++	const u64 intr = r535_gsp_log_put(&gsp->logintr);
++	const u64 rm = r535_gsp_log_put(&gsp->logrm);
++	ktime_t deadline = ktime_add_ms(start, R535_GSP_UNLOAD_MS);
++	bool replied = false, halted = false;
+ 	void *msg = NULL;
+ 
+ 	for (;;) {
+@@ -393,6 +418,9 @@ r535_gsp_unload_wait(struct nvkm_gsp *gsp)
+ 		if (!replied && gsp->unload_replied) {
+ 			replied = true;
+ 			deadline = ktime_add_ms(ktime_get(), R535_GSP_UNLOADED_MS);
++		} else if (!replied && !halted && READ_ONCE(gsp->halt_reported)) {
++			halted = true;
++			deadline = min(deadline, ktime_add_ms(ktime_get(), R535_GSP_HALTED_MS));
+ 		}
+ 		if (ktime_after(ktime_get(), deadline))
+ 			break;
+@@ -404,12 +432,18 @@ r535_gsp_unload_wait(struct nvkm_gsp *gsp)
+ 
+ 	WRITE_ONCE(gsp->dead, true);
+ 	nvkm_error(subdev,
+-		   "unload: no answer in %d ms: last answered fn %u cmdq w%u r%u msgq w%u r%u mbox0 %08x mbox1 %08x riscv %d\n",
+-		   R535_GSP_UNLOAD_MS, gsp->last_answered, *gsp->cmdq.wptr, *gsp->cmdq.rptr,
++		   "unload: no answer in %lld ms%s: last answered fn %u cmdq w%u r%u msgq w%u r%u mbox0 %08x mbox1 %08x riscv %d cpuctl %08x\n",
++		   ktime_ms_delta(ktime_get(), start),
++		   halted ? ", GSP reported a fatal state (HALT interrupt)" : "",
++		   gsp->last_answered, *gsp->cmdq.wptr, *gsp->cmdq.rptr,
+ 		   *gsp->msgq.wptr, *gsp->msgq.rptr,
+ 		   nvkm_falcon_rd32(&gsp->falcon, 0x040),
+ 		   nvkm_falcon_rd32(&gsp->falcon, 0x044),
+-		   nvkm_falcon_riscv_active(&gsp->falcon));
++		   nvkm_falcon_riscv_active(&gsp->falcon),
++		   nvkm_falcon_rd32(&gsp->falcon, gsp->falcon.func->addr2 + 0x388));
++	nvkm_error(subdev, "unload: log put loginit %llu->%llu logintr %llu->%llu logrm %llu->%llu\n",
++		   init, r535_gsp_log_put(&gsp->loginit), intr, r535_gsp_log_put(&gsp->logintr),
++		   rm, r535_gsp_log_put(&gsp->logrm));
+ 	return -ETIMEDOUT;
+ }
+ 
