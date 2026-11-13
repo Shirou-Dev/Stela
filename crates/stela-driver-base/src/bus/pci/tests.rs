@@ -938,7 +938,7 @@ impl Address {
 
 /// A function a reset empties, silent for `silence` reads after one.
 struct Resettable {
-    words: [u32; 32],
+    words: [u32; 64],
     silence: u32,
     busy: core::cell::Cell<u32>,
     resets: u32,
@@ -956,8 +956,16 @@ impl ConfigSpace for Resettable {
     }
 
     fn write32(&mut self, offset: u16, value: u32) -> Result<(), crate::bus::pci::ConfigError> {
+        let before = self.words[usize::from(offset / 4)];
         self.words[usize::from(offset / 4)] = value;
-        if offset == 0x48 && value & 1 << 15 != 0 {
+        let soft_reset = offset == 0x84
+            && before & 3 == 3
+            && value & 3 == 0
+            && before & u32::from(PM_NO_SOFT_RESET) == 0;
+        if soft_reset {
+            self.words[0x84 / 4] = 0;
+        }
+        if soft_reset || offset == 0x48 && value & 1 << 15 != 0 {
             self.words[0x48 / 4] = 0;
             self.words[1] = 0x0010_0000;
             self.words[4] = 0;
@@ -992,17 +1000,18 @@ impl ConfigSpace for Resettable {
 }
 
 fn resettable(capabilities: u32, silence: u32) -> Function<Resettable> {
-    let mut words = [0; 32];
+    let mut words = [0; 64];
     words[0] = 0x1234_8086;
     words[1] = 0x0010_0006;
     words[4] = 0xfe00_0000;
     words[0x34 / 4] = 0x40;
-    words[0x40 / 4] = 0x0002_0010;
+    words[0x40 / 4] = 0x0002_8010;
     words[0x44 / 4] = capabilities;
     words[0x48 / 4] = 0x0020_2810;
     words[0x50 / 4] = 0x0143;
     words[0x68 / 4] = 0x0400;
     words[0x70 / 4] = 3;
+    words[0x80 / 4] = 0x0003_0001;
     Function {
         address: Address::default_for_tests(),
         vendor: 0x8086,
@@ -1051,4 +1060,60 @@ fn a_function_without_a_reset_is_left_alone_and_one_that_stays_silent_is_an_erro
             "PCI function did not return from its reset"
         ))
     );
+}
+
+#[test]
+fn a_function_without_flr_is_reset_through_d3hot_when_its_exit_resets_it() {
+    let mut function = resettable(0, 1);
+    assert_eq!(
+        function.reset_method(),
+        Ok(Some(ResetMethod::PowerManagement))
+    );
+    let mut waits = Vec::new();
+    let reset = function.reset_with(|microseconds| {
+        waits.push(microseconds);
+        Ok(())
+    });
+    assert_eq!(reset, Ok(Some(ResetMethod::PowerManagement)));
+    assert_eq!(waits, [10_000, 10_000, 1_000]);
+    let config = &function.config;
+    assert_eq!(config.resets, 1);
+    assert_eq!(config.words[0x84 / 4] & 3, 0);
+    assert_eq!(config.words[1] & 0xffff, 6);
+    assert_eq!(config.words[4], 0xfe00_0000);
+    assert_eq!(config.words[0x48 / 4] & 0xffff, 0x2810);
+    assert_eq!(config.words[0x70 / 4], 3);
+}
+
+#[test]
+fn flr_is_preferred_and_no_soft_reset_or_a_low_power_state_offers_no_reset() {
+    let mut function = resettable(1 << 28, 0);
+    function.config.words[0x84 / 4] = u32::from(PM_NO_SOFT_RESET);
+    assert_eq!(
+        function.reset_method(),
+        Ok(Some(ResetMethod::FunctionLevel))
+    );
+    assert_eq!(
+        function.reset_with(|_| Ok(())),
+        Ok(Some(ResetMethod::FunctionLevel))
+    );
+    for control in [u32::from(PM_NO_SOFT_RESET), 3] {
+        let mut function = resettable(0, 0);
+        function.config.words[0x84 / 4] = control;
+        assert_eq!(function.reset_method(), Ok(None));
+        assert_eq!(function.reset_with(|_| Ok(())), Ok(None));
+        assert_eq!(function.function_level_reset_with(|_| Ok(())), Ok(false));
+        assert_eq!(function.config.resets, 0);
+        assert_eq!(function.config.words[0x84 / 4], control);
+    }
+}
+
+#[test]
+fn an_unanswering_capability_is_an_error_not_a_reset() {
+    let mut function = resettable(u32::MAX, 0);
+    assert_eq!(
+        function.reset_with(|_| Ok(())),
+        Err(BlockError::Unsupported("PCI function does not answer"))
+    );
+    assert_eq!(function.config.resets, 0);
 }
