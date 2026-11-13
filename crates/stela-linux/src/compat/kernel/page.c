@@ -811,7 +811,7 @@ static void queue_record(size_t index)
 {
 	struct allocation_record *record = catalog.allocations + index;
 	if (!record->pin || record->live)
-		pr_warn("page: queue_record index %zu invalid state (pin=%p live=%d)\n",
+		pr_warn("page: queue_record index %zu invalid state (pin=%p live=%zu)\n",
 			index, record->pin, record->live);
 	record->next = catalog.retired;
 	catalog.retired = index;
@@ -830,7 +830,7 @@ void stela_linux_pages_finish(void)
         size_t index = *link;
         struct allocation_record *record = catalog.allocations + index;
 		if (!record->pin || record->live) {
-			pr_warn("page: pages_finish record %zu invalid state (pin=%p live=%d)\n",
+			pr_warn("page: pages_finish record %zu invalid state (pin=%p live=%zu)\n",
 				index, record->pin, record->live);
 			link = &record->next;
 			continue;
