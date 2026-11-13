@@ -29,9 +29,18 @@ struct Control {
     hardwired: u16,
 }
 
+/// PCI Express capability device/port types (PCIe 6.0 section 7.5.3.2)
+/// whose bridge may forward transactions under a requester ID of its own.
+const PCIE_TO_PCI_BRIDGE: u8 = 0x7;
+const PCI_TO_PCIE_BRIDGE: u8 = 0x8;
+
 /// This plan describes PCI-level controls only. It conveys no physical
 /// ownership, engine stop, or authority to release old DMA or IRQ state.
-pub struct Plan(Vec<Control>);
+pub struct Plan {
+    controls: Vec<Control>,
+    /// The device/port type of the PCI Express capability, if any.
+    express_port: Option<u8>,
+}
 
 impl Plan {
     /// Census the function `read` reaches. `root_bus`: it sits on a root
@@ -42,7 +51,10 @@ impl Plan {
     ) -> Result<Self, ClaimError> {
         let reader = RefCell::new(read);
         let read = |offset, width| reader.borrow_mut()(offset, width);
-        let mut plan = Self(Vec::new());
+        let mut plan = Self {
+            controls: Vec::new(),
+            express_port: None,
+        };
         let command = read(regs::COMMAND, 2)? as u16;
         if command == u16::MAX {
             return Err(ClaimError::ReadFailed {
@@ -73,9 +85,8 @@ impl Plan {
             command & !regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE,
             regs::command_optional_bits(pin),
         )?;
-        plan.0[0].hardwired = hardwired;
+        plan.controls[0].hardwired = hardwired;
 
-        let mut express = false;
         let mut seen = 0u32;
         for entry in Capabilities::new(Transport(read)) {
             let entry = entry?;
@@ -83,10 +94,7 @@ impl Plan {
             let (relative, mut clear, event) = match id {
                 MSI => (2, 1, 0),
                 MSIX => (2, 1 << 15, 0),
-                PCIE => {
-                    express = true;
-                    (8, 1 << 11, 0)
-                }
+                PCIE => (8, 1 << 11, 0),
                 _ => continue,
             };
             if entry.layout != Layout::Sized {
@@ -97,12 +105,14 @@ impl Plan {
             }
             record_capability(&mut seen, id, entry.offset, relative, entry.bytes)?;
             if id == PCIE {
-                clear |= device_control_reset(read(entry.offset + 2, 2)? as u16);
+                let flags = read(entry.offset + 2, 2)?;
+                plan.express_port = Some((flags >> 4 & 0xf) as u8);
+                clear |= device_control_reset(flags as u16);
             }
             plan.disable(read, entry.offset + relative, clear, event)?;
         }
 
-        if express && read(0x100, 4)? != u32::MAX {
+        if plan.express_port.is_some() && read(0x100, 4)? != u32::MAX {
             let mut seen = 0u32;
             for entry in ExtendedCapabilities::new(Transport(read)) {
                 let entry = entry?;
@@ -156,13 +166,13 @@ impl Plan {
         disabled: u16,
         optional: u16,
     ) -> Result<(), ClaimError> {
-        if self.0.iter().any(|control| control.offset == offset) {
+        if self.controls.iter().any(|control| control.offset == offset) {
             return Err(ClaimError::MalformedCapability { offset });
         }
-        self.0
+        self.controls
             .try_reserve(1)
             .map_err(|_| ClaimError::Mapping(MappingError::Exhausted))?;
-        self.0.push(Control {
+        self.controls.push(Control {
             offset,
             original,
             disabled,
@@ -172,10 +182,24 @@ impl Plan {
         Ok(())
     }
 
+    /// Whether this function, as a bridge, passes on the requester ID of
+    /// each function below it unchanged, so each keeps a remapping context
+    /// of its own. A PCI Express root port, switch port or port of any other
+    /// type does. A PCI Express to PCI/PCI-X bridge, a PCI/PCI-X to PCI
+    /// Express bridge and a bridge without a PCI Express capability may
+    /// take over the transactions of the functions below it under an ID of
+    /// its own, as Linux's `pci_for_each_dma_alias` assumes.
+    pub fn keeps_requester_ids(&self) -> bool {
+        !matches!(
+            self.express_port,
+            None | Some(PCIE_TO_PCI_BRIDGE | PCI_TO_PCIE_BRIDGE)
+        )
+    }
+
     /// Does this exact write narrow one observed control?
     pub fn permits(&self, offset: u16, width: usize, value: u32) -> bool {
         width == 2
-            && self.0.iter().any(|control| {
+            && self.controls.iter().any(|control| {
                 control.offset == offset
                     && control.original != control.disabled
                     && u32::from(control.disabled) == value
@@ -185,7 +209,7 @@ impl Plan {
     /// Preflight every old control before issuing any write to this function.
     /// Recheck each changed word and retain the last write on a later refusal.
     pub fn apply(&self, config: &mut impl ConfigSpace) -> Result<ConfigEffect, ConfigError> {
-        for &control in &self.0 {
+        for &control in &self.controls {
             verify(
                 control.offset,
                 control.original,
@@ -194,7 +218,7 @@ impl Plan {
             )?;
         }
         let mut effect = ConfigEffect::None;
-        for &control in &self.0 {
+        for &control in &self.controls {
             if control.original != control.disabled {
                 config
                     .write16(control.offset, control.disabled)
@@ -229,7 +253,7 @@ impl Plan {
         &self,
         mut read: impl FnMut(u16) -> Result<u16, ConfigError>,
     ) -> Result<(), ConfigError> {
-        for control in &self.0 {
+        for control in &self.controls {
             control.verify_disabled(read(control.offset)?)?;
         }
         Ok(())
@@ -242,7 +266,7 @@ impl Plan {
     /// once the seal proves it hard-wired; anything else is refused.
     pub fn seal(&self, config: &mut impl MasterSeal) -> Result<(), ConfigError> {
         self.check_disabled(|offset| config.read16(offset))?;
-        let hardwired = self.0.iter().find(|control| {
+        let hardwired = self.controls.iter().find(|control| {
             control.offset == regs::COMMAND && control.hardwired & regs::COMMAND_MASTER != 0
         });
         if let Some(command) = hardwired

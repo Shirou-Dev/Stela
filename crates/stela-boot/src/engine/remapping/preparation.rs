@@ -248,7 +248,7 @@ impl Remappers {
             // fabric is empty and no root can block or translate this RID.
             // The parked master seal holds, and the kept line paths and
             // source exclude every other configuration and topology writer.
-            let config = unsafe { source.promote_cold_config(address, lines, || Ok(())) }
+            let config = unsafe { source.promote_cold_config(address, lines, || Ok(()), false) }
                 .map_err(PreparationError::Configuration)?;
             Ok((config, lines.clone()))
         })())
@@ -279,8 +279,9 @@ impl Remappers {
             // SAFETY: the complete original AMD fabric is blocked, the
             // selected unit owns this exact entry, and the kept line/source
             // owners exclude prior configuration and topology writers.
-            let config = unsafe { source.promote_cold_config(address, lines, || root.check()) }
-                .map_err(PreparationError::Configuration)?;
+            let config =
+                unsafe { source.promote_cold_config(address, lines, || root.check(), true) }
+                    .map_err(PreparationError::Configuration)?;
             return Ok((config, Box::new(root)));
         }
         let taken = self
@@ -300,12 +301,17 @@ impl Remappers {
         // and this slot's exact firmware route. Legacy probing is read-only
         // while this fabric is active, and AML's ECAM writers are excluded.
         let config = unsafe {
-            source.promote_cold_config(address, lines, || {
-                if blocked.requester() != rid {
-                    return Err(DmaError::IommuUnavailable);
-                }
-                blocked.check()
-            })
+            source.promote_cold_config(
+                address,
+                lines,
+                || {
+                    if blocked.requester() != rid {
+                        return Err(DmaError::IommuUnavailable);
+                    }
+                    blocked.check()
+                },
+                true,
+            )
         }
         .map_err(PreparationError::Configuration)?;
         let root = Box::new(VtdRoot {

@@ -997,6 +997,31 @@ fn containment_plan_on(config: &Config, root_bus: bool) -> Result<containment::P
     )
 }
 
+/// Root, switch and other PCI Express ports pass requester IDs on; a
+/// PCI Express to PCI bridge, a PCI to PCI Express bridge and a bridge
+/// with no PCI Express capability may substitute their own.
+#[test]
+fn containment_plan_tells_which_bridges_keep_requester_ids() {
+    let mut conventional = endpoint();
+    let plan = containment_plan(conventional.config()).unwrap();
+    assert!(!plan.keeps_requester_ids());
+    for (port, keeps) in [
+        (0x4, true),
+        (0x5, true),
+        (0x6, true),
+        (0x0, true),
+        (0xb, true),
+        (0x7, false),
+        (0x8, false),
+    ] {
+        let mut function = endpoint();
+        cap(&mut function, 0x40, PCIE, 0);
+        function.config().write16(0x42, 2 | port << 4).unwrap();
+        let plan = containment_plan(function.config()).unwrap();
+        assert_eq!(plan.keeps_requester_ids(), keeps, "port type {port:#x}");
+    }
+}
+
 #[test]
 fn containment_only_writes_the_exact_disabled_command_and_msi_controls() {
     use crate::bus::pci::ConfigEffect;

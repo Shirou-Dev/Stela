@@ -7,7 +7,6 @@ use stela_drivers::bus::dma::mapping::DmaError;
 use stela_drivers::{
     bus::pci::{
         ConfigEffect, ConfigError, ConfigFailure,
-        capability::capabilities,
         owned::{
             ConfigParts, OwnedConfig, PreparedConfig, UnpublishedConfig,
             grant::{
@@ -277,7 +276,10 @@ impl fmt::Display for ContainmentError {
             }
             Cause::Topology(cause) => write!(f, "the PCI topology is inconsistent ({cause:?})"),
             Cause::BridgeForwarding => f.write_str("upstream bridge forwarding is unavailable"),
-            Cause::BridgeAlias => f.write_str("bridge DMA requester aliases are unqualified"),
+            Cause::BridgeAlias => f.write_str(
+                "this bridge may forward the DMA below it under its own requester ID, which \
+                 a remapping context for each function cannot follow",
+            ),
         }
     }
 }
@@ -458,6 +460,28 @@ struct Fabric {
 }
 
 impl Fabric {
+    /// Refuse a function whose DMA crosses a bridge that may forward it
+    /// under the bridge's own requester ID: a remapping context attached
+    /// for the function's own ID would not see that DMA.
+    fn check_requester_ids(&self, mut route: topology::Parent) -> Result<(), ContainmentError> {
+        while let topology::Parent::Bridge(address) = route {
+            let index = self
+                .slots
+                .binary_search_by_key(&address, |slot| slot.address)
+                .expect("original parent remains in the fabric");
+            let bridge = &self.slots[index];
+            if !bridge.plan.keeps_requester_ids() {
+                return Err(ContainmentError {
+                    address: Some(address),
+                    cause: Cause::BridgeAlias,
+                    effect: ConfigEffect::None,
+                });
+            }
+            route = bridge.route;
+        }
+        Ok(())
+    }
+
     fn check_upstream(&self, mut route: topology::Parent) -> Result<(), ContainmentError> {
         while let topology::Parent::Bridge(address) = route {
             let index = self
@@ -589,29 +613,6 @@ impl Header {
         }
         Ok(())
     }
-}
-
-// PCI Express root, upstream switch and downstream switch ports keep the
-// downstream requester ID. PCI/PCI-X translation can introduce DMA aliases
-// which the current single-RID attachment cannot grant.
-fn check_pcie_port(config: &UnpublishedConfig) -> Result<(), ContainmentError> {
-    const EXPRESS: u8 = 0x10;
-    const PORT_TYPE_MASK: u16 = 0xf0;
-    for entry in capabilities(config) {
-        let entry = entry.map_err(ClaimError::from)?;
-        if entry.id == EXPRESS {
-            let flags = config.try_read16(entry.offset + 2)?;
-            if matches!(flags & PORT_TYPE_MASK, 0x40 | 0x50 | 0x60) {
-                return Ok(());
-            }
-            break;
-        }
-    }
-    Err(ContainmentError {
-        address: None,
-        cause: Cause::BridgeAlias,
-        effect: ConfigEffect::None,
-    })
 }
 
 struct Input {
@@ -953,7 +954,9 @@ unsafe impl DriverCustody for SlotCustody {}
 impl Source {
     /// Take the original parked endpoint, preserving its grant and negative
     /// operation state. A refusal after taking it keeps the exact envelope in
-    /// the same slot and prevents a second attempt.
+    /// the same slot and prevents a second attempt. `translated`: the
+    /// endpoint's DMA will be remapped by its own requester ID, so a bridge
+    /// above it that may substitute another ID refuses it.
     ///
     /// # Safety
     /// The caller owns the original complete remapping fabric. The check
@@ -965,12 +968,25 @@ impl Source {
         address: Address,
         lines: &InitialPciLines,
         check_blocked: impl Fn() -> Result<(), DmaError>,
+        translated: bool,
     ) -> Result<OwnedConfig, ContainmentError> {
+        if translated {
+            let cohort = self.pci_slots.0.try_borrow().map_err(|_| Error::Busy)?;
+            let Cohort::Parked(fabric) = &*cohort else {
+                return Err(Error::Unavailable.into());
+            };
+            let index = fabric
+                .slots
+                .binary_search_by_key(&address, |slot| slot.address)
+                .map_err(|_| ContainmentError::from(Error::OutsideResource).at(address))?;
+            fabric.check_requester_ids(fabric.slots[index].route)?;
+        }
         // SAFETY: same original exclusive, blocked requester and line paths.
         unsafe { self.promote_parked(address, lines, check_blocked, false) }
     }
 
-    /// Restore only forwarding through one original PCIe port. Keep the
+    /// Restore only forwarding through one original bridge of any kind, as
+    /// Linux enables any Type 1 bridge above a driven function. Keep the
     /// routing seal, configuration owner and its original blocked context.
     ///
     /// # Safety
@@ -986,7 +1002,7 @@ impl Source {
     ) -> Result<(), ContainmentError> {
         let blocked: Box<dyn Fn() -> Result<(), DmaError>> = Box::new(check_blocked);
         // SAFETY: the caller keeps the original stopped descendant cohort,
-        // and this selects only the original Type1 port for the exact RID.
+        // and this selects only the original Type 1 bridge for the exact RID.
         let mut config = unsafe { self.promote_parked(address, lines, &blocked, true) }?;
         let result = (|| {
             let command = config.try_read16(COMMAND)? | COMMAND_MASTER;
@@ -1092,9 +1108,6 @@ impl Source {
                 .verify(|offset| config.try_read32(offset))
                 .and_then(|()| plan.check_disabled(|offset| config.try_read16(offset)))
             {
-                return Err(SlotRefusal::new(error, config.into_parts()));
-            }
-            if bridge && let Err(error) = check_pcie_port(&config) {
                 return Err(SlotRefusal::new(error, config.into_parts()));
             }
             // SAFETY: the parked map retired, this is its sole successor,
