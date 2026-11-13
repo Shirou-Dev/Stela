@@ -351,6 +351,104 @@ fn render_passes_replay_their_state_and_draws() {
     );
 }
 
+/// A pass the device refuses leaves a note naming why with its
+/// attachments; one whose image memory a job makes defers, answered
+/// `Pending`, and is no refusal: it leaves no note.
+#[test]
+fn refused_passes_note_why_and_deferred_ones_note_nothing() {
+    use crate::metal::{service::wire::NewBufferTextureRequest, vulkan::backend::Backend};
+    let mut service = service();
+    let connection = connect(&mut service);
+    let memory = &mut Memory::default();
+    let usage = (TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ).bits();
+    let buffer = super::cpu_buffer(&mut service, connection, 4096, StorageMode::Shared);
+    // An IOSurface's texture, over a buffer's rows.
+    let surface: TextureResponse = call(
+        &mut service,
+        connection,
+        Operation::NewBufferTexture,
+        &NewBufferTextureRequest {
+            buffer: buffer.handle,
+            descriptor: TextureDescriptorRecord {
+                usage,
+                ..texture(StorageMode::Shared)
+            },
+            offset: 0,
+            bytes_per_row: 256,
+            second_offset: 0,
+            second_bytes_per_row: 0,
+            surface_format: 0,
+        },
+        memory,
+    )
+    .unwrap();
+    let memoryless: TextureResponse = call(
+        &mut service,
+        connection,
+        Operation::NewTexture,
+        &TextureDescriptorRecord {
+            usage,
+            ..texture(StorageMode::Memoryless)
+        },
+        memory,
+    )
+    .unwrap();
+    let pass = |scratch_load: LoadAction| {
+        let mut begin = BeginRender::default();
+        begin.color_attachments[0].attachment = PassAttachmentRecord {
+            texture: surface.handle,
+            load_action: LoadAction::Load.raw(),
+            store_action: StoreAction::Store.raw(),
+            ..Default::default()
+        };
+        begin.color_attachments[1].attachment = PassAttachmentRecord {
+            texture: memoryless.handle,
+            load_action: scratch_load.raw(),
+            store_action: StoreAction::DontCare.raw(),
+            ..Default::default()
+        };
+        let mut stream = Stream::default();
+        stream.push(RenderCode::Begin.raw(), &begin, &[]).end();
+        stream
+    };
+
+    // Its first run makes the surface's storage copy, whose memory a job
+    // makes.
+    let lock = crate::metal::deferred::JobLock {
+        lock: alloc::sync::Arc::new(crate::metal::compiler::CompileLock::new()),
+        relax: || {},
+    };
+    let backend = service.device().backend();
+    backend.defer_pipelines(Some(&lock));
+    backend.image_gate = Some(alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(
+        true,
+    )));
+    let stream = pass(LoadAction::DontCare);
+    assert!(commit(&mut service, connection, &stream).is_err());
+    assert_eq!(service.noted, None);
+    let backend = service.device().backend();
+    backend.stop_deferring();
+    assert!(backend.take_job().is_some());
+    assert!(commit(&mut service, connection, &stream).is_ok());
+    assert_eq!(service.noted, None);
+
+    // Metal never loads a memoryless attachment.
+    let stream = pass(LoadAction::Load);
+    assert_eq!(
+        status(commit(&mut service, connection, &stream)),
+        Status::Invalid
+    );
+    let noted = service.noted.take().unwrap();
+    assert!(
+        noted.starts_with("PASS REFUSED (") && noted.contains("never loaded"),
+        "{noted}"
+    );
+    assert!(
+        noted.contains("color1=[Rgba8Unorm 8x4x1 samples=1 storage=Memoryless"),
+        "{noted}"
+    );
+}
+
 /// A render pass that draws through a linear sampler, then through a
 /// bicubic one, which needs a variant of its pipeline.
 fn bicubic_draws(service: &mut TestService, connection: core::num::NonZeroU64) -> Stream {

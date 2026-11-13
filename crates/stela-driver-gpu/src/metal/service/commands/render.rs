@@ -10,10 +10,12 @@ use crate::metal::{
         CommandBuffer,
         render::{PassBoundary, ScissorRect, Viewport},
     },
+    compiler::DEFERRED,
     device::{
         BufferId, ComputePipelineId, CounterBufferId, RenderPipelineId, TextureId,
         queue::{AttachmentRequest, RenderPassRequest},
     },
+    error::Error,
     pass::{AttachmentSlot, TileMemory},
     pipeline::MAX_COLOR_ATTACHMENTS,
     service::{
@@ -55,7 +57,11 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 let (record, data) = payload.split::<BeginRender>()?;
                 let request = self.render_pass(connection, &record, data.bytes())?;
                 if let Err(error) = self.device.begin_render(commands, &request) {
-                    self.noted = Some(self.describe_pass(&request));
+                    // A deferral is no refusal: the call is answered
+                    // `Pending` and the pass begins when it runs again.
+                    if error != DEFERRED {
+                        self.noted = Some(self.describe_pass(&request, error));
+                    }
                     return Err(error.into());
                 }
             }
@@ -504,9 +510,10 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         })
     }
 
-    /// The color attachments of a refused pass, for the platform's log:
-    /// each texture and resolve texture as it was made, and the actions.
-    fn describe_pass(&self, request: &RenderPassRequest) -> String {
+    /// A refused pass, for the platform's log: why, its color attachments
+    /// (each texture and resolve texture as it was made, and the actions)
+    /// and its tile memory where the pass sets any.
+    fn describe_pass(&self, request: &RenderPassRequest, error: Error) -> String {
         use core::fmt::Write;
         let texture = |id: TextureId| {
             self.device.texture_descriptor(id).map_or_else(
@@ -525,7 +532,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 },
             )
         };
-        let mut text = String::from("PASS REFUSED");
+        let mut text = format!("PASS REFUSED ({})", Fault::from(error));
         for (index, attachment) in request.color_attachments.iter().enumerate() {
             let Some(attachment) = attachment else {
                 continue;
@@ -541,6 +548,17 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 let _ = write!(text, " resolve={}", texture(resolve));
             }
             text.push(']');
+        }
+        let tile = request.tile_memory;
+        if tile != TileMemory::default() {
+            let _ = write!(
+                text,
+                " tile={}x{} threadgroup={} imageblock={}",
+                tile.width,
+                tile.height,
+                tile.threadgroup_memory_length,
+                tile.imageblock_sample_length
+            );
         }
         text
     }
