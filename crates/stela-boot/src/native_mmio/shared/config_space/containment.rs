@@ -20,6 +20,8 @@ use stela_drivers::{
     sync::{FaultState, FirstFault},
 };
 
+mod bus_reset;
+
 /// The captured native fabric with PCI command, interrupt and requester
 /// controls contained and its original writable maps retired.
 pub(crate) struct ContainedPci<'a> {
@@ -370,6 +372,9 @@ struct Slot {
     ancestor: Parent,
     route: topology::Parent,
     forwarding: Option<Forwarding>,
+    /// The writes a bus reset admits through this parked function's
+    /// custody: its state saved before the reset, each written back once.
+    restore: Rc<RefCell<Vec<(u16, u8, u32)>>>,
 }
 
 impl Slot {
@@ -933,6 +938,23 @@ struct SlotCustody {
     window: EcamWindow,
     plan: Rc<Plan>,
     driver_lines: Option<InitialPciLines>,
+    /// See [`Slot::restore`].
+    restore: Rc<RefCell<Vec<(u16, u8, u32)>>>,
+}
+
+impl SlotCustody {
+    /// Consume the bus reset's admission of exactly this write.
+    fn take_restore(&self, offset: u16, width: usize, value: u32) -> bool {
+        let mut restore = self.restore.borrow_mut();
+        let Some(at) = restore
+            .iter()
+            .position(|&admitted| admitted == (offset, width as u8, value))
+        else {
+            return false;
+        };
+        restore.remove(at);
+        true
+    }
 }
 
 // SAFETY: the census issues one exact slot from the original aperture
@@ -959,6 +981,7 @@ unsafe impl ConfigCustody for SlotCustody {
                 value,
             } = operation
             && !self.plan.permits(offset, width, value)
+            && !self.take_restore(offset, width, value)
         {
             return Err(ConfigError::before_effect(
                 ConfigFailure::UnqualifiedControl,
@@ -1377,6 +1400,7 @@ impl Source {
             self.reservation_under(input.span, ResourceKind::Configuration, parent)?;
         let ancestor = original.parent();
         let close = original.admission_close();
+        let restore = Rc::new(RefCell::new(Vec::new()));
         let owner = Box::new(SlotCustody {
             completion: Arc::new(Completion {
                 epoch: Epoch {
@@ -1391,6 +1415,7 @@ impl Source {
             window: input.window,
             plan: input.plan.clone(),
             driver_lines: None,
+            restore: restore.clone(),
         });
         // SAFETY: the same affine slot backs the bounded operation and map.
         let grant = unsafe { PrepublicationGrant::from_boxed(owner, close) };
@@ -1403,6 +1428,7 @@ impl Source {
             ancestor,
             route,
             forwarding: None,
+            restore,
         })
     }
 

@@ -26,7 +26,7 @@ use stela_drivers::{
             power::Timer,
             requester::{
                 ClaimError, FunctionRole, RequesterBinding,
-                preparation::{AttachmentBackend, DetachError, Root},
+                preparation::{AttachmentBackend, BusReset, DetachError, Root},
             },
         },
         thunderbolt::manager::{Platform, Uuid},
@@ -39,7 +39,7 @@ use stela_drivers::{
 static PASSTHROUGH_REPORTED: AtomicBool = AtomicBool::new(false);
 
 pub(super) struct Services<'a> {
-    mmio: &'a native_mmio::Source,
+    mmio: &'static native_mmio::Source,
     remappers: &'a super::remapping::Remappers,
     acpi: Option<&'static HostAcpi>,
     heap: core::ops::Range<u64>,
@@ -112,7 +112,7 @@ impl<'a> Services<'a> {
     /// allocator's pages at `heap`. The ACPI namespace is offered only once
     /// the i8042's interrupts are masked, as its port grant requires.
     pub(super) fn new(
-        mmio: &'a native_mmio::Source,
+        mmio: &'static native_mmio::Source,
         remappers: &'a super::remapping::Remappers,
         acpi: Option<&'static HostAcpi>,
         heap: core::ops::Range<u64>,
@@ -244,10 +244,19 @@ unsafe impl NativeServices for Services<'_> {
         // and admits snooped WB DMA. Complete stable inventory supplies role.
         // PCI containment here grants no endpoint engine stop or payload drain;
         // the owning driver must produce that receipt with BARs still kept.
-        unsafe { PreparingRequester::new(function, role, root) }.map_err(|rejected| {
-            let _root = core::mem::ManuallyDrop::new(rejected.root);
-            drop(rejected.function);
-            ServiceError::Claim(rejected.error)
+        let requester =
+            unsafe { PreparingRequester::new(function, role, root) }.map_err(|rejected| {
+                let _root = core::mem::ManuallyDrop::new(rejected.root);
+                drop(rejected.function);
+                ServiceError::Claim(rejected.error)
+            })?;
+        // SAFETY: the same original source owns the bridge above this
+        // function and excludes every other configuration writer.
+        Ok(unsafe {
+            requester.with_bus_reset(Box::new(ParentBus {
+                source: self.mmio,
+                address,
+            }))
         })
     }
 
@@ -441,6 +450,32 @@ unsafe impl NativeServices for Services<'_> {
             .ok_or(ServiceError::Refused(
                 "firmware memory lies beyond the identity map",
             ))
+    }
+}
+
+/// A cold requester's bus, reset through the original forwarding bridge
+/// above it.
+struct ParentBus {
+    source: &'static native_mmio::Source,
+    address: Address,
+}
+
+// SAFETY: the original source checks and resets only the forwarding bridge
+// directly above this address, with every other function on its bus parked
+// and unclaimed, restores those and rechecks the bridge
+// (`Source::reset_parent_bus`).
+unsafe impl BusReset for ParentBus {
+    fn available(&self) -> bool {
+        self.source.parent_bus_reset_available(self.address)
+    }
+    fn reset(
+        &mut self,
+        function: &mut Function<OwnedConfig>,
+        timer: &dyn Timer,
+    ) -> Result<(), stela_drivers::block::BlockError> {
+        // SAFETY: the function is this source's cold owner of the address,
+        // sealed by its preparation; the cold start sealed its CPU views.
+        unsafe { self.source.reset_parent_bus(self.address, function, timer) }
     }
 }
 
