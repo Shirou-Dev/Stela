@@ -705,6 +705,26 @@ pub(super) unsafe fn take(
         });
     let started_blocked = taken.iter().any(|unit| unit.claims.is_some());
     outcome.fabric = started_blocked.then_some(complete);
+    // With every unit off, the policy takes units only for a complete
+    // blocked fabric. A unit that failed after it started leaves the rest
+    // short of one, with the IOAPICs and every native device refused, so
+    // the taken units stop too and `settle` leaves the machine untranslated
+    // when all read off, as when the policy leaves them all.
+    if !complete && units_off && !outcome.uncertain {
+        for taken in core::mem::take(&mut outcome.units) {
+            // No driver has started, so no domain or preparation holds the
+            // unit and every requester's Bus Master stays stopped since the
+            // original census.
+            let stopped = Rc::try_unwrap(taken.unit).map(|unit| retire(unit.into_inner()));
+            if !matches!(stopped, Ok(true)) {
+                outcome.uncertain = true;
+                output::arguments(format_args!(
+                    "HOST IOMMU AMD-Vi unit at {} did not stop after the blocked fabric fell short\n",
+                    taken.own
+                ));
+            }
+        }
+    }
     outcome
 }
 
