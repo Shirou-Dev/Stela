@@ -43,6 +43,9 @@ pub(crate) struct Services {
     query_variable_info: u64,
     /// This boot's number in the USB's log; 0 without one.
     boot: u64,
+    /// One more than the firmware entry this start came from
+    /// (`BootCurrent`, section 3.3); 0 where the firmware names none.
+    entry: u64,
 }
 
 impl Services {
@@ -62,10 +65,18 @@ impl Services {
         if runtime.header.revision < Revision::EFI_2_00 {
             return Self::default();
         }
+        let entry = runtime::get_variable_boxed(
+            uefi::cstr16!("BootCurrent"),
+            &VariableVendor::GLOBAL_VARIABLE,
+        )
+        .ok()
+        .and_then(|(value, _)| <[u8; 2]>::try_from(&*value).ok())
+        .map_or(0, |value| u64::from(u16::from_le_bytes(value)) + 1);
         Self {
             set_variable: runtime.set_variable as usize as u64,
             query_variable_info: runtime.query_variable_info as usize as u64,
             boot: 0,
+            entry,
         }
     }
 }
@@ -73,6 +84,7 @@ impl Services {
 static SET_VARIABLE: AtomicU64 = AtomicU64::new(0);
 static QUERY_VARIABLE_INFO: AtomicU64 = AtomicU64::new(0);
 static BOOT: AtomicU64 = AtomicU64::new(0);
+static ENTRY: AtomicU64 = AtomicU64::new(0);
 /// The root the firmware's services are called in; zero for the tables
 /// the processor has, the firmware's own.
 static ROOT: AtomicU64 = AtomicU64::new(0);
@@ -83,6 +95,7 @@ static ROOT: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn arm(services: Services, root: Option<u64>) {
     ROOT.store(root.unwrap_or(0), Ordering::Relaxed);
     BOOT.store(services.boot, Ordering::Relaxed);
+    ENTRY.store(services.entry, Ordering::Relaxed);
     QUERY_VARIABLE_INFO.store(services.query_variable_info, Ordering::Relaxed);
     SET_VARIABLE.store(services.set_variable, Ordering::Release);
 }
@@ -104,7 +117,48 @@ pub(crate) fn services() -> Services {
         set_variable: SET_VARIABLE.load(Ordering::Acquire),
         query_variable_info: QUERY_VARIABLE_INFO.load(Ordering::Relaxed),
         boot: BOOT.load(Ordering::Relaxed),
+        entry: ENTRY.load(Ordering::Relaxed),
     }
+}
+
+/// Ask the firmware to start the entry this start came from at the next
+/// start (`BootNext`), for a restart macOS asked for: the firmware's own
+/// order may put another system first, and a restart must come back here.
+/// The entry's number where the firmware took it; nothing is asked where the
+/// firmware named no entry or its services are out of reach.
+pub(crate) fn return_at_restart() -> Option<u16> {
+    /// `EFI_VARIABLE_NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS`.
+    const BOOT_NEXT_ATTRIBUTES: u32 = 0x7;
+    let entry = u16::try_from(ENTRY.load(Ordering::Relaxed).checked_sub(1)?).ok()?;
+    let set = SET_VARIABLE.load(Ordering::Acquire) as usize;
+    if set == 0 {
+        return None;
+    }
+    // SAFETY: the firmware's entry, as `Services::capture` read it from its
+    // runtime services table; code addresses fit a pointer.
+    let set = unsafe { core::mem::transmute::<usize, SetVariable>(set) };
+    let name = uefi::cstr16!("BootNext");
+    let value = entry.to_le_bytes();
+    let store = || {
+        // SAFETY: a runtime service, in the tables its regions are mapped
+        // in; the name, GUID and data outlive the call.
+        unsafe {
+            set(
+                name.as_ptr().cast(),
+                &VariableVendor::GLOBAL_VARIABLE.0,
+                BOOT_NEXT_ATTRIBUTES,
+                value.len(),
+                value.as_ptr(),
+            )
+        }
+    };
+    let status = match ROOT.load(Ordering::Relaxed) {
+        0 => store(),
+        // SAFETY: the loader's live root, which `arm` was given with the
+        // engine's handoff; the restart resumes nothing here.
+        root => unsafe { crate::engine::in_loader_root_at_stop(root, store) },
+    };
+    (status == SUCCESS).then_some(entry)
 }
 
 /// No stop has tried to write the record.
