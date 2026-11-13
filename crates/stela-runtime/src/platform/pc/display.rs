@@ -13,7 +13,11 @@
 //! display can run, the panel's native resolution, the preferred timing of
 //! its EDID ([`native`]), when the firmware offers it. It never takes a mode
 //! larger than one the panel is known to show: without that mode it takes
-//! the largest within it, and without an EDID it keeps the firmware's mode,
+//! the largest within it that has the panel's shape ([`same_shape`]),
+//! because a monitor stretches any other picture over its whole panel (a
+//! firmware on a 3840x2160 panel that lists 1920x1440 above 1920x1080
+//! showed macOS a third too wide), and only when no mode has that shape the
+//! largest of any. Without an EDID it keeps the firmware's mode,
 //! which the firmware set up on that panel, because a firmware may list
 //! modes the panel cannot show (QEMU's OVMF lists 2048x2048 on any display).
 //!
@@ -50,9 +54,12 @@ impl Mode {
 pub enum Reason {
     /// The panel's EDID prefers its resolution.
     Native,
-    /// The largest mode within the panel's native resolution, which no
-    /// usable mode has.
+    /// The largest mode of the panel's shape within its native resolution,
+    /// which no usable mode has.
     WithinNative,
+    /// No usable mode has the panel's shape: the largest within its native
+    /// resolution, which the monitor may stretch.
+    OtherShape,
     /// No EDID: the firmware's mode.
     Firmware,
     /// No EDID, and the guest cannot run the firmware's mode: the largest
@@ -64,7 +71,12 @@ impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Reason::Native => "the panel's native resolution",
-            Reason::WithinNative => "the largest mode within the panel's native resolution",
+            Reason::WithinNative => {
+                "the largest mode of the panel's shape within its native resolution"
+            }
+            Reason::OtherShape => {
+                "the largest mode within the panel's native resolution; none has the panel's shape, so the monitor may stretch the picture"
+            }
             Reason::Firmware => "the firmware's mode, as no EDID names the panel's",
             Reason::WithinFirmware => "the largest mode within the firmware's",
         })
@@ -155,9 +167,20 @@ pub fn guest_takes_at(width: u32, height: u32, refresh: u32) -> bool {
     .is_ok()
 }
 
+/// Whether a `width` by `height` picture has the shape of `panel` within
+/// 1%, so 1366x768 counts on a 16:9 panel.
+fn same_shape((width, height): (u32, u32), panel: (u32, u32)) -> bool {
+    let (a, b) = (
+        u64::from(width) * u64::from(panel.1),
+        u64::from(height) * u64::from(panel.0),
+    );
+    a.abs_diff(b) * 100 <= a.max(b)
+}
+
 /// The mode to run among `modes`, given the one in use (`current`) and the
 /// panel's native resolution when known: that resolution, else the
-/// firmware's, or the largest mode within it. Among equals the current mode
+/// firmware's, or the largest mode within it, one of its shape before any
+/// other. Among equals the current mode
 /// wins, then the lowest number, so a firmware already in the best mode is
 /// left alone. `None` when no such mode is drawable and fits the guest: the
 /// caller keeps the current one.
@@ -181,11 +204,14 @@ pub fn choose(modes: &[Mode], current: u32, native: Option<(u32, u32)>) -> Optio
     });
     // Lower ranks first: the current mode, then the lowest number.
     let rank = |mode: &Mode| (mode.index != current, mode.index);
-    let mode = usable.min_by_key(|mode| (Reverse(mode.pixels()), rank(mode)))?;
+    let shaped = |mode: &Mode| same_shape((mode.width, mode.height), bound);
+    let mode = usable.min_by_key(|mode| (!shaped(mode), Reverse(mode.pixels()), rank(mode)))?;
     let reason = if (mode.width, mode.height) == bound {
         exact
-    } else {
+    } else if shaped(mode) || native.is_none() {
         within
+    } else {
+        Reason::OtherShape
     };
     Some((*mode, reason))
 }
@@ -226,6 +252,37 @@ mod tests {
         reseal(&mut e);
         assert_eq!(physical_size(&e), None);
         assert_eq!(physical_size(&e[..64]), None);
+    }
+
+    #[test]
+    fn a_mode_of_the_panels_shape_wins_over_a_larger_one_the_monitor_would_stretch() {
+        // A 3840x2160 panel whose firmware lists 4:3 modes above 16:9 ones.
+        let modes = [
+            mode(0, 1920, 1440),
+            mode(1, 1600, 1200),
+            mode(2, 1920, 1080),
+            mode(3, 1366, 768),
+            mode(4, 1920, 1200),
+        ];
+        assert_eq!(
+            choose(&modes, 2, Some((3840, 2160))),
+            Some((modes[2], Reason::WithinNative))
+        );
+        // 1366x768 is 16:9 within a percent.
+        assert_eq!(
+            choose(&modes[3..], 4, Some((3840, 2160))),
+            Some((modes[3], Reason::WithinNative))
+        );
+        // Without a mode of that shape the largest runs, and says so.
+        assert_eq!(
+            choose(&modes[..2], 1, Some((3840, 2160))),
+            Some((modes[0], Reason::OtherShape))
+        );
+        // A 16:10 panel takes its own shape too.
+        assert_eq!(
+            choose(&modes, 0, Some((2560, 1600))),
+            Some((modes[4], Reason::WithinNative))
+        );
     }
 
     fn reseal(e: &mut [u8; 128]) {
@@ -300,7 +357,7 @@ mod tests {
         // A native resolution the firmware does not offer.
         assert_eq!(
             choose(&modes, 0, Some((1366, 768))),
-            Some((modes[0], Reason::WithinNative))
+            Some((modes[0], Reason::OtherShape))
         );
         assert_eq!(choose(&modes, 0, Some((640, 480))), None);
     }
@@ -332,7 +389,7 @@ mod tests {
         let modes = [mode(0, 1024, 768), blt_only, mode(2, 5120, 2880)];
         assert_eq!(
             choose(&modes, 0, Some((5120, 2880))),
-            Some((modes[0], Reason::WithinNative))
+            Some((modes[0], Reason::OtherShape))
         );
         assert_eq!(choose(&[blt_only], 1, None), None);
     }
@@ -350,7 +407,7 @@ mod tests {
         assert_eq!(choose(&modes, 7, native), Some((modes[0], Reason::Native)));
         assert_eq!(
             choose(&modes, 1, Some((1920, 1920))),
-            Some((modes[1], Reason::WithinNative))
+            Some((modes[1], Reason::OtherShape))
         );
     }
 }
