@@ -392,14 +392,14 @@ fn open_host(
         output::arguments(format_args!(
             "INSTALL OFFLINE macOS and Apple's signing answers are on the USB; no network is opened\n"
         ));
-        crate::status::info("Offline install: macOS and Apple's signing answers are on the USB");
     } else if options.install.is_some() {
-        crate::status::info(match remote_image {
-            true => {
-                "Network install: macOS downloads and Apple's signing server is asked during the install"
+        output::arguments(format_args!(
+            "INSTALL NETWORK {}\n",
+            match remote_image {
+                true => "macOS downloads and Apple's signing server is asked during the install",
+                false => "Apple's signing server is asked during the install",
             }
-            false => "Network install: Apple's signing server is asked during the install",
-        });
+        ));
     }
     let wants_network = (options.install.is_some() && !offline) || options.network_check.is_some();
     let mut devices = start_devices(
