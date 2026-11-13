@@ -152,6 +152,19 @@ impl Controller {
         }
     }
 
+    /// Linux `nvme_set_queue_count` for the one I/O queue pair this driver
+    /// runs. NVMe has the host set the Number of Queues before it creates
+    /// an I/O queue, and Linux does after every reset; a controller may
+    /// refuse a queue it was not asked for.
+    pub(super) fn queue_count_command(&self) -> [u32; 16] {
+        let mut command = [0u32; 16];
+        command[0] = u32::from(ADMIN_SET_FEATURES);
+        command[10] = FEATURE_QUEUE_COUNT;
+        // One submission and one completion queue, each count zero-based.
+        command[11] = 0;
+        command
+    }
+
     /// Linux `nvme_enable_aen`: enable the notices Linux handles.
     pub(super) fn events_command(&self) -> Option<[u32; 16]> {
         if self.events.supported == 0 {

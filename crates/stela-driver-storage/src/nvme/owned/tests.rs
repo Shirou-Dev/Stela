@@ -205,6 +205,13 @@ struct Model {
     mdts: u8,
     nvm_limits: Option<(u8, u32)>,
     nvm_identifies: usize,
+    /// Number of Queues features set; whether one was since the last
+    /// controller reset; refuse them; and refuse an I/O queue created
+    /// before one, with Invalid Field in Command.
+    queue_counts: usize,
+    queue_count_set: bool,
+    refuse_queue_count: bool,
+    queues_need_count: bool,
 }
 impl Model {
     fn new() -> Self {
@@ -283,6 +290,10 @@ impl Model {
             mdts: 0,
             nvm_limits: None,
             nvm_identifies: 0,
+            queue_counts: 0,
+            queue_count_set: false,
+            refuse_queue_count: false,
+            queues_need_count: true,
         }
     }
     fn registers_available(&self) -> bool {
@@ -488,6 +499,18 @@ impl Model {
                     status = 2;
                 }
             }
+            // Number of Queues: only before any I/O queue; one pair granted.
+            (0, 9) if command[10] == 0x07 => {
+                assert_eq!(command[11], 0);
+                assert_eq!(self.queues[1], (0, 0), "queue count after a queue");
+                self.queue_counts += 1;
+                if self.refuse_queue_count {
+                    status = 2;
+                } else {
+                    self.queue_count_set = true;
+                }
+            }
+            (0, 5 | 1) if self.queues_need_count && !self.queue_count_set => status = 2,
             (0, 9) if command[10] == 0x0b => self.event_configs.push(command[11]),
             (0, 2) => {
                 assert_eq!(command[1], u32::MAX);
@@ -803,6 +826,7 @@ unsafe impl Registers for Regs {
                         m.held_io.clear();
                         m.stopped = true;
                         m.fatal = false;
+                        m.queue_count_set = false;
                         m.queues[1] = (0, 0);
                         m.heads = [0; 2];
                         m.phases = [true; 2];
@@ -1140,6 +1164,46 @@ fn a_controller_that_never_becomes_ready_fails_within_its_bound() {
     let took_us = (Clock::ticks() - started) / 1000;
     assert!(took_us < 40_000, "{took_us}");
     assert!(budget.expired().is_some());
+}
+
+/// Linux `nvme_setup_io_queues` sets the Number of Queues before it creates
+/// an I/O queue, at probe and after every reset: a controller that refuses
+/// queues it was not asked for attaches and resets. A refused feature
+/// still tries the queues, whose refusal then fails the attach.
+#[test]
+fn the_queue_count_is_set_before_the_io_queues_like_nvme_set_queue_count() {
+    let f = Fixture::new();
+    let mut a = f.attach().unwrap();
+    assert_eq!(f.model.lock().unwrap().queue_counts, 1);
+    let disk = &mut a.namespaces[0];
+    disk.write(0, &[0x77; 512]).unwrap();
+    disk.controller.borrow_mut().reset_and_settle().unwrap();
+    {
+        let m = f.model.lock().unwrap();
+        assert_eq!(m.queue_counts, 2);
+        assert!(m.queue_count_set);
+    }
+    let mut data = [0; 512];
+    disk.read(0, &mut data).unwrap();
+    assert_eq!(data, [0x77; 512]);
+    disk.retire_owned().unwrap();
+
+    // Refused, by a controller that creates its queues anyway.
+    let f = Fixture::new();
+    {
+        let mut m = f.model.lock().unwrap();
+        m.refuse_queue_count = true;
+        m.queues_need_count = false;
+    }
+    let mut a = f.attach().unwrap();
+    assert_eq!(f.model.lock().unwrap().queue_counts, 1);
+    a.namespaces[0].write(0, &[1; 512]).unwrap();
+    a.namespaces[0].retire_owned().unwrap();
+
+    // Refused, and so are the queues.
+    let f = Fixture::new();
+    f.model.lock().unwrap().refuse_queue_count = true;
+    assert_eq!(f.attach().err(), Some(BlockError::Device { status: 2 }));
 }
 
 /// Linux `nvme_wait_ready` waits for CSTS.RDY alone: a controller showing

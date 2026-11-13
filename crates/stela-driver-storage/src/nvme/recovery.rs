@@ -219,6 +219,10 @@ impl Controller {
                     (Step::HostMemory, code) => self.host_memory_answered(code == 0),
                     // A refused feature is only logged.
                     (Step::HostOptions | Step::Apst | Step::Events, _) => {}
+                    // Every controller grants at least one queue pair. After
+                    // a refusal Linux creates no I/O queue; here the queue's
+                    // creation is still tried, and reports its own refusal.
+                    (Step::QueueCount, _) => {}
                     (Step::CreateCompletion | Step::CreateSubmission, 0) => {}
                     (_, status) => return Err(BlockError::Device { status }),
                 }
@@ -245,6 +249,7 @@ impl Controller {
                     None => None,
                 },
                 Step::HostMemory => self.host_memory_command()?,
+                Step::QueueCount => Some(self.queue_count_command()),
                 Step::CreateCompletion => Some(self.create_queue(false)?),
                 Step::CreateSubmission => {
                     self.io.submissions.publish();

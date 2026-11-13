@@ -99,6 +99,9 @@ const ADMIN_ASYNC_EVENT: u8 = 0x0c;
 /// One MSI-X table entry: message address, data and vector control.
 const MSIX_ENTRY_BYTES: u64 = 16;
 /// Autonomous Power State Transition (NVMe Base 2.1 5.27.1.6).
+/// Number of Queues: CDW11 asks the I/O submission and completion queue
+/// counts, zero-based.
+const FEATURE_QUEUE_COUNT: u32 = 0x07;
 const FEATURE_APST: u32 = 0x0c;
 /// Asynchronous Event Configuration, and the notices Linux enables from
 /// OAES (`NVME_AEN_SUPPORTED`): namespace attributes, firmware activation,
@@ -521,7 +524,8 @@ enum Tag {
 /// The admin commands bringing a controller up, as Linux's
 /// `nvme_reset_work` runs them after every reset and probe runs them once:
 /// `nvme_init_ctrl_finish`'s Identify, host options and APST,
-/// `nvme_setup_host_mem`, the I/O queues and `nvme_start_ctrl`'s events.
+/// `nvme_setup_host_mem`, `nvme_setup_io_queues`' queue count and I/O
+/// queues, and `nvme_start_ctrl`'s events.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Step {
     Identify,
@@ -530,17 +534,20 @@ enum Step {
     HostOptions,
     Apst,
     HostMemory,
+    /// `nvme_set_queue_count`'s Set Features, before any I/O queue.
+    QueueCount,
     CreateCompletion,
     CreateSubmission,
     Events,
 }
 
-const STEPS: [Step; 8] = [
+const STEPS: [Step; 9] = [
     Step::Identify,
     Step::Limits,
     Step::HostOptions,
     Step::Apst,
     Step::HostMemory,
+    Step::QueueCount,
     Step::CreateCompletion,
     Step::CreateSubmission,
     Step::Events,

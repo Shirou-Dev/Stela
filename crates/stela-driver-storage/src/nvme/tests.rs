@@ -918,10 +918,11 @@ fn a_command_past_its_deadline_is_aborted_then_resets_the_controller_and_runs_ag
         assert!(matches!(controller.recovery, Some(Recovery::Enabling(_))));
         controller.registers.write32(STATUS, READY).unwrap();
     }
-    // Ready: identified, then the I/O queues created again, completion
-    // queue first.
+    // Ready: identified, then the queue count set and the I/O queues
+    // created again, completion queue first.
     for opcode in [
         ADMIN_IDENTIFY,
+        ADMIN_SET_FEATURES,
         ADMIN_CREATE_COMPLETION,
         ADMIN_CREATE_SUBMISSION,
     ] {
