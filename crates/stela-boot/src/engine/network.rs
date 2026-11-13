@@ -105,6 +105,37 @@ impl RootLink {
             frames: Rc::default(),
         }
     }
+
+    /// Send `frame` inside the host drivers.
+    fn send(&mut self, frame: &[u8]) -> Result<(), LinkError> {
+        self.device
+            .transmit(frame)
+            .inspect(|()| Frames::count(&self.frames.sent))
+    }
+
+    /// The adapter's next frame, inside the host drivers.
+    fn arrived(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        self.device.receive().inspect(|frame| {
+            if frame.is_some() {
+                Frames::count(&self.frames.received);
+            }
+        })
+    }
+
+    /// [`Link::transmit`] for a service turn, which does not wait for the
+    /// host drivers' lock: `None` while another processor is inside them.
+    fn transmit_now(&mut self, frame: &[u8]) -> Option<Result<(), LinkError>> {
+        // SAFETY: as in `carrier`.
+        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        Some(self.send(frame))
+    }
+
+    /// [`Link::receive`] for a service turn, as [`Self::transmit_now`].
+    fn receive_now(&mut self) -> Option<Result<Option<Vec<u8>>, LinkError>> {
+        // SAFETY: as in `carrier`.
+        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        Some(self.arrived())
+    }
 }
 
 impl Drop for RootLink {
@@ -128,18 +159,12 @@ impl Link for RootLink {
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device
-            .transmit(frame)
-            .inspect(|()| Frames::count(&self.frames.sent))
+        self.send(frame)
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.receive().inspect(|frame| {
-            if frame.is_some() {
-                Frames::count(&self.frames.received);
-            }
-        })
+        self.arrived()
     }
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
         // SAFETY: as in `carrier`.
@@ -676,12 +701,19 @@ impl GuestNetwork {
     /// Read frames from the host adapter while the guest's receive queue
     /// had `room` and nothing read earlier still waits, without the devices'
     /// lock: the adapter's MMIO and DMA can wait milliseconds on the host.
+    /// While another processor is inside the host drivers the frames wait
+    /// in the adapter's ring for the next turn: a turn does not wait for
+    /// the drivers' lock, which can be held for longer than a PE's exit
+    /// may take.
     pub fn receive(&mut self, room: bool) {
         if !room || !self.received.is_empty() {
             return;
         }
         while self.received.len() < RECEIVE_BURST {
-            match self.link.receive() {
+            let Some(received) = self.link.receive_now() else {
+                break;
+            };
+            match received {
                 Ok(Some(frame)) => self.received.push_back(frame),
                 Ok(None) => break,
                 Err(error) => {
@@ -717,15 +749,17 @@ impl GuestNetwork {
 
     /// Send in queue order and return the last sent frame's reusable
     /// storage. A full host ring keeps that frame and the ones after it for
-    /// the next turn, as Linux requeues a `NETDEV_TX_BUSY` frame.
+    /// the next turn, as Linux requeues a `NETDEV_TX_BUSY` frame, and so
+    /// does another processor inside the host drivers, whose lock a turn
+    /// does not wait for.
     pub fn transmit(&mut self, frames: Vec<Vec<u8>>) -> Option<Vec<u8>> {
         self.unsent.extend(frames);
         let mut reusable = None;
         while let Some(frame) = self.unsent.front() {
-            match self.link.transmit(frame) {
-                Ok(()) => {}
-                Err(LinkError::Busy) => break,
-                Err(error) => self.refuse(error.into()),
+            match self.link.transmit_now(frame) {
+                Some(Ok(())) => {}
+                None | Some(Err(LinkError::Busy)) => break,
+                Some(Err(error)) => self.refuse(error.into()),
             }
             reusable = self.unsent.pop_front();
         }
