@@ -176,7 +176,9 @@ fn a_dead_host_controller_disconnects_every_device_like_usb_hc_died() {
     let devices: Vec<_> = host.devices.iter().map(|d| (d.id, d.slot)).collect();
     assert_eq!(devices.len(), 3);
     assert!(!host.due());
+    assert!(!host.died());
     shared.borrow_mut().died();
+    assert!(host.died());
     assert!(host.due());
     let changes = host.poll(&mut dma, &firmware);
     let removed: Vec<_> = changes.removed.iter().map(|d| (d.id, d.slot)).collect();

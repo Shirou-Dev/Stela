@@ -67,6 +67,14 @@ pub struct Host {
     standing: Vec<(String, BlockError)>,
 }
 impl Host {
+    /// Whether the controller stopped answering commands (Linux
+    /// xhci_hc_died): none of its devices can be reached again without a
+    /// controller reset.
+    pub fn died(&self) -> bool {
+        self.controller
+            .try_borrow()
+            .is_ok_and(|c| matches!(c.hardware, hardware::State::Died))
+    }
     /// Transfer this inventory's unbound Address-state device to the
     /// forwarding adapter. A failed constructor keeps the exclusive claim:
     /// neither dropping a handle nor a copied descriptor authorizes rebinding.

@@ -1183,6 +1183,12 @@ pub struct Found {
     /// How long each root port took to debounce, reset and enumerate.
     pub probes: Vec<PortProbe>,
 }
+impl Found {
+    /// Whether the controller died while its devices started.
+    pub fn controller_died(&self) -> bool {
+        self.hosts.iter().any(Host::died)
+    }
+}
 
 /// Starts the controller at `function`, enumerates its devices and binds
 /// the class drivers.

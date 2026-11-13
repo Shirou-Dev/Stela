@@ -760,6 +760,11 @@ pub struct Devices {
 /// when a driver's per-step bounds would add up to more.
 pub const DEVICE_START_US: u64 = 30_000_000;
 
+/// Said when an xHCI controller died as its devices started and was reset
+/// and attached a second time.
+const XHCI_RESTARTED: &str = "xHCI: the controller stopped answering while its devices started; \
+                              Stela reset it and looked for its devices again";
+
 /// Why a Wi-Fi adapter is left alone.
 const NO_WIFI_NETWORK: &str = "Wi-Fi adapter stays off: no --wifi network";
 
@@ -1753,13 +1758,40 @@ pub unsafe fn probe_observed(
                 })
             } else if function.class == xhci::CLASS {
                 let minimum = minimum_for_function!().clone();
-                match xhci::attach_with_provider(
+                let mut attached = xhci::attach_with_provider(
                     &mut function,
                     handoff,
                     dma,
                     firmware,
                     minimum.clone(),
-                ) {
+                );
+                // A controller that stopped answering while its devices
+                // started has lost every device below it, the boot stick
+                // and the keyboard among them. Its reset starts it again,
+                // so it is attached once more. The first attachment's
+                // owners are kept, never dropped: their rings stay
+                // allocated and they touch no register again.
+                if let Ok(found) = &attached
+                    && found.controller_died()
+                {
+                    devices
+                        .warnings
+                        .push((address, Warning::Message(XHCI_RESTARTED)));
+                    if let Ok(found) = core::mem::replace(
+                        &mut attached,
+                        Err(BlockError::Unsupported("xHCI host controller died")),
+                    ) {
+                        core::mem::forget(found);
+                    }
+                    attached = xhci::attach_with_provider(
+                        &mut function,
+                        handoff,
+                        dma,
+                        firmware,
+                        minimum.clone(),
+                    );
+                }
+                match attached {
                     Ok(found) => devices.absorb_usb(Some(address), found, firmware),
                     Err(error) => {
                         start.quiesce(&mut function);
