@@ -80,6 +80,7 @@ pub mod staged_frame;
 pub mod storage;
 pub mod topology;
 pub mod tsc;
+pub mod usb_legacy;
 #[cfg(target_arch = "x86_64")]
 pub mod vtd;
 pub mod work_status;

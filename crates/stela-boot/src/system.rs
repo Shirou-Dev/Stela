@@ -803,6 +803,9 @@ fn load(
         boot_disk_bytes = take;
     }
     let (device_skips, device_needs) = device_starts(&system);
+    // Found now, through the firmware's own protocol; claimed as the first
+    // act after the firmware's exit.
+    let usb_legacy = crate::usb_legacy::find();
     crate::status::done("");
     let boot_heap = crate::ALLOCATOR.usage();
     output::arguments(format_args!(
@@ -847,7 +850,14 @@ fn load(
     }
     // The log is closed from here to the engine's start, so a freeze in
     // this step shows only on the screen: each part names itself there.
-    crate::status::progress("the firmware has left; its DMA remapping");
+    // Before anything stops a controller: firmware that still drives USB
+    // from system management mode hangs there when its controller's bus
+    // mastering ends under it (issue 36). Linux claims them this early too.
+    crate::status::progress("the firmware has left; its USB controllers");
+    // SAFETY: boot services ended above with interrupts off, the firmware's
+    // identity map is loaded and no Stela driver has started.
+    unsafe { usb_legacy.take(tsc_hz) };
+    crate::status::progress("the firmware's DMA remapping");
     // SAFETY: the firmware's identity map is still loaded, the APs idle in
     // firmware code, and no Stela driver or memory reuse has started.
     let inactive_firmware_units =
