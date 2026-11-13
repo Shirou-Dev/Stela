@@ -16,8 +16,27 @@ pub(crate) struct FirmwareUnits {
     complete: bool,
 }
 
-/// The complete original IOMMU inventory observed inactive at firmware exit.
-pub(crate) struct InactiveFirmwareUnits(Option<Units>);
+/// The complete original IOMMU inventory at firmware exit, twice: `found`
+/// when every unit was observed inactive as the firmware left it, which
+/// the proof for requesters that start blocked needs, and `off` when every
+/// unit is inactive now, found so or turned off by
+/// [`release_firmware_units`] with its status wait passed. Linux turns a
+/// unit the firmware left on off and carries on; so does the rest of the
+/// boot from `off`.
+pub(crate) struct InactiveFirmwareUnits {
+    found: Option<Units>,
+    off: Option<Units>,
+}
+
+fn matches_amd(units: &Units, ivrs: &stela_drivers::bus::dma::amd::ivrs::Ivrs<'_>) -> bool {
+    units.as_slice().len() == ivrs.units().count()
+        && units.as_slice().iter().all(|unit| {
+            unit.kind == Kind::AmdVi
+                && ivrs.units().any(|entry| {
+                    entry.id().segment == unit.segment && entry.mmio_address() == unit.base
+                })
+        })
+}
 
 impl InactiveFirmwareUnits {
     pub(crate) fn contains(&self, kind: Kind, segment: u16, base: u64) -> bool {
@@ -26,25 +45,33 @@ impl InactiveFirmwareUnits {
             segment,
             base,
         };
-        self.0
+        self.found
             .as_ref()
             .is_some_and(|units| units.as_slice().contains(&original))
     }
 
     pub(crate) fn matches_amd(&self, ivrs: &stela_drivers::bus::dma::amd::ivrs::Ivrs<'_>) -> bool {
-        self.0.as_ref().is_some_and(|units| {
-            units.as_slice().len() == ivrs.units().count()
-                && units.as_slice().iter().all(|unit| {
-                    unit.kind == Kind::AmdVi
-                        && ivrs.units().any(|entry| {
-                            entry.id().segment == unit.segment && entry.mmio_address() == unit.base
-                        })
-                })
-        })
+        self.found
+            .as_ref()
+            .is_some_and(|units| matches_amd(units, ivrs))
+    }
+
+    /// Every unit of `ivrs` is off now.
+    pub(crate) fn off_amd(&self, ivrs: &stela_drivers::bus::dma::amd::ivrs::Ivrs<'_>) -> bool {
+        self.off
+            .as_ref()
+            .is_some_and(|units| matches_amd(units, ivrs))
+    }
+
+    /// Every unit of `descriptors` is off now.
+    pub(crate) fn off_dmar(&self, descriptors: &[dmar::Drhd]) -> bool {
+        self.off
+            .as_ref()
+            .is_some_and(|units| units.matches_dmar(descriptors))
     }
 
     pub(crate) fn matches_dmar(&self, descriptors: &[dmar::Drhd]) -> bool {
-        self.0
+        self.found
             .as_ref()
             .is_some_and(|units| units.matches_dmar(descriptors))
     }
@@ -234,6 +261,8 @@ pub(crate) unsafe fn release_firmware_units(
 ) -> InactiveFirmwareUnits {
     let FirmwareUnits { units, complete } = inventory;
     let mut initially_inactive = complete;
+    // Every unit read and, where it was on, turned off below.
+    let mut off = complete;
     let opt_in = if units.dmar_flags & 4 != 0 {
         " (DMAR asks the OS to keep DMA protection on)"
     } else {
@@ -252,6 +281,7 @@ pub(crate) unsafe fn release_firmware_units(
             Found::Inactive => continue,
             Found::Unreadable => {
                 initially_inactive = false;
+                off = false;
                 output::arguments(format_args!(
                     "UNSUPPORTED host IOMMU {kind} unit {:#x} segment {} reads all ones: ignored\n",
                     unit.base, unit.segment,
@@ -280,5 +310,8 @@ pub(crate) unsafe fn release_firmware_units(
             );
         }
     }
-    InactiveFirmwareUnits(initially_inactive.then_some(units))
+    InactiveFirmwareUnits {
+        found: initially_inactive.then_some(units),
+        off: off.then_some(units),
+    }
 }

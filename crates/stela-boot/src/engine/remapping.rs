@@ -380,7 +380,7 @@ impl Remappers {
         let Some(table) = dmar else {
             let units_off = ivrs.as_ref().is_some_and(|ivrs| {
                 stela_drivers::bus::dma::amd::ivrs::Ivrs::parse(ivrs, amd::MAXIMUM_BLOCKS)
-                    .is_ok_and(|ivrs| inactive_firmware_units.matches_amd(&ivrs))
+                    .is_ok_and(|ivrs| inactive_firmware_units.off_amd(&ivrs))
             });
             remappers.settle(units_off && !uncertain);
             return remappers;
@@ -433,15 +433,17 @@ impl Remappers {
                 planned.push((*segment, index, decision, reserved));
             }
         }
+        let found_off = inactive_firmware_units.matches_dmar(&parsed.units);
         let candidates: Vec<Candidate> = planned
             .iter()
             .map(|(segment, _, decision, reserved)| Candidate {
                 segment: *segment,
                 decision: decision.clone(),
-                blockable: reserved.is_empty(),
+                // A blocked start needs the units found off, not turned off.
+                blockable: reserved.is_empty() && found_off,
             })
             .collect();
-        let units_off = inactive_firmware_units.matches_dmar(&parsed.units);
+        let units_off = inactive_firmware_units.off_dmar(&parsed.units);
         let modes = initial::modes(&candidates, &requesters, units_off);
         for ((_, index, decision, reserved), mode) in planned.into_iter().zip(modes) {
             let unit = &parsed.units[index];

@@ -367,10 +367,13 @@ pub(super) unsafe fn take(
             return outcome;
         }
     };
-    let units_off = inactive_firmware_units.is_some_and(|units| units.matches_amd(&ivrs));
+    // Off now, whether the firmware left them so or the boot turned them
+    // off at its exit; found off is what a blocked start needs.
+    let units_off = inactive_firmware_units.is_some_and(|units| units.off_amd(&ivrs));
+    let found_off = inactive_firmware_units.is_some_and(|units| units.matches_amd(&ivrs));
     // Requesters may start blocked only from a proven firmware state and
     // with no reserved region a requester still uses.
-    let blockable = units_off && ivrs.memory_definitions().next().is_none();
+    let blockable = found_off && ivrs.memory_definitions().next().is_none();
     let left = |base: u64, why: &dyn core::fmt::Debug| {
         output::arguments(format_args!(
             "HOST IOMMU AMD-Vi unit {base:#x} left untranslated: {why:?}\n"
