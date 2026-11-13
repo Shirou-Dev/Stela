@@ -1058,3 +1058,34 @@ fn a_window_never_waits_to_look_at_a_disk_another_owner_holds() {
     released.set(2);
     assert_eq!(window.finish(tag), Some(Ok(None)));
 }
+
+/// Another owner may take the disk between a window's `room` and its
+/// start: the start waits for it instead of refusing, as its caller found
+/// room (a NOR store failed on this, and the machine stopped).
+#[test]
+fn a_window_start_waits_for_an_owner_that_took_the_disk_after_room() {
+    extern crate std;
+    use std::{sync::mpsc, thread, time::Duration};
+    let disk = Shared::new(Box::new(RamDisk::new("raced", 8, 512)));
+    let mut window = disk.whole();
+    assert!(window.room());
+    let (taken, wait) = mpsc::channel();
+    let other = disk.clone();
+    let owner = thread::spawn(move || {
+        let _held = other.lock();
+        taken.send(()).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+    wait.recv().unwrap();
+    assert!(!window.room());
+    let tag = window.start(write(0, 1)).unwrap();
+    owner.join().unwrap();
+    let mut result = None;
+    for _ in 0..1000 {
+        result = window.finish(tag);
+        if result.is_some() {
+            break;
+        }
+    }
+    assert_eq!(result, Some(Ok(None)));
+}

@@ -619,7 +619,10 @@ impl Window {
     /// once unless `more` follow ([`BlockDevice::commit`]).
     fn submit(&mut self, command: Command, more: bool) -> Result<u32, BlockError> {
         let command = command.within(&self.identity, self.first)?;
-        if !self.room() {
+        // Only the window's own depth refuses. Another owner that took the
+        // disk since `room` answered is waited for: a start refused for it
+        // would fail a store whose caller had found room.
+        if self.started.len() >= WINDOW_DEPTH {
             return Err(BlockError::Protocol("the disk window queue is full"));
         }
         let ticket = self.disk.lock().submit(command, more);
