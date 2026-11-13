@@ -176,6 +176,69 @@ impl HostPower {
     }
 }
 
+/// Port accesses to the host's ACPI fixed hardware.
+pub trait Ports {
+    fn in8(&mut self, port: u16) -> u8;
+    fn out8(&mut self, port: u16, value: u8);
+    fn in16(&mut self, port: u16) -> u16;
+    fn out16(&mut self, port: u16, value: u16);
+    /// Write the caches back to memory before the machine sleeps (WBINVD).
+    fn flush_caches(&mut self);
+}
+
+impl HostPower {
+    /// Whether the firmware runs in ACPI mode (SCI_EN), where the power
+    /// button is the operating system's to answer. In legacy mode the
+    /// firmware's own handler keeps it.
+    pub fn acpi_mode(&self, ports: &mut impl Ports) -> bool {
+        self.pm1[0].is_some_and(|pm1a| ports.in16(pm1a.control) & SCI_ENABLE != 0)
+    }
+
+    /// Whether PWRBTN_STS is set in a PM1 status register, clearing it
+    /// where it is. The bit records a press of the button the chipset sees,
+    /// whichever button the FADT declares, and stays set until written.
+    pub fn take_power_button(&self, ports: &mut impl Ports) -> bool {
+        let mut pressed = false;
+        for block in self.blocks() {
+            if ports.in16(block.event) & POWER_BUTTON != 0 {
+                ports.out16(block.event, POWER_BUTTON);
+                pressed = true;
+            }
+        }
+        pressed
+    }
+
+    /// Enter S5 with the sleep types `(a, b)`, as Linux's
+    /// `acpi_hw_legacy_sleep` and `acpi_hw_extended_sleep` do: every GPE
+    /// disabled and every GPE and fixed event status cleared, so that no
+    /// pending event turns the machine straight back on, then the sleep
+    /// types and SLP_EN. Returns when the machine stayed on.
+    pub fn enter_soft_off(&self, ports: &mut impl Ports, (a, b): (u8, u8)) {
+        for (status, enable) in self.gpe.iter().flatten().flat_map(|gpe| gpe.registers()) {
+            ports.out8(enable, 0);
+            ports.out8(status, 0xff);
+        }
+        for block in self.blocks() {
+            ports.out16(block.event, ALL_FIXED_STATUS);
+        }
+        if let Some(registers) = self.sleep_registers {
+            ports.out8(registers.status, SLEEP_WAKE_STATUS);
+            ports.flush_caches();
+            ports.out8(registers.control, sleep_register_control(a));
+            return;
+        }
+        for (block, sleep_type) in self.blocks().zip([a, b]) {
+            let current = ports.in16(block.control);
+            ports.out16(block.control, sleep_type_control(current, sleep_type));
+        }
+        ports.flush_caches();
+        for (block, sleep_type) in self.blocks().zip([a, b]) {
+            let current = ports.in16(block.control);
+            ports.out16(block.control, sleep_control(current, sleep_type));
+        }
+    }
+}
+
 /// PM1x_CNT with S5's sleep type and SLP_EN clear, from its current
 /// value: written first, as Linux writes SLP_TYP before SLP_EN.
 pub fn sleep_type_control(current: u16, sleep_type: u8) -> u16 {
@@ -426,6 +489,100 @@ mod tests {
         table[RESET_REGISTER + 4..RESET_REGISTER + 12].copy_from_slice(&0xcf9u64.to_le_bytes());
         table[RESET_VALUE] = 0x06;
         table
+    }
+
+    /// Ports as a map of words, recording every write in order; a write
+    /// of ones to a PM1 status register clears those bits.
+    #[derive(Default)]
+    struct Board {
+        words: alloc::collections::BTreeMap<u16, u16>,
+        status: Vec<u16>,
+        writes: Vec<(u16, u16)>,
+        flushes: usize,
+    }
+
+    impl Ports for Board {
+        fn in8(&mut self, port: u16) -> u8 {
+            self.in16(port) as u8
+        }
+        fn out8(&mut self, port: u16, value: u8) {
+            self.out16(port, u16::from(value));
+        }
+        fn in16(&mut self, port: u16) -> u16 {
+            self.words.get(&port).copied().unwrap_or(0)
+        }
+        fn out16(&mut self, port: u16, value: u16) {
+            self.writes.push((port, value));
+            let word = self.words.entry(port).or_default();
+            if self.status.contains(&port) {
+                *word &= !value;
+            } else {
+                *word = value;
+            }
+        }
+        fn flush_caches(&mut self) {
+            self.flushes += 1;
+            self.writes.push((0, 0));
+        }
+    }
+
+    #[test]
+    fn a_press_is_read_once_from_the_status_and_only_in_acpi_mode_is_it_ours() {
+        let (power, _) = fadt(&q35()).unwrap();
+        let mut board = Board {
+            status: vec![0x600],
+            ..Board::default()
+        };
+        assert!(!power.acpi_mode(&mut board));
+        board.words.insert(0x604, SCI_ENABLE);
+        assert!(power.acpi_mode(&mut board));
+        assert!(!power.take_power_button(&mut board));
+        assert!(board.writes.is_empty());
+        // The button's bit beside the timer's, which stays.
+        board.words.insert(0x600, POWER_BUTTON | 1);
+        assert!(power.take_power_button(&mut board));
+        assert_eq!(board.words[&0x600], 1);
+        assert!(!power.take_power_button(&mut board));
+        // No PM1 block, as a FADT without one leaves it: never ACPI mode.
+        assert!(!HostPower::default().acpi_mode(&mut board));
+    }
+
+    #[test]
+    fn soft_off_quiets_every_event_then_writes_the_type_before_the_enable() {
+        let (mut power, _) = fadt(&q35()).unwrap();
+        let mut board = Board::default();
+        board.words.insert(0x604, SCI_ENABLE);
+        power.enter_soft_off(&mut board, (5, 0));
+        let gpe: Vec<(u16, u16)> = (0..8)
+            .flat_map(|i| [(0x628 + i, 0), (0x620 + i, 0xff)])
+            .collect();
+        assert_eq!(board.writes[..16], gpe[..]);
+        assert_eq!(
+            board.writes[16..],
+            [
+                (0x600, ALL_FIXED_STATUS),
+                (0x604, SCI_ENABLE | 5 << 10),
+                (0, 0),
+                (0x604, SCI_ENABLE | 5 << 10 | 1 << 13),
+            ]
+        );
+        // A hardware-reduced platform's sleep registers take it instead.
+        power.sleep_registers = Some(SleepRegisters {
+            control: 0x700,
+            status: 0x701,
+        });
+        power.gpe = [None; 2];
+        let mut board = Board::default();
+        power.enter_soft_off(&mut board, (5, 0));
+        assert_eq!(
+            board.writes,
+            [
+                (0x600, ALL_FIXED_STATUS),
+                (0x701, u16::from(SLEEP_WAKE_STATUS)),
+                (0, 0),
+                (0x700, u16::from(sleep_register_control(5))),
+            ]
+        );
     }
 
     #[test]

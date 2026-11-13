@@ -28,17 +28,13 @@
 use super::host;
 use crate::output;
 use core::arch::asm;
-use stela_runtime::pc::power::{
-    self, ALL_FIXED_STATUS, HostPower, POWER_BUTTON, ResetRegister, SCI_ENABLE, SLEEP_WAKE_STATUS,
-};
+use stela_runtime::pc::power::{HostPower, POWER_BUTTON, SCI_ENABLE};
 use stela_soc::machine::AppleDevices;
 
 /// The stop codes the hypervisor exit port reports.
 pub const RESTART_CODE: u32 = 0x15;
 pub const POWER_OFF_CODE: u32 = 0x17;
 
-const PCI_ADDRESS: u16 = 0xcf8;
-const PCI_DATA: u16 = 0xcfc;
 const KEYBOARD_STATUS: u16 = 0x64;
 const KEYBOARD_INPUT_FULL: u8 = 1 << 1;
 const KEYBOARD_PULSE_RESET: u8 = 0xfe;
@@ -269,16 +265,7 @@ impl HostPowerControl {
             return false;
         }
         self.looked = now;
-        let mut pressed = false;
-        for block in power.blocks() {
-            // SAFETY: the FADT's PM1 status registers.
-            unsafe {
-                if in16(block.event) & POWER_BUTTON != 0 {
-                    out16(block.event, POWER_BUTTON);
-                    pressed = true;
-                }
-            }
-        }
+        let pressed = power.take_power_button(&mut crate::stop::Io);
         if pressed {
             output::arguments(format_args!("POWER host button pressed\n"));
         }
@@ -294,7 +281,7 @@ impl HostPowerControl {
         match self.power.as_ref().and_then(|power| power.reset) {
             Some((register, value)) => {
                 // SAFETY: the FADT's reset register; the machine resets.
-                unsafe { write_reset(register, value) };
+                unsafe { crate::stop::write_reset(register, value) };
                 wait(self.tsc_hz, 500, || false);
                 output::arguments(format_args!(
                     "POWER the ACPI reset register did not reset the machine\n"
@@ -350,72 +337,12 @@ impl HostPowerControl {
         let Some((power, (a, b))) = soft_off else {
             output::fatal("the host has no ACPI S5 soft-off sequence or firmware power-off")
         };
-        // SAFETY: the FADT's GPE, PM1 and sleep registers, as Linux's
-        // `acpi_hw_legacy_sleep` and `acpi_hw_extended_sleep` write them;
-        // the machine powers off.
-        unsafe {
-            // No GPE may wake the machine, and no status left from before
-            // may turn it straight back on.
-            for (status, enable) in power.gpe.iter().flatten().flat_map(|gpe| gpe.registers()) {
-                out8(enable, 0);
-                out8(status, 0xff);
-            }
-            for block in power.blocks() {
-                out16(block.event, ALL_FIXED_STATUS);
-            }
-            if let Some(registers) = power.sleep_registers {
-                out8(registers.status, SLEEP_WAKE_STATUS);
-                asm!("wbinvd", options(nostack, preserves_flags));
-                out8(registers.control, power::sleep_register_control(a));
-            } else {
-                for (block, sleep_type) in power.blocks().zip([a, b]) {
-                    out16(
-                        block.control,
-                        power::sleep_type_control(in16(block.control), sleep_type),
-                    );
-                }
-                asm!("wbinvd", options(nostack, preserves_flags));
-                for (block, sleep_type) in power.blocks().zip([a, b]) {
-                    out16(
-                        block.control,
-                        power::sleep_control(in16(block.control), sleep_type),
-                    );
-                }
-            }
-        }
+        power.enter_soft_off(&mut crate::stop::Io, (a, b));
         wait(self.tsc_hz, 1000, || false);
         output::arguments(format_args!("POWER the host did not power off at S5\n"));
         if let Some(efi) = self.efi {
             efi.power_off();
         }
         output::fatal("the host did not power off at S5; its firmware may need _PTS")
-    }
-}
-
-/// # Safety
-///
-/// `register` is the FADT's reset register.
-unsafe fn write_reset(register: ResetRegister, value: u8) {
-    match register {
-        // SAFETY: the caller's register.
-        ResetRegister::Io(port) => unsafe { out8(port, value) },
-        ResetRegister::PciConfiguration {
-            device,
-            function,
-            offset,
-        } => {
-            let address = 1 << 31
-                | u32::from(device) << 11
-                | u32::from(function) << 8
-                | u32::from(offset & 0xfc);
-            let shift = u32::from(offset & 3) * 8;
-            // SAFETY: configuration mechanism 1 on bus 0, the caller's
-            // register; the other bytes of its dword are written back.
-            unsafe {
-                out32(PCI_ADDRESS, address);
-                let dword = in32(PCI_DATA) & !(0xff << shift) | u32::from(value) << shift;
-                out32(PCI_DATA, dword);
-            }
-        }
     }
 }

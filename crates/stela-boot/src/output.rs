@@ -13,7 +13,6 @@
 use crate::{console, serial::Serial};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
-    arch::asm,
     cell::RefCell,
     convert::Infallible,
     fmt::{self, Write},
@@ -914,11 +913,9 @@ pub(crate) fn early_fatal(message: &str) -> ! {
 
 fn halt(code: u32) -> ! {
     debug_exit(code);
-    loop {
-        // SAFETY: native mount termination runs at CPL0; after the debug-exit
-        // attempt no task resumes, so maskable interrupts remain disabled.
-        unsafe { asm!("cli", "hlt", options(nostack)) };
-    }
+    // After the debug-exit attempt no task resumes; the stop answers only
+    // the PC's power button.
+    crate::stop::wait()
 }
 
 /// Show `message` as the reason the mount stopped: as a failed step on

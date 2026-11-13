@@ -731,6 +731,9 @@ fn load(
     }
     let wall = read_rtc();
     let power = host_power();
+    if let Some(power) = &power {
+        crate::stop::arm(power, tsc_hz);
+    }
     let random_seed = match crate::entropy::retain_seed() {
         Ok((region, source)) => {
             output::arguments(format_args!("HOST entropy seeded source={source}\n"));

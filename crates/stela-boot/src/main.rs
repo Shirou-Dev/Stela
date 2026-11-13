@@ -56,6 +56,7 @@ mod random;
 mod selection;
 mod serial;
 mod status;
+mod stop;
 mod storage;
 mod system;
 mod tables;
