@@ -113,7 +113,10 @@ static void *alloc_coherent(struct device *dev, size_t size, dma_addr_t *address
 			    unsigned long attributes)
 {
 	unsigned int order = (unsigned int)get_order(size);
-	dev_info(dev, "alloc_coherent: size=%zu order=%u\n", size, order);
+	dev_info(dev, "alloc_coherent: size=%zu order=%u gfp=0x%x coherent=0x%llx mask=0x%llx\n",
+		 size, order, (unsigned int)gfp,
+		 (unsigned long long)dev->coherent_dma_mask,
+		 (unsigned long long)(dev->dma_mask ? *dev->dma_mask : 0));
 	struct page *page = alloc_pages(gfp | __GFP_ZERO, order);
 
 	if (!page) {
@@ -141,7 +144,10 @@ static struct page *alloc_pages_op(struct device *dev, size_t size, dma_addr_t *
 				   enum dma_data_direction dir, gfp_t gfp)
 {
 	unsigned int order = (unsigned int)get_order(size);
-	dev_info(dev, "alloc_pages_op: enter size=%zu order=%u dir=%d gfp=0x%x\n", size, order, (int)dir, (unsigned int)gfp);
+	dev_info(dev, "alloc_pages_op: enter size=%zu order=%u dir=%d gfp=0x%x coherent=0x%llx mask=0x%llx\n",
+		 size, order, (int)dir, (unsigned int)gfp,
+		 (unsigned long long)dev->coherent_dma_mask,
+		 (unsigned long long)(dev->dma_mask ? *dev->dma_mask : 0));
 	dev_info(dev, "alloc_pages_op: calling alloc_pages(0x%x, %u)...\n", (unsigned int)(gfp | __GFP_ZERO), order);
 	struct page *page = alloc_pages(gfp | __GFP_ZERO, order);
 	dev_info(dev, "alloc_pages_op: alloc_pages attempt 1 finished, page=%p\n", page);

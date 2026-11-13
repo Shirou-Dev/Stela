@@ -70,32 +70,65 @@ diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c b/drivers/gpu/drm/n
 index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..fd6608b8ebc48fd69a04ca480be735da33374b9b 100644
 --- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
 +++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
-@@ -85,19 +85,28 @@
+@@ -85,19 +85,61 @@
  	u32 loc, sig, cnt;
  	int ret;
  
-+	nvkm_info(subdev, "tu102_gsp_booter_ctor: %s starting (size %zu, data=%p)\n", name, blob ? blob->size : 0, blob ? blob->data : NULL);
++	if (!blob || !blob->data || blob->size < sizeof(*hdr)) {
++		nvkm_error(subdev, "tu102_gsp_booter_ctor: %s firmware is missing or too short\n", name);
++		return -EINVAL;
++	}
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: %s starting (size %zu, data=%p)\n", name, blob->size, blob->data);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: %s about to read the bin header\n", name);
  	hdr = nvfw_bin_hdr(subdev, blob->data);
-+	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 1: bin_hdr=%p (hdr_off=%u data_off=%u data_sz=%u)\n",
-+		  hdr, hdr ? hdr->header_offset : 0, hdr ? hdr->data_offset : 0, hdr ? hdr->data_size : 0);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 1: bin_hdr=%p (magic=0x%08x hdr_off=%u data_off=%u data_sz=%u)\n",
++		  hdr, hdr->bin_magic, hdr->header_offset, hdr->data_offset, hdr->data_size);
++	if (hdr->header_offset > blob->size || blob->size - hdr->header_offset < sizeof(*hshdr)) {
++		nvkm_error(subdev, "tu102_gsp_booter_ctor: %s header offset %u is outside %zu bytes\n",
++			   name, hdr->header_offset, blob->size);
++		return -EINVAL;
++	}
++	if (hdr->data_offset > blob->size || blob->size - hdr->data_offset < hdr->data_size) {
++		nvkm_error(subdev, "tu102_gsp_booter_ctor: %s data %u+%u is outside %zu bytes\n",
++			   name, hdr->data_offset, hdr->data_size, blob->size);
++		return -EINVAL;
++	}
  	hshdr = nvfw_hs_header_v2(subdev, blob->data + hdr->header_offset);
-+	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 2: hs_header=%p (patch_loc=%u patch_sig=%u num_sig=%u)\n",
-+		  hshdr, hshdr ? hshdr->patch_loc : 0, hshdr ? hshdr->patch_sig : 0, hshdr ? hshdr->num_sig : 0);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 2: hs_header=%p (sig_prod_off=%u sig_prod_sz=%u patch_loc=%u patch_sig=%u num_sig=%u)\n",
++		  hshdr, hshdr->sig_prod_offset, hshdr->sig_prod_size, hshdr->patch_loc,
++		  hshdr->patch_sig, hshdr->num_sig);
++	if (hshdr->patch_loc > blob->size - sizeof(u32) ||
++	    hshdr->patch_sig > blob->size - sizeof(u32) ||
++	    hshdr->num_sig > blob->size - sizeof(u32)) {
++		nvkm_error(subdev, "tu102_gsp_booter_ctor: %s signature fields are outside %zu bytes\n",
++			   name, blob->size);
++		return -EINVAL;
++	}
  	loc = *(u32 *)(blob->data + hshdr->patch_loc);
  	sig = *(u32 *)(blob->data + hshdr->patch_sig);
  	cnt = *(u32 *)(blob->data + hshdr->num_sig);
 +	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 3: loc=0x%08x sig=0x%08x cnt=%u, calling falcon_fw_ctor...\n",
 +		  loc, sig, cnt);
++	if (!cnt || hshdr->sig_prod_size % cnt) {
++		nvkm_error(subdev, "tu102_gsp_booter_ctor: %s signature count %u is invalid\n", name, cnt);
++		return -EINVAL;
++	}
++	if ((size_t)hshdr->sig_prod_offset + sig > blob->size ||
++	    blob->size - ((size_t)hshdr->sig_prod_offset + sig) < hshdr->sig_prod_size) {
++		nvkm_error(subdev, "tu102_gsp_booter_ctor: %s signature %zu+%u is outside %zu bytes\n",
++			   name, (size_t)hshdr->sig_prod_offset + sig, hshdr->sig_prod_size, blob->size);
++		return -EINVAL;
++	}
  
  	ret = nvkm_falcon_fw_ctor(func, name, subdev->device, true,
  				  blob->data + hdr->data_offset, hdr->data_size, falcon, fw);
-+	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 4: falcon_fw_ctor ret=%d\n", name, ret);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 4: falcon_fw_ctor ret=%d\n", ret);
  	if (ret)
  		goto done;
  
  	ret = nvkm_falcon_fw_sign(fw, loc, hshdr->sig_prod_size / cnt, blob->data,
  				  cnt, hshdr->sig_prod_offset + sig, 0, 0);
-+	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 5: falcon_fw_sign ret=%d\n", name, ret);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 5: falcon_fw_sign ret=%d\n", ret);
  	if (ret)
  		goto done;
  

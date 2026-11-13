@@ -81,11 +81,25 @@ void dma_unmap_sg_attrs(struct device *dev, struct scatterlist *sg, int nents,
 void *dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *dma_handle, gfp_t flag,
 		      unsigned long attrs)
 {
+	const struct dma_map_ops *ops;
+	void *result;
+
 	if (stela_linux_kernel_hosted())
 		return NULL;
+	ops = get_dma_ops(dev);
+	if (size >= PAGE_SIZE)
+		pr_info("dma_alloc_attrs: enter size=%zu gfp=0x%x coherent=0x%llx mask=0x%llx ops=%p alloc=%d alloc_pages_op=%d\n",
+			size, (unsigned int)flag,
+			(unsigned long long)dev->coherent_dma_mask,
+			(unsigned long long)(dev->dma_mask ? *dev->dma_mask : 0),
+			ops, ops->alloc != NULL, ops->alloc_pages_op != NULL);
 	/* The zone modifiers mean nothing here: the mask decides placement. */
 	flag &= ~(__GFP_DMA | __GFP_DMA32 | __GFP_HIGHMEM);
-	return get_dma_ops(dev)->alloc(dev, size, dma_handle, flag, attrs);
+	result = ops->alloc(dev, size, dma_handle, flag, attrs);
+	if (size >= PAGE_SIZE)
+		pr_info("dma_alloc_attrs: result=%p size=%zu dma=0x%llx\n", result, size,
+			(unsigned long long)(result ? *dma_handle : 0));
+	return result;
 }
 
 void dma_free_attrs(struct device *dev, size_t size, void *cpu_addr, dma_addr_t dma_handle,
@@ -102,13 +116,21 @@ struct page *dma_alloc_pages(struct device *dev, size_t size, dma_addr_t *dma_ha
 			     enum dma_data_direction dir, gfp_t gfp)
 {
 	const struct dma_map_ops *ops = get_dma_ops(dev);
+	struct page *page;
 
-	pr_info("dma_alloc_pages: enter size=%zu dir=%d gfp=0x%x ops=%p\n",
-		size, (int)dir, (unsigned int)gfp, ops);
+	pr_info("dma_alloc_pages: enter size=%zu dir=%d gfp=0x%x dev=%p ops=%p hosted=%d coherent=0x%llx mask=0x%llx alloc_pages_op=%d\n",
+		size, (int)dir, (unsigned int)gfp, dev, ops,
+		(int)stela_linux_kernel_hosted(),
+		(unsigned long long)dev->coherent_dma_mask,
+		(unsigned long long)(dev->dma_mask ? *dev->dma_mask : 0),
+		ops->alloc_pages_op != NULL);
 	if (stela_linux_kernel_hosted() || !ops->alloc_pages_op)
 		return NULL;
 	gfp &= ~(__GFP_DMA | __GFP_DMA32 | __GFP_HIGHMEM);
-	return ops->alloc_pages_op(dev, PAGE_ALIGN(size), dma_handle, dir, gfp);
+	page = ops->alloc_pages_op(dev, PAGE_ALIGN(size), dma_handle, dir, gfp);
+	pr_info("dma_alloc_pages: result page=%p size=%zu dma=0x%llx\n", page, size,
+		(unsigned long long)(page ? *dma_handle : 0));
+	return page;
 }
 
 /* Only pages dma_alloc_pages returned come back here, and it returns none

@@ -118,6 +118,17 @@ const DMA_LIMIT: u64 = (1 << 47) - 1;
 const START_SECONDS: u64 = 60;
 /// The longest idle wait while they do, which the timeout above is checked at.
 const WAIT_MICROS: u64 = 10_000;
+/// The GPU start deadline, in the Linux clock's nanoseconds, while its job
+/// runs. A single Linux task step outlives every pump budget, so a driver
+/// that waits on `ktime_get` inside one step could spin forever and never let
+/// `wait_for_child` see the deadline. Once this passes, [`Host::now_ns`]
+/// fast-forwards Linux time by [`GPU_START_TIME_JUMP_NS`], which ends every
+/// time-bounded driver wait instead of leaving the boot hung.
+static GPU_START_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
+/// Whether the deadline jump was reported, so it is logged once.
+static GPU_START_DEADLINE_REPORTED: AtomicBool = AtomicBool::new(false);
+/// The jump added once the start deadline passes, far beyond any driver wait.
+const GPU_START_TIME_JUMP_NS: i64 = 3_600 * 1_000_000_000;
 /// The longest one pump runs Linux between the boot PE's slices. What is
 /// still runnable stays pending for the next, so a busy driver shares the
 /// boot CPU with the guest and the host's devices instead of holding it.
@@ -443,7 +454,21 @@ impl Platform for Host {
                 .filter(|&now| now != i64::MAX)
                 .ok_or(WorkError::Exhausted)
         });
-        sample.unwrap_or_else(|error| output::fatal(format_args!("Linux clock failed: {error}")))
+        let now = sample
+            .unwrap_or_else(|error| output::fatal(format_args!("Linux clock failed: {error}")));
+        let deadline = GPU_START_DEADLINE_NS.load(Ordering::Acquire);
+        if deadline != 0 && now as u64 >= deadline {
+            if !GPU_START_DEADLINE_REPORTED.swap(true, Ordering::AcqRel) {
+                output::arguments(format_args!(
+                    "GPU START DEADLINE PASSED: fast-forwarding Linux time past {START_SECONDS}s\n"
+                ));
+            }
+            // The driver's waits compare two readings of this clock: a jump
+            // both makes an already-running wait expire and keeps the clock
+            // monotonic for the ones that start afterwards.
+            return now.saturating_add(GPU_START_TIME_JUMP_NS);
+        }
+        now
     }
 
     fn boottime_ns(&self) -> Result<u64, WorkError> {
@@ -1820,10 +1845,22 @@ fn mount_and_start(
     });
     // SAFETY: the ready original task broker keeps the callback and all
     // original owners until its genuine managed child has joined.
-    let pending = unsafe { threads.submit(job) }.map_err(|refusal| Error::Submit(refusal.error))?;
+    GPU_START_DEADLINE_REPORTED.store(false, Ordering::Release);
+    GPU_START_DEADLINE_NS.store(deadline, Ordering::Release);
+    let pending = match unsafe { threads.submit(job) } {
+        Ok(pending) => pending,
+        Err(refusal) => {
+            GPU_START_DEADLINE_NS.store(0, Ordering::Release);
+            return Err(Error::Submit(refusal.error));
+        }
+    };
     output::arguments(format_args!("GPU mount_and_start waiting for child (deadline={START_SECONDS}s)\n"));
     flush_gpu_log();
-    wait_for_child(runtime, threads, time, deadline, || pending.status().joined)?;
+    let waited = wait_for_child(runtime, threads, time, deadline, || pending.status().joined);
+    // The job has returned (or the wait gave up): Linux time no longer needs
+    // to be fast-forwarded, and the jump must not leak into later boots.
+    GPU_START_DEADLINE_NS.store(0, Ordering::Release);
+    waited?;
     output::arguments(format_args!("GPU mount_and_start child joined successfully\n"));
     flush_gpu_log();
     // SAFETY: physical return on the same dispatcher with the joined status.
