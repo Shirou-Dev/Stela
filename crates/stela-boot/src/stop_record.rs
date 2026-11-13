@@ -16,8 +16,8 @@ use core::{
     sync::atomic::{AtomicU8, AtomicU64, Ordering},
 };
 use stela_boot_core::stop_record::{
-    ATTRIBUTES, HEADER_NAME, Header, Kept, PIECES, Space, Tail, VENDOR, piece_name, pieces, read,
-    store_bytes,
+    ATTRIBUTES, HEADER_NAME, Header, Kept, PIECES, Space, Tail, VENDOR, fitting, piece_name,
+    pieces, read,
 };
 use uefi::{
     CStr16, Guid,
@@ -165,9 +165,7 @@ fn write(fill: impl FnOnce(&mut Tail)) -> bool {
     let lines = unsafe { &mut *LINES.0.get() };
     fill(lines);
     let text = lines.text();
-    let Some(header) = Header::of(BOOT.load(Ordering::Relaxed), text) else {
-        return false;
-    };
+    let boot = BOOT.load(Ordering::Relaxed);
     let store = || {
         let mut space = Space {
             maximum: 0,
@@ -184,9 +182,14 @@ fn write(fill: impl FnOnce(&mut Tail)) -> bool {
                 &mut space.largest,
             )
         };
-        if asked != SUCCESS || !space.takes(store_bytes(text.len())) {
+        if asked != SUCCESS {
             return false;
         }
+        // A store too short for all of it keeps the newest lines that fit.
+        let text = fitting(&space, text);
+        let Some(header) = Header::of(boot, text) else {
+            return false;
+        };
         for (index, piece) in pieces(text).enumerate() {
             let name = piece_name(index);
             // SAFETY: as above; the name, GUID and data outlive the call.

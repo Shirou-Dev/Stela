@@ -32,7 +32,7 @@ pub const VENDOR: Guid = guid!("b3e1f6a4-2c5d-4e8f-9a17-6d0c53a7e142");
 /// The bytes of one piece.
 pub const PIECE_BYTES: usize = 1024;
 /// The most pieces of a record.
-pub const PIECES: usize = 8;
+pub const PIECES: usize = 24;
 /// The most text a record holds.
 pub const TEXT_BYTES: usize = PIECE_BYTES * PIECES;
 pub const HEADER_BYTES: usize = 32;
@@ -64,7 +64,12 @@ pub const HEADER_NAME: [u16; 16] = name("StelaStopHeader");
 pub const fn piece_name(index: usize) -> [u16; 11] {
     assert!(index < PIECES);
     let mut name: [u16; 11] = name("StelaStop0");
-    name[9] += index as u16;
+    // 0 to 9, then A onwards.
+    name[9] = if index < 10 {
+        b'0' as u16 + index as u16
+    } else {
+        b'A' as u16 + (index - 10) as u16
+    };
     name
 }
 
@@ -106,6 +111,28 @@ impl Space {
             && needed <= self.remaining
             && self.remaining - needed >= STORE_RESERVE
             && self.maximum != 0
+    }
+}
+
+/// The newest whole lines of `text` whose record `space` takes: all of it
+/// where it fits, less by whole pieces where the store is short, and none
+/// where not one piece fits.
+pub fn fitting<'a>(space: &Space, text: &'a [u8]) -> &'a [u8] {
+    let mut kept = text;
+    loop {
+        if kept.is_empty() || space.takes(store_bytes(kept.len())) {
+            return kept;
+        }
+        let shorter = (kept.len() - 1) / PIECE_BYTES * PIECE_BYTES;
+        let from = text.len() - shorter;
+        // From the start of the first whole line of what is left.
+        kept = match text[from.saturating_sub(1)..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+        {
+            Some(end) if from != 0 => &text[from - 1 + end + 1..],
+            _ => &text[text.len()..],
+        };
     }
 }
 
@@ -310,7 +337,10 @@ mod tests {
         assert_eq!(HEADER_NAME[15], 0);
         for index in 0..PIECES {
             let name = piece_name(index);
-            assert_eq!(text(&name), alloc::format!("StelaStop{index}"));
+            let digit = char::from_digit(index as u32, 36)
+                .unwrap()
+                .to_ascii_uppercase();
+            assert_eq!(text(&name), alloc::format!("StelaStop{digit}"));
             assert_eq!(name[10], 0);
         }
     }
@@ -343,7 +373,7 @@ mod tests {
 
     #[test]
     fn text_longer_than_the_record_keeps_its_newest_whole_lines() {
-        let all = lines(1000);
+        let all = lines(4000);
         assert!(all.len() > 2 * TEXT_BYTES);
         // Pushed in uneven parts, as the log's ring hands them over.
         let mut tail = Tail::new();
@@ -355,7 +385,7 @@ mod tests {
         assert!(all.ends_with(text));
         assert!(text.starts_with(b"["), "starts at a line's start");
         assert!(
-            text.ends_with(b"STEP line 999\n"),
+            text.ends_with(b"STEP line 3999\n"),
             "the stop's reason stays"
         );
         // In one part, too.
@@ -374,7 +404,7 @@ mod tests {
     fn a_cut_at_a_line_boundary_drops_no_line_and_one_long_line_is_kept() {
         // Exactly one byte too many, and that byte ends a line.
         let mut exact = vec![b'\n'];
-        exact.extend(lines(400).into_iter().take(TEXT_BYTES));
+        exact.extend(lines(2000).into_iter().take(TEXT_BYTES));
         let mut tail = Tail::new();
         tail.push(&exact);
         assert_eq!(tail.text(), &exact[1..]);
@@ -464,6 +494,42 @@ mod tests {
                 text: String::from("STEP caf\u{e9} \u{fffd}\u{fffd}\n")
             }
         );
+    }
+
+    #[test]
+    fn a_short_store_keeps_the_newest_whole_lines_that_fit() {
+        let mut text = Vec::new();
+        for line in 0..400u32 {
+            text.extend_from_slice(format!("line {line:04} of the stopped boot\n").as_bytes());
+        }
+        let text = &text[..];
+        assert!(text.len() > 8 * PIECE_BYTES && text.len() <= TEXT_BYTES);
+        let space = |remaining| Space {
+            maximum: 0x20000,
+            remaining,
+            largest: 0x2000,
+        };
+        // Room for all of it.
+        assert_eq!(fitting(&space(0x10000), text), text);
+        // Room for a part: the newest whole lines, in a record that fits.
+        let short = space(STORE_RESERVE + store_bytes(4 * PIECE_BYTES));
+        let kept = fitting(&short, text);
+        assert!(!kept.is_empty() && kept.len() <= 4 * PIECE_BYTES);
+        assert!(kept.len() > 3 * PIECE_BYTES - 64);
+        assert!(text.ends_with(kept) && kept.starts_with(b"line "));
+        assert!(short.takes(store_bytes(kept.len())));
+        // Room for nothing.
+        assert!(fitting(&space(STORE_RESERVE), text).is_empty());
+        assert!(fitting(&space(0x10000), b"").is_empty());
+    }
+
+    #[test]
+    fn pieces_past_the_tenth_are_named_by_letters() {
+        let last = |index| piece_name(index)[9];
+        assert_eq!(last(0), u16::from(b'0'));
+        assert_eq!(last(9), u16::from(b'9'));
+        assert_eq!(last(10), u16::from(b'A'));
+        assert_eq!(last(PIECES - 1), u16::from(b'A') + (PIECES - 11) as u16);
     }
 
     #[test]
