@@ -1699,10 +1699,23 @@ pub unsafe fn open(
     let waited = match waited {
         Ok(waited) => waited,
         Err(refusal) => {
-            return Err(Refused {
-                refusal,
-                log: boot_log(&mut devices.disks),
-            });
+            // What Stela's drivers did find, so the stop tells a disk that
+            // never started from one that started as another.
+            let log = boot_log(&mut devices.disks);
+            let kept = if early_log || log.is_some() {
+                Keeping::Log
+            } else {
+                Keeping::Screen
+            };
+            account(
+                &mut devices,
+                "the disk chosen for macOS",
+                0,
+                boot_disk,
+                targets.first().copied(),
+                kept,
+            );
+            return Err(Refused { refusal, log });
         }
     };
     if waited.looks != 0 {
