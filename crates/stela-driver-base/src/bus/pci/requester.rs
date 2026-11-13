@@ -22,10 +22,7 @@ pub mod containment;
 pub mod preparation;
 pub mod roles;
 
-const PM: u16 = 1;
 const MSI: u16 = 5;
-const PCIX: u16 = 7;
-const VENDOR: u16 = 9;
 /// MSI Message Control's Extended Message Data Enable (PCIe 4.0 7.7.1.2).
 /// Its Capable bit 9 and the reserved bits above are left as found, as Linux
 /// leaves them; a function with 32-bit message data enabled is refused,
@@ -33,6 +30,11 @@ const VENDOR: u16 = 9;
 const MSI_EXTENDED_DATA_ENABLE: u16 = 1 << 10;
 const PCIE: u16 = 0x10;
 const MSIX: u16 = 0x11;
+/// PCI Advanced Features, and its `PCI_AF_STATUS` word with `PCI_AF_STATUS_TP`
+/// read through the control byte before it.
+const AF: u16 = 0x13;
+const AF_CONTROL: u16 = 4;
+const AF_TRANSACTIONS_PENDING: u16 = 1 << 8;
 const ATS: u16 = 0xf;
 const PRI: u16 = 0x13;
 const PASID: u16 = 0x1b;
@@ -300,43 +302,82 @@ pub fn wait_for_pending_transactions<C: ConfigSpace>(
     Ok(())
 }
 
-/// Extended capabilities that report or tune the link and make no request of
-/// their own, by their `pci_regs.h` IDs: the null entry, AER, virtual channels,
-/// the serial number, power budgeting, vendor-specific, ACS, ARI, Resizable BAR
-/// and its VF twin, LTR, secondary PCIe, L1 substates, data link features, the
-/// 16 and 32 GT/s physical layers and lane margining.
-const INERT: [u16; 17] = [
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x0b, 0x0d, 0x0e, 0x15, 0x18, 0x19, 0x1e, 0x24, 0x25, 0x26, 0x27,
-    0x2a,
-];
+// Which capabilities a stopped function is checked on. Linux validates no
+// capability list; it acts only on the capabilities it uses. Here a capability
+// is checked only when one of its controls can make the function send a
+// request or an interrupt while Bus Master and INTx Disable say it is quiet;
+// every other capability is ignored, whatever its ID, version or layout.
+//
+// Checked, standard list:
+// - MSI and MSI-X: an enabled one is an interrupt source of its own.
+// - PCI Express: Device Control's Enable No Snoop and Device Status's
+//   Transactions Pending, and the port type, which must be an endpoint's.
+// - Advanced Features: its Transactions Pending, the conventional twin of the
+//   PCI Express one.
+// Checked, extended list:
+// - SR-IOV: VF Enable makes virtual functions, each a requester of its own.
+// - ATS, PRI and PASID: their enables let the function translate and fault
+//   addresses through the remapping unit (as drivers/pci/ats.c disables them).
+// - A CXL device DVSEC: Cache_Enable lets the function cache host memory over
+//   CXL.cache, which Bus Master does not gate.
+//
+// Ignored, because they can make no request or interrupt of their own:
+// - Power management: a function in D1 to D3hot cannot master at all, and in
+//   D0 Bus Master gates it. PME is a message to the root port, which raises
+//   the interrupt under its own PME Interrupt Enable; a port is never claimed
+//   here (the header must be type 0). Drivers that need D0 check it.
+// - Read-only or identifying data: VPD, slot identification, bridge
+//   subsystem IDs, the serial number, power budgeting, SATA and enhanced
+//   allocation, vendor-specific and designated vendor-specific bodies other
+//   than CXL's, DOE (its interrupt is an MSI or MSI-X vector, checked above).
+// - Link, routing and protocol layers: AGP, PCI-X, HyperTransport, virtual
+//   channels, ACS, ARI, multicast, LTR, secondary PCI Express, L1 substates,
+//   PTM, data link features, the 16, 32 and 64 GT/s physical layers, lane
+//   margining, IDE and the like. Their requests are messages or need Bus
+//   Master; TPH, LN and multicast only qualify memory requests.
+// - Resizable BAR and its VF twin: they size BARs and make no request.
+// - Port-only controls: AER root error reporting, DPC trigger and interrupt,
+//   hot-plug and the root complex capabilities exist on ports and root
+//   complex event collectors, whose interrupts are MSI, MSI-X or INTx anyway,
+//   and an endpoint's AER only sends error messages upstream.
+
 /// SR-IOV: inert while its virtual functions, which are requesters, are off.
 const SRIOV: u16 = 0x10;
 /// `PCI_SRIOV_CTRL`, and its `PCI_SRIOV_CTRL_VFE`.
 const SRIOV_CONTROL: u16 = 8;
 const SRIOV_VF_ENABLE: u16 = 1;
+/// Designated vendor-specific, with `PCI_DVSEC_HEADER1` and `PCI_DVSEC_HEADER2`.
+const DVSEC: u16 = 0x23;
+const DVSEC_HEADER1: u16 = 4;
+const DVSEC_HEADER2: u16 = 8;
+/// Linux `PCI_VENDOR_ID_CXL` and `CXL_DVSEC_PCIE_DEVICE`: the DVSEC of a CXL
+/// device, whose DVSEC CXL Control word (`CXL_DVSEC_CTRL_OFFSET`) has
+/// Cache_Enable in bit 0.
+const CXL_VENDOR: u32 = 0x1e98;
+const CXL_DEVICE: u16 = 0;
+const CXL_CONTROL: u16 = 0xc;
+const CXL_CACHE_ENABLE: u16 = 1;
+
+/// A second entry of a checked ID: two answers for one control.
+fn single(seen: &mut u32, id: u16, offset: u16) -> Result<(), ClaimError> {
+    let bit = 1 << id;
+    if *seen & bit != 0 {
+        return Err(ClaimError::MalformedCapability { offset });
+    }
+    *seen |= bit;
+    Ok(())
+}
 
 fn standard<C: ConfigSpace>(config: &C, status: u16) -> Result<(), ClaimError> {
     if status & regs::STATUS_CAP_LIST == 0 {
         return Ok(());
     }
-    let mut singleton = 0u32;
+    let mut seen = 0u32;
     for entry in config.capabilities() {
         let entry = entry?;
         let offset = entry.offset;
         let id = u16::from(entry.id);
         match id {
-            PM => {
-                let version = (read16(config, offset + 2)? & 7) as u8;
-                if !(1..=3).contains(&version) {
-                    return Err(ClaimError::UnsupportedVersion { id, version });
-                }
-            }
-            PCIX => {
-                let version = ((read16(config, offset + 2)? >> 12) & 3) as u8;
-                if !matches!(version, 0..=2) {
-                    return Err(ClaimError::UnsupportedVersion { id, version });
-                }
-            }
             MSI => {
                 let flags = inactive(config, offset + 2, 1)?;
                 let supported = (flags >> 1) & 7;
@@ -361,21 +402,12 @@ fn standard<C: ConfigSpace>(config: &C, status: u16) -> Result<(), ClaimError> {
                 inactive(config, offset + 8, 1 << 11)?;
                 inactive(config, offset + 10, 1 << 5)?;
             }
-            VENDOR => {}
-            _ => {
-                return Err(ClaimError::UnsupportedCapability {
-                    id,
-                    extended: false,
-                });
+            AF => {
+                inactive(config, offset + AF_CONTROL, AF_TRANSACTIONS_PENDING)?;
             }
+            _ => continue,
         }
-        if id != VENDOR {
-            let bit = 1 << id;
-            if singleton & bit != 0 {
-                return Err(ClaimError::MalformedCapability { offset });
-            }
-            singleton |= bit;
-        }
+        single(&mut seen, id, offset)?;
     }
     Ok(())
 }
@@ -387,28 +419,26 @@ fn extended<C: ConfigSpace>(config: &C) -> Result<(), ClaimError> {
     if config.read32(0x100)? == u32::MAX {
         return Ok(());
     }
-    let mut singleton = 0u32;
+    let mut seen = 0u32;
     for entry in config.extended_capabilities() {
         let entry = entry?;
         let (offset, id, version) = (entry.offset, entry.id, entry.version);
-        if INERT.contains(&id) {
-            continue;
-        }
-        if id == SRIOV {
-            inactive(config, offset + SRIOV_CONTROL, SRIOV_VF_ENABLE)?;
-            continue;
-        }
-        if !matches!(id, ATS | PASID | PRI) {
-            return Err(ClaimError::UnsupportedCapability { id, extended: true });
+        match id {
+            SRIOV => {
+                inactive(config, offset + SRIOV_CONTROL, SRIOV_VF_ENABLE)?;
+                continue;
+            }
+            DVSEC => {
+                cxl_cache(config, offset, entry.bytes)?;
+                continue;
+            }
+            ATS | PASID | PRI => {}
+            _ => continue,
         }
         if version != 1 {
             return Err(ClaimError::UnsupportedVersion { id, version });
         }
-        let bit = 1 << id;
-        if singleton & bit != 0 {
-            return Err(ClaimError::MalformedCapability { offset });
-        }
-        singleton |= bit;
+        single(&mut seen, id, offset)?;
         match id {
             ATS => {
                 inactive(config, offset + 6, 1 << 15)?;
@@ -424,6 +454,21 @@ fn extended<C: ConfigSpace>(config: &C) -> Result<(), ClaimError> {
             }
         }
     }
+    Ok(())
+}
+
+/// Refuse a CXL device DVSEC with Cache_Enable set; any other DVSEC is
+/// ignored. `bytes` is the length the walk sized and reserved from the header.
+fn cxl_cache<C: ConfigSpace>(config: &C, offset: u16, bytes: u16) -> Result<(), ClaimError> {
+    if config.read32(offset + DVSEC_HEADER1)? & 0xffff != CXL_VENDOR
+        || read16(config, offset + DVSEC_HEADER2)? != CXL_DEVICE
+    {
+        return Ok(());
+    }
+    if bytes < CXL_CONTROL + 2 {
+        return Err(ClaimError::MalformedCapability { offset });
+    }
+    inactive(config, offset + CXL_CONTROL, CXL_CACHE_ENABLE)?;
     Ok(())
 }
 

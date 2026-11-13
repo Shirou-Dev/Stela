@@ -5,6 +5,9 @@ use crate::bus::pci::regs;
 use alloc::sync::Arc;
 use core::{cell::Cell, sync::atomic::Ordering};
 
+const PM: u16 = 1;
+const PCIX: u16 = 7;
+
 const ADDRESS: Address = Address {
     segment: 0xfffe,
     bus: 0xe7,
@@ -456,24 +459,13 @@ fn linked_zero_cycles_overlaps_unknowns_and_unmasked_pointers_are_refused() {
             Err(ClaimError::MalformedCapability { .. })
         ));
     }
+    // An ID with no control that can start a request is ignored, known or not.
     let mut unknown = endpoint();
     cap(&mut unknown, 0x40, 0x7f, 0);
-    assert_eq!(
-        validate_stopped(&mut unknown),
-        Err(ClaimError::UnsupportedCapability {
-            id: 0x7f,
-            extended: false
-        })
-    );
+    assert_eq!(validate_stopped(&mut unknown), Ok(()));
     let mut unknown = endpoint();
     ext(&mut unknown, 0x100, 0x7fff, 1, 0);
-    assert_eq!(
-        validate_stopped(&mut unknown),
-        Err(ClaimError::UnsupportedCapability {
-            id: 0x7fff,
-            extended: true
-        })
-    );
+    assert_eq!(validate_stopped(&mut unknown), Ok(()));
     let mut gpu = endpoint();
     ext(&mut gpu, 0x100, 0, 1, 0x140);
     ext(&mut gpu, 0x140, 0x01, 2, 0x180);
@@ -500,16 +492,11 @@ fn pcix_versioned_bodies_cannot_hide_an_overlapping_capability() {
         function.config().write16(0x42, version << 12).unwrap();
         assert_eq!(validate_stopped(&mut function), Ok(()));
     }
+    // A PCI-X version without a layout here is ignored: PCI-X starts no request.
     let mut function = endpoint();
     cap(&mut function, 0x40, PCIX, 0);
     function.config().write16(0x42, 3 << 12).unwrap();
-    assert_eq!(
-        validate_stopped(&mut function),
-        Err(ClaimError::UnsupportedVersion {
-            id: PCIX,
-            version: 3
-        })
-    );
+    assert_eq!(validate_stopped(&mut function), Ok(()));
     for version in [1, 2] {
         for reverse in [false, true] {
             let mut function = endpoint();
@@ -528,21 +515,15 @@ fn pcix_versioned_bodies_cannot_hide_an_overlapping_capability() {
             ));
         }
     }
+    // Power management starts no request in any version or power state; Linux
+    // skips only PM itself on a function with an unknown PM version.
     for version in 0..=7 {
-        let mut function = endpoint();
-        cap(&mut function, 0x40, PM, 0);
-        function.config().write16(0x42, version).unwrap();
-        let result = validate_stopped(&mut function);
-        if (1..=3).contains(&version) {
-            assert_eq!(result, Ok(()));
-        } else {
-            assert_eq!(
-                result,
-                Err(ClaimError::UnsupportedVersion {
-                    id: PM,
-                    version: version as u8
-                })
-            );
+        for state in 0..=3 {
+            let mut function = endpoint();
+            cap(&mut function, 0x40, PM, 0);
+            function.config().write16(0x42, version).unwrap();
+            function.config().write16(0x44, state | 1 << 8).unwrap();
+            assert_eq!(validate_stopped(&mut function), Ok(()));
         }
     }
 }
@@ -595,6 +576,306 @@ fn translation_features_require_inactive_controls_and_stopped_pri() {
             Err(ClaimError::UnsupportedVersion { id, version: 2 })
         );
     }
+}
+
+/// A function with `class` and `header` type, its capability lists linked in
+/// order: `standard` as (offset, ID, Message Control or flags word),
+/// `extended` as (offset, ID, version).
+fn listed(
+    class: u32,
+    header: u8,
+    standard: &[(u16, u16, u16)],
+    extended: &[(u16, u16, u32)],
+) -> Function<Config> {
+    let mut config = Config {
+        words: [0; 1024],
+        last_read: Cell::new(0),
+        command_fixed: 0,
+        master_sealed: false,
+        command_writes: alloc::vec::Vec::new(),
+    };
+    configure(&mut config);
+    config.write32(8, class << 8).unwrap();
+    config.write8(0x0e, header).unwrap();
+    config.write16(regs::STATUS, regs::STATUS_CAP_LIST).unwrap();
+    config.write8(0x34, standard[0].0 as u8).unwrap();
+    for (index, &(offset, id, word)) in standard.iter().enumerate() {
+        let next = standard.get(index + 1).map_or(0, |entry| entry.0);
+        config.write16(offset, id | next << 8).unwrap();
+        config.write16(offset + 2, word).unwrap();
+    }
+    for (index, &(offset, id, version)) in extended.iter().enumerate() {
+        let next = extended.get(index + 1).map_or(0, |entry| entry.0);
+        config
+            .write32(
+                offset,
+                u32::from(id) | version << 16 | u32::from(next) << 20,
+            )
+            .unwrap();
+    }
+    Function::new(ADDRESS, config).unwrap()
+}
+
+/// Controls of ignored capabilities set as a running system leaves them:
+/// L1 substates, LTR, AER masks and severities, a Resizable BAR size.
+fn set_ignored_controls(function: &mut Function<Config>, writes: &[(u16, u32)]) {
+    for &(offset, value) in writes {
+        function.config().write32(offset, value).unwrap();
+    }
+}
+
+/// A current NVIDIA GeForce GPU, as lspci lists one: PM, 64-bit MSI, a
+/// legacy PCI Express endpoint and a vendor-specific entry; then virtual
+/// channels, LTR, L1 substates, power budgeting, AER, a vendor-specific
+/// entry, secondary PCI Express, Resizable BAR, the 16 and 32 GT/s physical
+/// layers, lane margining and data link features.
+fn geforce() -> Function<Config> {
+    let mut gpu = listed(
+        0x03_0000,
+        0,
+        &[
+            (0x60, PM, 3),
+            (0x68, MSI, 0x80),
+            (0x78, PCIE, 2 | 1 << 4),
+            (0xb4, 9, 0x14),
+        ],
+        &[
+            (0x100, 0x02, 1),
+            (0x250, 0x18, 1),
+            (0x258, 0x1e, 1),
+            (0x128, 0x04, 1),
+            (0x420, 0x01, 2),
+            (0x600, 0x0b, 1),
+            (0x900, 0x19, 1),
+            (0xbb0, 0x15, 1),
+            (0xc1c, 0x26, 1),
+            (0xd00, 0x27, 1),
+            (0xe00, 0x25, 1),
+            (0xe10, 0x2a, 1),
+        ],
+    );
+    set_ignored_controls(
+        &mut gpu,
+        &[
+            (0x604, 0x024 << 20 | 1),
+            (0x254, 0x1003_1003),
+            (0x260, 0x4000_000f),
+            (0x428, 0x0040_0000),
+            (0x430, 0x0000_e000),
+            (0xbb8, 0x0000_0e20),
+        ],
+    );
+    gpu
+}
+
+/// A data centre NVMe disk: PM, 64-bit MSI with 32 messages, a PCI Express
+/// endpoint, MSI-X and VPD; then AER, the serial number, power budgeting,
+/// secondary PCI Express, the 16 GT/s physical layer, lane margining, LTR,
+/// L1 substates, TPH, PTM, a DOE mailbox and data link features. VPD, TPH,
+/// PTM and DOE each refused it before.
+fn nvme() -> Function<Config> {
+    let mut disk = listed(
+        0x01_0802,
+        0,
+        &[
+            (0x40, PM, 3),
+            (0x50, MSI, 0x8a),
+            (0x70, PCIE, 2),
+            (0xb0, MSIX, 0x20),
+            (0xd0, 0x03, 0),
+        ],
+        &[
+            (0x100, 0x01, 2),
+            (0x148, 0x03, 1),
+            (0x158, 0x04, 1),
+            (0x168, 0x19, 1),
+            (0x188, 0x26, 1),
+            (0x1ac, 0x27, 1),
+            (0x214, 0x18, 1),
+            (0x21c, 0x1e, 1),
+            (0x300, 0x17, 1),
+            (0x320, 0x1f, 1),
+            (0x330, 0x2e, 1),
+            (0x3a0, 0x25, 1),
+        ],
+    );
+    set_ignored_controls(
+        &mut disk,
+        &[
+            (0x218, 0x1003_1003),
+            (0x224, 0x4000_000f),
+            (0x108, 0x0040_0000),
+            // TPH Requester Control: interrupt vector mode, requester enabled.
+            (0x308, 0x0000_0101),
+            // PTM Control: enabled.
+            (0x328, 1),
+            // DOE Control: interrupt enabled, as its MSI-X vector is off.
+            (0x338, 2),
+        ],
+    );
+    disk
+}
+
+/// Every capability without a control that starts a request is ignored, so
+/// a GPU and an NVMe disk as they really list theirs are stopped; their
+/// interrupt and translation controls still refuse them when set.
+#[test]
+fn real_gpu_and_nvme_capability_lists_are_stopped_unless_an_interrupt_is_enabled() {
+    assert_eq!(validate_stopped(&mut geforce()), Ok(()));
+    let mut gpu = geforce();
+    gpu.config().write16(0x6a, 0x81).unwrap();
+    assert_eq!(
+        validate_stopped(&mut gpu),
+        Err(ClaimError::Active { offset: 0x6a })
+    );
+    let mut gpu = geforce();
+    gpu.config().write16(0x80, 1 << 11).unwrap();
+    assert_eq!(
+        validate_stopped(&mut gpu),
+        Err(ClaimError::Active { offset: 0x80 })
+    );
+
+    assert_eq!(validate_stopped(&mut nvme()), Ok(()));
+    let mut disk = nvme();
+    disk.config().write16(0xb2, 0x8020).unwrap();
+    assert_eq!(
+        validate_stopped(&mut disk),
+        Err(ClaimError::Active { offset: 0xb2 })
+    );
+    let mut disk = nvme();
+    disk.config().write16(0x7a, 1 << 5).unwrap();
+    assert_eq!(
+        validate_stopped(&mut disk),
+        Err(ClaimError::Active { offset: 0x7a })
+    );
+}
+
+/// A PCIe root port and a switch downstream port list SSVID, HyperTransport,
+/// ACS, DPC and PTM beside AER and the link layers. With DPC triggering, AER
+/// root reporting and PME interrupts enabled, as firmware leaves ports, their
+/// extended list passes: none of those controls is checked here. Ports are no
+/// stopped requesters: the type 1 header is refused before any capability.
+#[test]
+fn real_port_capability_lists_pass_and_ports_stay_on_their_own_path() {
+    let mut root = listed(
+        0x06_0400,
+        1,
+        &[
+            (0x50, PM, 3),
+            (0x58, PCIE, 2 | 4 << 4 | 1 << 8),
+            (0xa0, MSI, 0),
+            (0xc0, 0x0d, 0),
+            (0xc8, 0x08, 0xa803),
+        ],
+        &[
+            (0x100, 0x0b, 1),
+            (0x150, 0x01, 2),
+            (0x270, 0x19, 1),
+            (0x2a0, 0x0d, 1),
+            (0x370, 0x1e, 1),
+            (0x380, 0x1d, 1),
+            (0x400, 0x25, 1),
+            (0x410, 0x26, 1),
+            (0x440, 0x27, 1),
+            (0x4c0, 0x1f, 1),
+        ],
+    );
+    set_ignored_controls(
+        &mut root,
+        &[
+            (0x104, 0x010 << 20 | 1),
+            // Root Control: PME and system error interrupts enabled.
+            (0x74, 0x0000_000f),
+            // AER Root Error Command: all three reporting enables.
+            (0x17c, 7),
+            // DPC Control: trigger on ERR_FATAL, interrupt enabled.
+            (0x384, 0x0009_0000),
+            // ACS Control: source validation, request and completion redirect.
+            (0x2a4, 0x001d_0000),
+            // PTM Control: enabled, root select.
+            (0x4c8, 3),
+        ],
+    );
+    assert_eq!(extended(&*root.config()), Ok(()));
+    assert_eq!(
+        validate_stopped(&mut root),
+        Err(ClaimError::UnsupportedHeader(1))
+    );
+
+    let mut switch = listed(
+        0x06_0400,
+        1,
+        &[
+            (0x40, PM, 3),
+            (0x48, MSI, 0x80),
+            (0x68, PCIE, 2 | 6 << 4 | 1 << 8),
+            (0xa4, 0x0d, 0),
+        ],
+        &[
+            (0x100, 0x01, 2),
+            (0x140, 0x02, 1),
+            (0x200, 0x0d, 1),
+            (0x220, 0x19, 1),
+            (0x250, 0x1d, 1),
+            (0x300, 0x1e, 1),
+            (0x310, 0x1f, 1),
+            (0x320, 0x25, 1),
+            (0x330, 0x26, 1),
+            (0x360, 0x27, 1),
+        ],
+    );
+    set_ignored_controls(&mut switch, &[(0x254, 0x0009_0000), (0x204, 0x001d_0000)]);
+    assert_eq!(extended(&*switch.config()), Ok(()));
+    assert_eq!(
+        validate_stopped(&mut switch),
+        Err(ClaimError::UnsupportedHeader(1))
+    );
+}
+
+/// A conventional function's Advanced Features report Transactions Pending
+/// as PCI Express Device Status does, and refuse the claim the same way.
+#[test]
+fn advanced_features_transactions_pending_refuse_a_stopped_claim() {
+    let mut function = listed(0x04_0300, 0, &[(0x50, PM, 3), (0x60, AF, 6 | 3 << 8)], &[]);
+    assert_eq!(validate_stopped(&mut function), Ok(()));
+    function.config().write16(0x64, 1 << 8).unwrap();
+    assert_eq!(
+        validate_stopped(&mut function),
+        Err(ClaimError::Active { offset: 0x64 })
+    );
+}
+
+/// A CXL device DVSEC with Cache_Enable lets the function read host memory
+/// over CXL.cache, which Bus Master does not gate; Mem_Enable and any other
+/// DVSEC are ignored.
+#[test]
+fn cxl_cache_enable_refuses_and_other_dvsecs_are_ignored() {
+    let cxl = |vendor: u32, id: u16, length: u32, control: u16| {
+        let mut function = endpoint();
+        ext(&mut function, 0x100, 0x01, 2, 0x200);
+        ext(&mut function, 0x200, DVSEC, 1, 0);
+        function
+            .config()
+            .write32(0x204, vendor | 1 << 16 | length << 20)
+            .unwrap();
+        function.config().write16(0x208, id).unwrap();
+        function.config().write16(0x20c, control).unwrap();
+        function
+    };
+    // Mem_Enable only, IO_Enable reads set.
+    assert_eq!(validate_stopped(&mut cxl(0x1e98, 0, 0x38, 6)), Ok(()));
+    assert_eq!(
+        validate_stopped(&mut cxl(0x1e98, 0, 0x38, 7)),
+        Err(ClaimError::Active { offset: 0x20c })
+    );
+    // A CXL DVSEC of another ID, and another vendor's DVSEC 0.
+    assert_eq!(validate_stopped(&mut cxl(0x1e98, 3, 0x38, 7)), Ok(()));
+    assert_eq!(validate_stopped(&mut cxl(0x10de, 0, 0x38, 7)), Ok(()));
+    // Too short to hold DVSEC CXL Control.
+    assert_eq!(
+        validate_stopped(&mut cxl(0x1e98, 0, 0x0c, 0)),
+        Err(ClaimError::MalformedCapability { offset: 0x200 })
+    );
 }
 
 #[test]
