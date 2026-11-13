@@ -10,7 +10,8 @@
 //! natively (VMD, EHCI) and the fabric cannot be blocked whole, no unit is
 //! taken. With every unit off, units that cannot all start blocked are all
 //! left, as any other mix of taken units keeps the IOAPICs and every native
-//! device refused. A driver that
+//! device refused; a blocked fabric that does not qualify then stops its
+//! taken units the same way. A driver that
 //! asks the native services for a domain gets its own
 //! ([`Remappers::domain`]).
 //!
@@ -30,7 +31,10 @@ use crate::{
         firmware_state::Kind,
         requester::RequesterClaim,
         vtd::interrupt::DirectDelivery,
-        vtd::{BlockedRequester, BoundRequester, InitialBlock, MmioRegisters, Unit, VtdError},
+        vtd::{
+            BlockedRequester, BoundRequester, InitialBlock, MmioRegisters, TakeOverError, Unit,
+            VtdError,
+        },
     },
     native_mmio, output,
 };
@@ -581,11 +585,15 @@ impl Remappers {
                     });
                 }
                 Err(error) => {
-                    // A refused takeover may have programmed its root.
-                    uncertain = true;
+                    // A takeover that wrote the unit, or read it on or
+                    // unreadable, leaves a state no proof covers.
+                    let off = error.leaves_unit_off();
+                    uncertain |= !off;
                     output::arguments(format_args!(
-                        "HOST IOMMU VT-d unit {:#x} left untranslated: {error:?}\n",
-                        unit.base
+                        "HOST IOMMU VT-d unit {:#x} left untranslated: {:?}{}\n",
+                        unit.base,
+                        error.error,
+                        if off { "" } else { ", its state uncertain" }
                     ));
                 }
             }
@@ -634,8 +642,36 @@ impl Remappers {
                 pci.functions()
             ));
         }
+        // With every unit off, the policy takes units only for a complete
+        // blocked fabric. One that did not qualify would leave the IOAPICs
+        // and every native device refused, so the taken units stop and the
+        // machine settles untranslated, as when the policy leaves them all.
+        if remappers.initial_fabric.is_none() && units_off && !uncertain {
+            uncertain = !remappers.retire_taken();
+        }
         remappers.settle(units_off && !uncertain);
         remappers
+    }
+
+    /// Stop every taken VT-d unit. False when one did not stop: it stays
+    /// taken, and its shutdown failure keeps it held.
+    fn retire_taken(&mut self) -> bool {
+        let dmar = self.dmar.as_ref();
+        self.taken.retain(|taken| {
+            // SAFETY: no driver has started, so no requester has a domain,
+            // and every requester's Bus Master stays stopped since the
+            // original census.
+            let Err(error) = (unsafe { taken.unit.shut_down() }) else {
+                return false;
+            };
+            output::arguments(format_args!(
+                "HOST IOMMU VT-d unit {:#x} did not stop: {error:?}\n",
+                dmar.and_then(|dmar| dmar.units.get(taken.descriptor))
+                    .map_or(0, |unit| unit.base)
+            ));
+            true
+        });
+        self.taken.is_empty()
     }
 
     /// With no unit taken and every described unit `off` since
@@ -745,25 +781,32 @@ impl Remappers {
         physical_bits: u8,
         mmio: &native_mmio::Source,
         tsc_hz: u64,
-    ) -> Result<Arc<Unit<MmioRegisters>>, VtdError> {
-        let span =
-            PhysicalSpan::new(unit.base, unit.bytes as u64).map_err(|_| VtdError::RegisterRange)?;
-        // SAFETY: the DMAR names this unit's registers, which no driver owns.
-        let resource = unsafe { mmio.claim_platform(span) }.map_err(|_| VtdError::RegisterRange)?;
-        let mapping = mmio
-            .authority()
-            .map(
-                resource,
-                0,
-                unit.bytes,
-                CacheAttribute::Uncached,
-                Protection::ReadWrite,
-            )
-            .map_err(|_| VtdError::RegisterRange)?;
-        // SAFETY: the unit's exclusive uncached register window is mapped
-        // through this boot's shared aperture.
-        let registers =
-            unsafe { MmioRegisters::from_mapping(mapping, crate::apic::rdtsc, tsc_hz.max(1)) }?;
+    ) -> Result<Arc<Unit<MmioRegisters>>, TakeOverError> {
+        let map = || {
+            let span = PhysicalSpan::new(unit.base, unit.bytes as u64)
+                .map_err(|_| VtdError::RegisterRange)?;
+            // SAFETY: the DMAR names this unit's registers, which no driver owns.
+            let resource =
+                unsafe { mmio.claim_platform(span) }.map_err(|_| VtdError::RegisterRange)?;
+            let mapping = mmio
+                .authority()
+                .map(
+                    resource,
+                    0,
+                    unit.bytes,
+                    CacheAttribute::Uncached,
+                    Protection::ReadWrite,
+                )
+                .map_err(|_| VtdError::RegisterRange)?;
+            // SAFETY: the unit's exclusive uncached register window is mapped
+            // through this boot's shared aperture.
+            unsafe { MmioRegisters::from_mapping(mapping, crate::apic::rdtsc, tsc_hz.max(1)) }
+        };
+        // Mapping the registers writes none of them.
+        let registers = map().map_err(|error| TakeOverError {
+            error,
+            started: false,
+        })?;
         // SAFETY: forwarded: the policy resolved the scope and the window
         // holds the reserved regions the covered requesters use.
         unsafe {

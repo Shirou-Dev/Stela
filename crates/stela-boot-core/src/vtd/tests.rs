@@ -655,7 +655,10 @@ fn covered_requesters_reach_only_the_window_until_attached_to_their_own_domain()
         // SAFETY: the model registers stand in for the unit, and this test is the only
         // process-context owner.
         unsafe { Unit::take_over(ModelRegisters::new(), source, &[8], 48, &msi) },
-        Err(VtdError::Unsupported)
+        Err(TakeOverError {
+            error: VtdError::Unsupported,
+            started: false
+        })
     ));
 }
 
@@ -858,7 +861,13 @@ fn hardware_did_capacity_quarantine_and_software_epochs_never_wrap_or_reuse_earl
         // process-context owner.
         let result = unsafe { Unit::take_over(registers, source, &[8], 48, &[]) };
         if nd == 7 {
-            assert!(matches!(result, Err(VtdError::Unsupported)));
+            assert!(matches!(
+                result,
+                Err(TakeOverError {
+                    error: VtdError::Unsupported,
+                    started: false
+                })
+            ));
             assert_eq!(source.next.load(Ordering::Relaxed), 0x100000);
         } else {
             let unit = result.unwrap();
@@ -872,7 +881,10 @@ fn hardware_did_capacity_quarantine_and_software_epochs_never_wrap_or_reuse_earl
             // SAFETY: the model registers stand in for the unit, and this test is the only
             // process-context owner.
             unsafe { Unit::take_over(ModelRegisters::new(), source(), invalid, 48, &[]) },
-            Err(VtdError::Unsupported)
+            Err(TakeOverError {
+                error: VtdError::Unsupported,
+                started: false
+            })
         ));
     }
     // Requesters on two buses: a context table under each root entry.
@@ -1034,6 +1046,29 @@ fn active_noncoherent_walker_never_reaches_unpublished_children() {
 }
 
 #[test]
+fn only_a_refusal_before_any_write_from_a_unit_read_off_leaves_it_off() {
+    let refused = |error, started| TakeOverError { error, started };
+    for error in [
+        VtdError::Unsupported,
+        VtdError::RegisterRange,
+        VtdError::Memory,
+    ] {
+        assert!(refused(error, false).leaves_unit_off(), "{error:?}");
+        assert!(!refused(error, true).leaves_unit_off(), "{error:?}");
+    }
+    for error in [VtdError::Busy, VtdError::RegisterRead] {
+        assert!(!refused(error, false).leaves_unit_off(), "{error:?}");
+    }
+    // An unsupported address width is refused before any register write.
+    let registers = ModelRegisters::new();
+    // SAFETY: the model registers stand in for the unit, and this test is the
+    // only process-context owner.
+    let result = unsafe { Unit::take_over(registers.clone(), source(), &[8], 31, &[]) };
+    assert!(result.is_err_and(TakeOverError::leaves_unit_off));
+    assert!(registers.0.lock().unwrap().writes.is_empty());
+}
+
+#[test]
 fn all_ones_control_reads_never_establish_a_domain() {
     for offset in [CAP, ECAP, GSTS, PMEN] {
         let registers = ModelRegisters::new();
@@ -1047,7 +1082,10 @@ fn all_ones_control_reads_never_establish_a_domain() {
         assert!(matches!(
             // SAFETY: explicit failed-register model; no takeover may occur.
             unsafe { Unit::take_over(registers.clone(), source, &[8], 48, &[]) },
-            Err(VtdError::RegisterRead)
+            Err(TakeOverError {
+                error: VtdError::RegisterRead,
+                started: false
+            })
         ));
         assert_eq!(source.next.load(Ordering::Relaxed), 0x100000);
         assert!(registers.0.lock().unwrap().writes.is_empty());
@@ -1061,7 +1099,10 @@ fn all_ones_control_reads_never_establish_a_domain() {
             // SAFETY: model injects failed GSTS only after this real stage's command; no
             // acknowledged usable Arc may escape.
             unsafe { Unit::take_over(registers.clone(), source, &[8], 48, &[]) },
-            Err(VtdError::RegisterRead)
+            Err(TakeOverError {
+                error: VtdError::RegisterRead,
+                started: true
+            })
         ));
         assert!(quarantined_units() > before);
         assert!(source.next.load(Ordering::Relaxed) > 0x100000);
@@ -1350,7 +1391,10 @@ fn busy_firmware_unit_is_refused_without_writes() {
     assert!(matches!(
         // SAFETY: model probe; active firmware translation must be refused.
         unsafe { Unit::take_over(registers.clone(), source, &[8], 48, &[]) },
-        Err(VtdError::Busy)
+        Err(TakeOverError {
+            error: VtdError::Busy,
+            started: false
+        })
     ));
     assert_eq!(source.next.load(Ordering::Relaxed), 0x100000);
     assert!(registers.0.lock().unwrap().writes.is_empty());
@@ -1393,7 +1437,13 @@ fn invalid_window_geometry_never_publishes_a_hardware_root() {
         // SAFETY: the registers and page allocator are this test's exclusive
         // software models; the invalid range must cause no hardware writes.
         let result = unsafe { Unit::take_over(registers.clone(), source, &[8], 48, &[range]) };
-        assert!(matches!(result, Err(VtdError::Unsupported)));
+        assert!(matches!(
+            result,
+            Err(TakeOverError {
+                error: VtdError::Unsupported,
+                started: false
+            })
+        ));
         assert!(registers.0.lock().unwrap().writes.is_empty());
     }
 }

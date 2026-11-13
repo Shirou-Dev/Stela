@@ -86,6 +86,24 @@ pub fn quarantined_units() -> u64 {
     QUARANTINED_UNITS.load(Ordering::Relaxed)
 }
 
+/// Why [`Unit::take_over`] refused a unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TakeOverError {
+    pub error: VtdError,
+    /// Whether it had written the unit's registers. False: the unit is as
+    /// it was found, and no table of this takeover was published to it.
+    pub started: bool,
+}
+
+impl TakeOverError {
+    /// Whether a unit proven off before the takeover still is: nothing was
+    /// written, and the unit read neither on ([`VtdError::Busy`]) nor
+    /// unreadable ([`VtdError::RegisterRead`]).
+    pub fn leaves_unit_off(self) -> bool {
+        !self.started && !matches!(self.error, VtdError::Busy | VtdError::RegisterRead)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VtdError {
     Config(stela_drivers::bus::pci::ConfigError),
@@ -575,6 +593,41 @@ impl<R: Registers> Unit<R> {
         requesters: &[u16],
         physical_bits: u8,
         window: &[Range<u64>],
+    ) -> Result<Arc<Self>, TakeOverError> {
+        let unit = Self::prepare(registers, source, requesters, physical_bits, window).map_err(
+            |error| TakeOverError {
+                error,
+                started: false,
+            },
+        )?;
+        let started = |error| TakeOverError {
+            error,
+            started: true,
+        };
+        let mut guard = unit.lock();
+        let state = guard.state();
+        unit.publish_tables(state);
+        // Mask fault interrupts; fault delivery needs its own registered IRQ
+        // owner, never a firmware handler kept across ownership transfer.
+        unit.registers.write32(FECTL, 1 << 31);
+        unit.registers.write64(RTADDR, state.root.physical());
+        unit.write_command(ROOT_POINTER).map_err(started)?;
+        unit.wait32(GSTS, ROOT_POINTER, true).map_err(started)?;
+        unit.invalidate(true).map_err(started)?;
+        unit.command.store(TRANSLATION, Ordering::Relaxed);
+        unit.write_command(0).map_err(started)?;
+        unit.wait32(GSTS, TRANSLATION, true).map_err(started)?;
+        drop(guard);
+        Ok(unit)
+    }
+
+    /// Check the unit and build its tables, writing no register.
+    fn prepare(
+        registers: R,
+        source: &'static (dyn PageSource + Sync),
+        requesters: &[u16],
+        physical_bits: u8,
+        window: &[Range<u64>],
     ) -> Result<Arc<Self>, VtdError> {
         let mut allowed = requesters.to_vec();
         allowed.sort_unstable();
@@ -651,7 +704,7 @@ impl<R: Registers> Unit<R> {
                 context.write(index, window.tables[0].physical() | 1);
             }
         }
-        let unit = Arc::new(Self {
+        Ok(Arc::new(Self {
             registers: ManuallyDrop::new(registers),
             command: AtomicU32::new(0),
             direct_delivery: AtomicBool::new(false),
@@ -677,22 +730,7 @@ impl<R: Registers> Unit<R> {
             cap,
             max_domains,
             table_cacheline,
-        });
-        let mut guard = unit.lock();
-        let state = guard.state();
-        unit.publish_tables(state);
-        // Mask fault interrupts; fault delivery needs its own registered IRQ
-        // owner, never a firmware handler kept across ownership transfer.
-        unit.registers.write32(FECTL, 1 << 31);
-        unit.registers.write64(RTADDR, state.root.physical());
-        unit.write_command(ROOT_POINTER)?;
-        unit.wait32(GSTS, ROOT_POINTER, true)?;
-        unit.invalidate(true)?;
-        unit.command.store(TRANSLATION, Ordering::Relaxed);
-        unit.write_command(0)?;
-        unit.wait32(GSTS, TRANSLATION, true)?;
-        drop(guard);
-        Ok(unit)
+        }))
     }
 
     /// Whether requester `rid` may attach to this unit.
