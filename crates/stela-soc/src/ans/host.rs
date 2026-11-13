@@ -67,6 +67,11 @@ struct Discards {
     failed: Option<BlockError>,
     /// When a guest transfer last started or completed, if one has.
     active: Option<u64>,
+    /// The controller's shutdown waits for these: batches go at once and
+    /// [`DISCARD_COMMANDS`] commands together, as for a waiting transfer.
+    hurried: bool,
+    /// Runs a shutdown gave up on, which the disk never heard of.
+    abandoned: u64,
 }
 
 impl Discards {
@@ -135,7 +140,7 @@ impl Discards {
     /// a guest read may come to wait behind, and [`DISCARD_COMMANDS`] while
     /// a transfer waits for discards.
     fn commands(&self) -> usize {
-        if self.held.is_empty() {
+        if self.held.is_empty() && !self.hurried {
             1
         } else {
             DISCARD_COMMANDS
@@ -147,7 +152,9 @@ impl Discards {
     /// paused for [`DISCARD_QUIET`].
     fn due(&self, now: u64) -> u64 {
         match self.active {
-            Some(active) if self.held.is_empty() => active.saturating_add(DISCARD_QUIET),
+            Some(active) if self.held.is_empty() && !self.hurried => {
+                active.saturating_add(DISCARD_QUIET)
+            }
             _ => now,
         }
     }
@@ -211,6 +218,22 @@ impl HostDisk {
         if self.identity().features.discard.is_some() && self.discards.failed.is_none() {
             self.discards.add(lba, lba + blocks);
         }
+    }
+
+    /// Send the waiting discards without a pause in transfers while
+    /// `hurried`: the controller's shutdown waits for them.
+    pub(super) fn hurry_discards(&mut self, hurried: bool) {
+        self.discards.hurried = hurried;
+    }
+
+    /// Forget the discards not yet sent, and say how many runs they were.
+    /// Discards are hints (NVMe 1.4 section 6.7.1.1), and the disk keeps
+    /// those blocks' old contents. The batch on the disk still completes.
+    pub(super) fn abandon_discards(&mut self) -> usize {
+        let runs = self.discards.waiting.len();
+        self.discards.waiting.clear();
+        self.discards.abandoned += runs as u64;
+        runs
     }
 
     /// Whether background discards remain: they need [`Self::poll`] though
@@ -341,7 +364,7 @@ impl HostDisk {
             .join(",");
         format!(
             "running={} oldest=[{oldest}] latency={} room={} posted={} signals={} \
-             discards={}+{} held={} refused={:?}",
+             discards={}+{} held={} abandoned={} refused={:?}",
             self.running.len(),
             self.latency,
             self.device.room(),
@@ -353,6 +376,7 @@ impl HostDisk {
                 .as_ref()
                 .map_or(0, |(_, runs)| runs.len()),
             self.discards.held.len(),
+            self.discards.abandoned,
             self.discards.failed,
         )
     }

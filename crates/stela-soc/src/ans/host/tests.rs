@@ -311,3 +311,44 @@ fn a_waiting_flush_sends_discards_several_commands_at_once() {
         .count();
     assert_eq!(discards, 3);
 }
+
+/// A shutdown's discards go several commands together with no pause in
+/// transfers, where the background sends one command after each pause.
+#[test]
+fn hurried_discards_go_at_once_several_commands_together() {
+    let (mut disk, log) = queued(1, false);
+    assert!(disk.submit(1, write(40), 100).is_none());
+    for start in [0, 4, 8] {
+        disk.discard(start, 2);
+    }
+    release(&log, 0);
+    assert_eq!(disk.poll(200).len(), 1);
+    assert_eq!(log.started().len(), 1);
+    disk.hurry_discards(true);
+    assert!(disk.poll(201).is_empty());
+    let discards = log
+        .started()
+        .iter()
+        .filter(|command| matches!(command, Command::Discard { .. }))
+        .count();
+    assert_eq!(discards, 3);
+}
+
+/// Giving the waiting discards up leaves the batch on the disk to complete
+/// and nothing after it.
+#[test]
+fn abandoned_discards_never_reach_the_disk() {
+    let (mut disk, log) = queued(1, false);
+    for start in [0, 4, 8] {
+        disk.discard(start, 2);
+    }
+    assert!(disk.poll(0).is_empty());
+    assert_eq!(log.started().len(), 1);
+    assert_eq!(disk.abandon_discards(), 2);
+    assert!(disk.discarding());
+    release(&log, 0);
+    assert!(disk.poll(DISCARD_QUIET).is_empty());
+    assert!(!disk.discarding());
+    assert_eq!(log.started().len(), 1);
+    assert_eq!(disk.abandon_discards(), 0);
+}

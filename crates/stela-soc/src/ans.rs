@@ -101,6 +101,9 @@ const INTMS: u64 = 0xc;
 const INTMC: u64 = 0x10;
 const CC: u64 = 0x14;
 const CSTS: u64 = 0x1c;
+/// How long a shutdown sends queued discards to the disk before it gives up
+/// the rest: 10 s of the 24 MHz counter, under half its driver's limit.
+const SHUTDOWN_DISCARDS: u64 = 240_000_000;
 const AQA: u64 = 0x24;
 const ASQ: u64 = 0x28;
 const ACQ: u64 = 0x30;
@@ -279,6 +282,8 @@ pub struct Ans {
     modesel: u32,
     auto_queue: bool,
     shutdown: bool,
+    /// When the shutdown in progress was first run, in counter ticks.
+    shutdown_since: Option<u64>,
     /// NVMe feature state, indexed by the small standard feature IDs.
     features: [u32; 12],
     debug: debug::DebugService,
@@ -359,6 +364,7 @@ impl Ans {
             modesel: 0,
             auto_queue: false,
             shutdown: false,
+            shutdown_since: None,
             features,
             debug: debug::DebugService::default(),
             timestamp: 0,
@@ -796,6 +802,20 @@ impl Ans {
         };
         // Host transfers that completed end their commands.
         let now = port.access.now;
+        // A shutdown waits for the discards still queued, so they go to the
+        // disk at once. Its driver gives the controller 25 s
+        // (`IONVMeController::PollCSTS`) and a disk takes a batch for tens
+        // of milliseconds, so what is still waiting after
+        // [`SHUTDOWN_DISCARDS`] is given up, as discards are hints.
+        self.medium.device.hurry_discards(self.shutdown);
+        if self.shutdown {
+            let since = *self.shutdown_since.get_or_insert(now);
+            if now.saturating_sub(since) >= SHUTDOWN_DISCARDS {
+                self.medium.device.abandon_discards();
+            }
+        } else {
+            self.shutdown_since = None;
+        }
         for (key, done) in self.medium.device.poll(now) {
             let Some(inflight) = self.inflight.remove(&key) else {
                 return Err(refusal(1, refuse!("ANS host transfer for no command")));
