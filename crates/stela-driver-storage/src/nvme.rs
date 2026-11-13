@@ -22,7 +22,7 @@ use crate::{
     bus::{dma::DmaAllocator, pci::Function},
     registers,
 };
-use alloc::{format, rc::Rc, vec::Vec};
+use alloc::{boxed::Box, format, rc::Rc, vec::Vec};
 
 mod admin;
 mod features;
@@ -777,6 +777,95 @@ fn removed() -> BlockError {
     BlockError::Unsupported("the NVMe controller is gone")
 }
 
+/// What a failed start says of a CSTS with CSTS.CFS set: a register's
+/// value, never a command's completion status.
+const FATAL_STATUS: &str = "NVMe controller fatal status, CSTS";
+const DISABLE_WAIT: &str = "NVMe controller disable, waiting for CSTS.RDY to clear";
+const ENABLE_WAIT: &str = "NVMe controller enable, waiting for CSTS.RDY";
+
+/// `error` under `step`, whatever it names already.
+fn within(step: &'static str, error: BlockError) -> BlockError {
+    BlockError::Step {
+        step,
+        error: Box::new(error),
+    }
+}
+
+/// A CSTS read as fatal, said to be one.
+fn fatal_status(error: BlockError) -> BlockError {
+    match error {
+        error @ BlockError::Device { .. } => within(FATAL_STATUS, error),
+        other => other,
+    }
+}
+
+/// The name an admin command's failure is reported under: its opcode and
+/// its Identify CNS or its feature.
+fn admin_name(opcode: u8, selector: u32) -> &'static str {
+    match (opcode, selector & 0xff) {
+        (ADMIN_IDENTIFY, IDENTIFY_NAMESPACE) => "NVMe Identify Namespace (opcode 0x06, CNS 0x00)",
+        (ADMIN_IDENTIFY, IDENTIFY_CONTROLLER) => "NVMe Identify Controller (opcode 0x06, CNS 0x01)",
+        (ADMIN_IDENTIFY, IDENTIFY_ACTIVE_NAMESPACES) => {
+            "NVMe Identify Active Namespace List (opcode 0x06, CNS 0x02)"
+        }
+        (ADMIN_IDENTIFY, IDENTIFY_DESCRIPTORS) => {
+            "NVMe Identify Namespace Identification Descriptors (opcode 0x06, CNS 0x03)"
+        }
+        (ADMIN_IDENTIFY, IDENTIFY_COMMAND_SET_CONTROLLER) => {
+            "NVMe Identify Controller, NVM command set (opcode 0x06, CNS 0x06)"
+        }
+        (ADMIN_IDENTIFY, IDENTIFY_INDEPENDENT_NAMESPACE) => {
+            "NVMe Identify Namespace, command set independent (opcode 0x06, CNS 0x08)"
+        }
+        (ADMIN_IDENTIFY, _) => "NVMe Identify (opcode 0x06)",
+        (ADMIN_SET_FEATURES, FEATURE_QUEUE_COUNT) => {
+            "NVMe Set Features, Number of Queues (opcode 0x09, feature 0x07)"
+        }
+        (ADMIN_SET_FEATURES, FEATURE_ASYNC_EVENTS) => {
+            "NVMe Set Features, Asynchronous Event Configuration (opcode 0x09, feature 0x0b)"
+        }
+        (ADMIN_SET_FEATURES, FEATURE_APST) => {
+            "NVMe Set Features, Autonomous Power State Transition (opcode 0x09, feature 0x0c)"
+        }
+        (ADMIN_SET_FEATURES, FEATURE_HOST_MEMORY) => {
+            "NVMe Set Features, Host Memory Buffer (opcode 0x09, feature 0x0d)"
+        }
+        (ADMIN_SET_FEATURES, FEATURE_HOST_BEHAVIOR) => {
+            "NVMe Set Features, Host Behavior Support (opcode 0x09, feature 0x16)"
+        }
+        (ADMIN_SET_FEATURES, _) => "NVMe Set Features (opcode 0x09)",
+        (ADMIN_CREATE_COMPLETION, _) => "NVMe Create I/O Completion Queue (opcode 0x05)",
+        (ADMIN_CREATE_SUBMISSION, _) => "NVMe Create I/O Submission Queue (opcode 0x01)",
+        (ADMIN_DELETE_COMPLETION, _) => "NVMe Delete I/O Completion Queue (opcode 0x04)",
+        (ADMIN_DELETE_SUBMISSION, _) => "NVMe Delete I/O Submission Queue (opcode 0x00)",
+        (ADMIN_GET_LOG_PAGE, _) => "NVMe Get Log Page (opcode 0x02)",
+        (ADMIN_ABORT, _) => "NVMe Abort (opcode 0x08)",
+        (ADMIN_ASYNC_EVENT, _) => "NVMe Asynchronous Event Request (opcode 0x0c)",
+        _ => "NVMe admin command",
+    }
+}
+
+fn identify_name(cns: u32) -> &'static str {
+    admin_name(ADMIN_IDENTIFY, cns)
+}
+
+impl Step {
+    /// The name of this step's admin command.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Identify => identify_name(IDENTIFY_CONTROLLER),
+            Self::Limits => identify_name(IDENTIFY_COMMAND_SET_CONTROLLER),
+            Self::HostOptions => admin_name(ADMIN_SET_FEATURES, FEATURE_HOST_BEHAVIOR),
+            Self::Apst => admin_name(ADMIN_SET_FEATURES, FEATURE_APST),
+            Self::HostMemory => admin_name(ADMIN_SET_FEATURES, FEATURE_HOST_MEMORY),
+            Self::QueueCount => admin_name(ADMIN_SET_FEATURES, FEATURE_QUEUE_COUNT),
+            Self::CreateCompletion => admin_name(ADMIN_CREATE_COMPLETION, 0),
+            Self::CreateSubmission => admin_name(ADMIN_CREATE_SUBMISSION, 0),
+            Self::Events => admin_name(ADMIN_SET_FEATURES, FEATURE_ASYNC_EVENTS),
+        }
+    }
+}
+
 /// One namespace of a controller.
 pub struct Namespace {
     controller: Rc<RefCell<Controller>>,
@@ -882,7 +971,11 @@ fn discover(
     location: alloc::string::String,
     host_memory: &mut dyn HostMemorySource,
 ) -> Result<Attached, BlockError> {
-    let identify = controller.identify(IDENTIFY_CONTROLLER, 0)?.to_vec();
+    // A refusal that ends the start names the command it refused.
+    let identify = controller
+        .identify(IDENTIFY_CONTROLLER, 0)
+        .map_err(|error| error.at(identify_name(IDENTIFY_CONTROLLER)))?
+        .to_vec();
     let request = HostMemoryRequest::from_identify(&identify);
     let serial = ascii(&identify[CONTROLLER_SERIAL]);
     let model = ascii(&identify[CONTROLLER_MODEL]);

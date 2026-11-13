@@ -200,7 +200,7 @@ impl Controller {
             }) => {
                 let Some((_, code)) = self.admin_completion(Some((id, true)))? else {
                     if deadline.passed() {
-                        return Err(BlockError::Timeout);
+                        return Err(BlockError::Timeout.at(step.name()));
                     }
                     self.recovery = Some(Recovery::Admin {
                         step,
@@ -224,7 +224,9 @@ impl Controller {
                     // creation is still tried, and reports its own refusal.
                     (Step::QueueCount, _) => {}
                     (Step::CreateCompletion | Step::CreateSubmission, 0) => {}
-                    (_, status) => return Err(BlockError::Device { status }),
+                    (step, status) => {
+                        return Err(BlockError::Device { status }.at(step.name()));
+                    }
                 }
                 let next = STEPS.iter().position(|each| *each == step).unwrap() + 1;
                 match STEPS.get(next) {

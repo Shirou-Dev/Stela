@@ -87,7 +87,8 @@ impl Controller {
             self.configuration |= COMMAND_SETS_ALL;
         }
         self.registers.write32(CONFIGURATION, 0)?;
-        self.wait_status(self.ready_timeout_us, |status| status & READY == 0)?;
+        self.wait_status(self.ready_timeout_us, |status| status & READY == 0)
+            .map_err(|error| error.at(DISABLE_WAIT))?;
         self.configure_admin()?;
         if let Some(owner) = self.owned.as_mut() {
             owner.lifecycle.enable_dma()?;
@@ -101,14 +102,19 @@ impl Controller {
     /// before its reset, is not a failure; one still set once the
     /// controller is ready, or at the timeout, is.
     fn wait_enabled(&self, timeout: u64) -> Result<(), BlockError> {
+        let fatal = |controller: &Self| {
+            controller
+                .check_fatal()
+                .map_err(|error| within(ENABLE_WAIT, fatal_status(error)))
+        };
         match self.wait_status(timeout, |status| status & READY != 0) {
             Err(BlockError::Timeout) => {
-                self.check_fatal()?;
-                return Err(BlockError::Timeout);
+                fatal(self)?;
+                return Err(BlockError::Timeout.at(ENABLE_WAIT));
             }
             other => other?,
         }
-        self.check_fatal()
+        fatal(self)
     }
 
     /// The admin command creating the I/O completion queue, or with
@@ -153,6 +159,11 @@ impl Controller {
     /// `nvme_timeout` does for the admin queue; a failed reset poisons every
     /// sibling. Only a positively identified CQE or an acknowledged reset
     /// authorizes SQ/PRP/data CPU reuse.
+    ///
+    /// A refusal is the completion's bare status, which callers tell from
+    /// every other failure. A command that got no answer names itself, by
+    /// opcode and Identify CNS or feature, and says when the controller's
+    /// CSTS, not a completion, reported the failure.
     pub(super) fn admin(&mut self, command: [u32; 16]) -> Result<u32, BlockError> {
         self.ready()?;
         self.settle()?;
@@ -162,8 +173,13 @@ impl Controller {
             Err(Lost::Reset(error)) => {
                 // The lost command leaves no admin queue to delete with.
                 self.reset_with(false);
-                self.settle()?;
-                Err(error)
+                // A reset that fails poisons the controller; the command
+                // that was lost is still the error to report.
+                let _ = self.settle();
+                Err(within(
+                    admin_name(command[0] as u8, command[10]),
+                    fatal_status(error),
+                ))
             }
             Err(Lost::Fatal(error)) => Err(self.poison(error)),
         }

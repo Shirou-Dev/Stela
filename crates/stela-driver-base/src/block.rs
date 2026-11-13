@@ -61,6 +61,25 @@ pub enum BlockError {
     PciPower(crate::bus::pci::power::Error),
     /// The device needs something these drivers do not implement.
     Unsupported(&'static str),
+    /// `error`, met at this named step of a device's start: the command
+    /// or register wait that failed.
+    Step {
+        step: &'static str,
+        error: Box<BlockError>,
+    },
+}
+impl BlockError {
+    /// This error as met at `step`. One that already names its step keeps
+    /// it: the innermost name is the command that failed.
+    pub fn at(self, step: &'static str) -> Self {
+        match self {
+            Self::Step { .. } => self,
+            error => Self::Step {
+                step,
+                error: Box::new(error),
+            },
+        }
+    }
 }
 impl From<crate::bus::mmio::owned::Error> for BlockError {
     fn from(error: crate::bus::mmio::owned::Error) -> Self {
@@ -230,6 +249,7 @@ impl fmt::Display for BlockError {
             Self::PciCapability(error) => write!(f, "PCI capability: {error}"),
             Self::PciPower(error) => write!(f, "PCI power/timing: {error}"),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
+            Self::Step { step, error } => write!(f, "{step}: {error}"),
         }
     }
 }

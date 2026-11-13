@@ -208,6 +208,12 @@ struct Model {
     /// Number of Queues features set; whether one was since the last
     /// controller reset; refuse them; and refuse an I/O queue created
     /// before one, with Invalid Field in Command.
+    /// Refuse the Identify with this CNS, with Invalid Field in Command.
+    refuse_identify: Option<u32>,
+    /// Leave every admin command unanswered; and report CSTS.CFS once one
+    /// is.
+    ignore_admin: bool,
+    fatal_on_admin: bool,
     queue_counts: usize,
     queue_count_set: bool,
     refuse_queue_count: bool,
@@ -290,6 +296,9 @@ impl Model {
             mdts: 0,
             nvm_limits: None,
             nvm_identifies: 0,
+            refuse_identify: None,
+            ignore_admin: false,
+            fatal_on_admin: false,
             queue_counts: 0,
             queue_count_set: false,
             refuse_queue_count: false,
@@ -395,6 +404,10 @@ impl Model {
         self.outstanding = true;
         self.drained = false;
         self.record("command");
+        if queue == 0 && self.ignore_admin {
+            self.fatal |= self.fatal_on_admin;
+            return;
+        }
         if holding {
             self.held_io.push(command);
             return;
@@ -430,6 +443,7 @@ impl Model {
                     result = 1;
                 }
             }
+            (0, 6) if self.refuse_identify == Some(command[10]) => status = 2,
             (0, 6) => {
                 let mut data = vec![0; 4096];
                 match command[10] {
@@ -1148,7 +1162,7 @@ fn a_controller_that_never_becomes_ready_fails_within_its_bound() {
     let f = Fixture::new();
     f.model.lock().unwrap().never_ready = true;
     let started = Clock::ticks();
-    assert!(matches!(f.attach(), Err(BlockError::Timeout)));
+    assert_eq!(f.attach().err(), Some(BlockError::Timeout.at(ENABLE_WAIT)));
     let took_us = (Clock::ticks() - started) / 1000;
     assert!((500_000..2_000_000).contains(&took_us), "{took_us}");
 
@@ -1160,7 +1174,7 @@ fn a_controller_that_never_becomes_ready_fails_within_its_bound() {
     }
     let budget = stela_driver_base::budget::Budget::start(clock, 20_000).unwrap();
     let started = Clock::ticks();
-    assert!(matches!(f.attach(), Err(BlockError::Timeout)));
+    assert_eq!(f.attach().err(), Some(BlockError::Timeout.at(ENABLE_WAIT)));
     let took_us = (Clock::ticks() - started) / 1000;
     assert!(took_us < 40_000, "{took_us}");
     assert!(budget.expired().is_some());
@@ -1203,7 +1217,10 @@ fn the_queue_count_is_set_before_the_io_queues_like_nvme_set_queue_count() {
     // Refused, and so are the queues.
     let f = Fixture::new();
     f.model.lock().unwrap().refuse_queue_count = true;
-    assert_eq!(f.attach().err(), Some(BlockError::Device { status: 2 }));
+    assert_eq!(
+        f.attach().err(),
+        Some(BlockError::Device { status: 2 }.at("NVMe Create I/O Completion Queue (opcode 0x05)"))
+    );
 }
 
 /// Linux `nvme_wait_ready` waits for CSTS.RDY alone: a controller showing
@@ -1229,10 +1246,60 @@ fn a_fatal_status_while_enabling_is_waited_out_like_nvme_wait_ready() {
     let f = Fixture::new();
     f.model.lock().unwrap().fatal_while_enabling = usize::MAX;
     let started = Clock::ticks();
-    assert_eq!(f.attach().err(), Some(BlockError::Device { status: 2 }));
+    let error = f.attach().err().unwrap();
+    assert_eq!(
+        format!("{error}"),
+        "NVMe controller enable, waiting for CSTS.RDY: \
+         NVMe controller fatal status, CSTS: device status 0x2"
+    );
     let took_us = (Clock::ticks() - started) / 1000;
     assert!((500_000..2_000_000).contains(&took_us), "{took_us}");
     assert_eq!(f.model.lock().unwrap().commands, 0);
+}
+
+/// A start that fails names the admin command that failed, by opcode and
+/// Identify CNS or feature, and tells a completion's status from the
+/// controller's CSTS and from a command left unanswered.
+#[test]
+fn a_failed_start_names_its_admin_command() {
+    let _clock = crate::test_clock::virtualize();
+    let message = |prepare: fn(&mut Model)| {
+        let f = Fixture::new();
+        prepare(&mut f.model.lock().unwrap());
+        format!("{}", f.attach().err().unwrap())
+    };
+    // A refused command: its completion status.
+    assert_eq!(
+        message(|m| m.refuse_identify = Some(1)),
+        "NVMe Identify Controller (opcode 0x06, CNS 0x01): device status 0x2"
+    );
+    assert_eq!(
+        message(|m| m.refuse_queue_count = true),
+        "NVMe Create I/O Completion Queue (opcode 0x05): device status 0x2"
+    );
+    // An unanswered command: a timeout, here of the first Identify.
+    assert_eq!(
+        message(|m| m.ignore_admin = true),
+        "NVMe Identify Controller (opcode 0x06, CNS 0x01): device timeout"
+    );
+    // A controller that fails while its command waits: CSTS, said so.
+    assert_eq!(
+        message(|m| {
+            m.ignore_admin = true;
+            m.fatal_on_admin = true;
+        }),
+        "NVMe Identify Controller (opcode 0x06, CNS 0x01): \
+         NVMe controller fatal status, CSTS: device status 0x3"
+    );
+    // A controller that never becomes ready, and one that never stops.
+    assert_eq!(
+        message(|m| m.never_ready = true),
+        "NVMe controller enable, waiting for CSTS.RDY: device timeout"
+    );
+    assert_eq!(
+        message(|m| m.stuck_ready = true),
+        "NVMe controller disable, waiting for CSTS.RDY to clear: device timeout"
+    );
 }
 
 #[test]
