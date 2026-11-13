@@ -80,6 +80,7 @@ pub mod source_health;
 pub mod staged_disk;
 pub mod staged_frame;
 pub mod stop_keys;
+pub mod stop_record;
 pub mod storage;
 pub mod topology;
 pub mod tsc;
