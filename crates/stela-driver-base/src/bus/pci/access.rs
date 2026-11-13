@@ -88,6 +88,7 @@ impl core::fmt::Display for Register {
             0x08 => "class and revision",
             0x0c => "header type",
             0x18 => "bus numbers",
+            0x3e => "bridge control",
             _ => return write!(f, "register {:#x}", self.0),
         };
         write!(f, "{name} register ({:#04x})", self.0)

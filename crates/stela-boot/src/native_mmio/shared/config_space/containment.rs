@@ -37,6 +37,16 @@ impl<'a> ContainedPci<'a> {
         self.functions
     }
 
+    /// The first function refused at containment whose Bus Master bit did
+    /// not read clear. It may master DMA that nothing here stopped, so
+    /// nothing that relies on every function being stopped may start.
+    pub(crate) fn unstopped_master(&self) -> Option<Address> {
+        match &*self.source.pci_slots.0.borrow() {
+            Cohort::Parked(fabric) => fabric.unstopped_master,
+            _ => None,
+        }
+    }
+
     /// Original populated bridge routes in upstream-first order.
     pub(crate) fn bridges(&self) -> Result<Vec<Address>, Error> {
         let cohort = self
@@ -53,6 +63,9 @@ impl<'a> ContainedPci<'a> {
             let Some(buses) = slot.header.bridge else {
                 continue;
             };
+            if slot.refusal.is_some() {
+                continue;
+            }
             let secondary = buses.to_le_bytes()[1];
             if secondary > slot.address.bus
                 && fabric
@@ -231,16 +244,29 @@ impl fmt::Display for ContainmentError {
             }
             Cause::Claim(ClaimError::Config(error)) => {
                 write!(f, "{error}")?;
-                if let ConfigFailure::Readback {
-                    offset: COMMAND, ..
-                } = error.reason
-                {
-                    f.write_str(
-                        "; the function keeps bus mastering or INTx on, so Stela cannot hold it \
-                         stopped",
-                    )?;
+                match error.reason {
+                    ConfigFailure::Readback {
+                        offset: COMMAND,
+                        expected,
+                        observed,
+                        ..
+                    } if (expected ^ observed) & u32::from(COMMAND_MASTER) != 0 => f.write_str(
+                        "; the function keeps bus mastering on, so Stela cannot hold it stopped",
+                    ),
+                    ConfigFailure::Readback {
+                        offset: COMMAND, ..
+                    } => f.write_str(
+                        "; the function does not hold INTx Disable, so its INTx cannot be masked \
+                         at the function",
+                    ),
+                    ConfigFailure::Readback {
+                        offset: BRIDGE_CONTROL,
+                        ..
+                    } => f.write_str(
+                        "; its Secondary Bus Reset is set, so the buses below it stay in reset",
+                    ),
+                    _ => Ok(()),
                 }
-                Ok(())
             }
             Cause::Claim(cause) => {
                 write!(f, "{cause}")?;
@@ -297,6 +323,24 @@ impl ContainmentError {
         self.address = Some(address);
         self
     }
+
+    /// Whether this refusal concerns the function alone, as Linux carries
+    /// on past each: a stop control that does not read back (INTx Disable,
+    /// Bus Master, a capability's enable, Secondary Bus Reset), a control
+    /// left in a state Stela does not change, or transactions still
+    /// pending after the wait. A configuration space that cannot be mapped
+    /// or owned, or a header that changed, still stops the whole fabric.
+    fn per_function(&self) -> bool {
+        match self.cause {
+            Cause::Claim(ClaimError::Active { .. }) => true,
+            Cause::Claim(ClaimError::Config(error)) => match error.reason {
+                ConfigFailure::Readback { offset, .. } => !matches!(offset, 0 | 8 | 0x0c | 0x18),
+                ConfigFailure::BusMasterSealed | ConfigFailure::UnqualifiedControl => true,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
 }
 
 struct Slot {
@@ -315,6 +359,14 @@ impl Slot {
         &self,
         mut read: impl FnMut(u16, u8) -> Result<u32, ConfigError>,
     ) -> Result<(), ContainmentError> {
+        // A refused function is never driven. Its stop was judged when it
+        // was refused (see `unstopped_master`); only its place is rechecked.
+        if self.refusal.is_some() {
+            return self
+                .header
+                .verify(|offset| read(offset, 4))
+                .map_err(|error| ContainmentError::from(error).at(self.address));
+        }
         self.header
             .verify(|offset| read(offset, 4))
             .and_then(|()| {
@@ -363,6 +415,14 @@ impl Forwarding {
     }
 }
 
+/// Type 1 Bridge Control, whose Secondary Bus Reset a bridge may hold.
+const BRIDGE_CONTROL: u16 = 0x3e;
+
+/// How long a stopped function may keep Transactions Pending set: Linux's
+/// `pci_wait_for_pending_transaction` polls at 0, 100, 300 and 700 ms and
+/// then carries on.
+const PENDING_TRANSACTIONS_MS: u64 = 700;
+
 fn check_command(
     config: &OwnedConfig,
     expected: u16,
@@ -393,6 +453,8 @@ struct Fabric {
     roots: Vec<Option<Assignment<RootBus>>>,
     slots: Vec<Slot>,
     refusal: Option<SlotRefusal>,
+    /// See [`ContainedPci::unstopped_master`].
+    unstopped_master: Option<Address>,
 }
 
 impl Fabric {
@@ -421,6 +483,9 @@ impl Fabric {
 
 struct SlotRefusal {
     error: ContainmentError,
+    /// Judged when containment refuses it: its Bus Master bit read clear,
+    /// or hard-wired as its plan allows.
+    master_stopped: bool,
     _original: ConfigParts<PrepublicationGrant>,
 }
 
@@ -429,7 +494,24 @@ impl SlotRefusal {
         original.close_admission();
         Self {
             error: error.into(),
+            master_stopped: false,
             _original: original,
+        }
+    }
+
+    /// Refuse a function whose stop did not complete, reading COMMAND once
+    /// to judge whether it can still master DMA.
+    fn unstopped(
+        error: impl Into<ContainmentError>,
+        config: UnpublishedConfig,
+        plan: &Plan,
+    ) -> Self {
+        let master_stopped = config
+            .try_read16(COMMAND)
+            .is_ok_and(|command| plan.master_stopped(command));
+        Self {
+            master_stopped,
+            ..Self::new(error, config.into_parts())
         }
     }
 }
@@ -1009,6 +1091,26 @@ impl Source {
             };
             match result {
                 Ok(parked) => fabric.slots[index].configuration = Some(parked),
+                Err(mut refusal) if refusal.error.per_function() => {
+                    refusal.error.address = Some(address);
+                    let error = refusal.error;
+                    // Reported once here: the slot keeps the refusal, and
+                    // every later claim of it, or of a function below a
+                    // refused bridge, is refused without another stop.
+                    if refusal.master_stopped {
+                        crate::output::arguments(format_args!(
+                            "HOST PCI function not contained: {error}; it stays undriven\n"
+                        ));
+                    } else {
+                        crate::output::arguments(format_args!(
+                            "HOST PCI function not contained: {error}; it stays undriven and may \
+                             still master DMA, so no IOMMU unit is taken and native drivers stay \
+                             refused\n"
+                        ));
+                        fabric.unstopped_master = fabric.unstopped_master.or(Some(address));
+                    }
+                    fabric.slots[index].refusal = Some(refusal);
+                }
                 Err(mut refusal) => {
                     refusal.error.address = Some(address);
                     let error = refusal.error;
@@ -1160,11 +1262,11 @@ impl Source {
             .and_then(|()| plan.apply(&mut config))
         {
             Ok(effect) => effect,
-            Err(error) => return Err(SlotRefusal::new(error, config.into_parts())),
+            Err(error) => return Err(SlotRefusal::unstopped(error, config, plan)),
         };
         let acknowledge = (|| -> Result<(), ClaimError> {
             let started = crate::apic::rdtsc();
-            let limit = (tsc_hz / 1_000 * 64).max(1);
+            let limit = (tsc_hz / 1_000 * PENDING_TRANSACTIONS_MS).max(1);
             wait_for_pending_transactions(&config, || {
                 crate::apic::rdtsc().wrapping_sub(started) >= limit
             })?;
@@ -1178,13 +1280,14 @@ impl Source {
             Ok(())
         })();
         if let Err(cause) = acknowledge {
-            return Err(SlotRefusal::new(
+            return Err(SlotRefusal::unstopped(
                 ContainmentError {
                     address: None,
                     cause: Cause::Claim(cause),
                     effect,
                 },
-                config.into_parts(),
+                config,
+                plan,
             ));
         }
         // SAFETY: the only accesses were synchronous and bounded, with no

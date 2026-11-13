@@ -1074,7 +1074,37 @@ fn containment_refuses_changed_control_before_the_first_write() {
 }
 
 #[test]
-fn containment_refuses_to_replay_function_or_pri_reset_commands() {
+fn containment_clears_an_endpoints_reset_bit_and_keeps_a_ports_bit_15() {
+    // An endpoint's Device Control bit 15 is Initiate FLR: the stop writes
+    // it 0, never back as read.
+    for kind in [0x0, 0x1, 0x9] {
+        let mut function = endpoint();
+        cap(&mut function, 0x40, PCIE, 0);
+        let config = function.config();
+        config.write16(0x42, 2 | kind << 4).unwrap();
+        config.write16(0x48, 1 << 15 | 1 << 11 | 1).unwrap();
+        let plan = containment_plan(config).unwrap();
+        assert!(plan.permits(0x48, 2, 1));
+        plan.apply(config).unwrap();
+        assert_eq!(config.read16(0x48), Ok(1));
+    }
+    // A PCI Express to PCI bridge's Bridge Configuration Retry Enable, and
+    // the reserved bit of the other ports, are kept as found.
+    for kind in [0x4, 0x5, 0x6, 0x7, 0x8, 0xa] {
+        let mut function = endpoint();
+        cap(&mut function, 0x40, PCIE, 0);
+        let config = function.config();
+        config.write16(0x42, 2 | kind << 4).unwrap();
+        config.write16(0x48, 1 << 15 | 1 << 11).unwrap();
+        let plan = containment_plan(config).unwrap();
+        assert!(plan.permits(0x48, 2, 1 << 15));
+        plan.apply(config).unwrap();
+        assert_eq!(config.read16(0x48), Ok(1 << 15));
+    }
+}
+
+#[test]
+fn containment_refuses_to_replay_a_pri_reset_command() {
     use crate::bus::pci::{ConfigError, ConfigFailure};
 
     let mut function = endpoint();
@@ -1083,10 +1113,6 @@ fn containment_refuses_to_replay_function_or_pri_reset_commands() {
     let refused = ClaimError::Config(ConfigError::before_effect(
         ConfigFailure::UnqualifiedControl,
     ));
-    function.config().write16(0x48, 1 << 15).unwrap();
-    assert!(matches!(containment_plan(function.config()), Err(error) if error == refused));
-
-    function.config().write16(0x48, 0).unwrap();
     ext(&mut function, 0x100, PRI, 1, 0);
     function.config().write16(0x104, 2).unwrap();
     assert!(matches!(containment_plan(function.config()), Err(error) if error == refused));
@@ -1161,6 +1187,7 @@ fn containment_seals_a_root_bus_host_bridge_whose_bus_master_is_hardwired() {
     assert_eq!(plan.seal(config), Ok(()));
     assert_eq!(config.read16(regs::COMMAND), Ok(0x0006));
     assert!(config.master_sealed);
+    assert!(plan.master_stopped(0x0006));
     // The stop and the proof write only the stopped value, the one write
     // the containment owner permits.
     assert_eq!(config.command_writes, [0x0402, 0x0402]);
@@ -1288,6 +1315,8 @@ fn containment_refuses_an_interrupt_pin_that_ignores_intx_disable() {
             observed: 2,
         }
     );
+    // Its Bus Master bit cleared: refused alone, it masters nothing.
+    assert!(plan.master_stopped(config.read16(regs::COMMAND).unwrap()));
 }
 
 #[test]
@@ -1309,6 +1338,8 @@ fn containment_refuses_bus_master_that_stays_set_without_a_pin() {
             ..
         }
     ));
+    // It may still master DMA, which its refusal alone does not stop.
+    assert!(!plan.master_stopped(config.read16(regs::COMMAND).unwrap()));
 }
 
 #[test]

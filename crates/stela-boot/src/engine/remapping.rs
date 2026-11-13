@@ -233,6 +233,18 @@ impl Remappers {
     ) -> Self {
         let mmio = pci.source();
         let mut remappers = Self::none();
+        // A function whose Bus Master bit stayed set may master DMA that no
+        // stop accounted for. Every unit then stays as the firmware left it
+        // at ExitBootServices and no native requester is prepared, as when
+        // containment fails: the legacy probe path runs with nothing proven
+        // stopped, and a blocked fabric or untranslated settle, which both
+        // rest on every function being stopped, is never published.
+        if let Some(address) = pci.unstopped_master() {
+            output::arguments(format_args!(
+                "HOST IOMMU not taken: PCI function {address} may still master DMA\n"
+            ));
+            return remappers;
+        }
         let (dmar, ivrs) = {
             // SAFETY: forwarded; the loader root maps the original tables.
             let _root = unsafe { RestoreRoot::enter(root) };

@@ -377,11 +377,18 @@ impl<G: Grant> Region<G> {
         for (index, word) in words.iter_mut().enumerate() {
             *word = self.try_read32(ROUTING_BASE + index as u16 * 4)?;
         }
+        // A bridge holding Secondary Bus Reset keeps the buses below it in
+        // reset. Their functions answered nothing to the census, so the
+        // bridge is refused and the reset is left as found: releasing it
+        // would bring up functions nobody has stopped.
         let control = self.try_read16(BRIDGE_CONTROL)?;
         if control & SECONDARY_BUS_RESET != 0 {
-            return Err(ConfigError::before_effect(
-                ConfigFailure::UnqualifiedControl,
-            ));
+            return Err(ConfigError::before_effect(ConfigFailure::Readback {
+                offset: BRIDGE_CONTROL,
+                width: 2,
+                expected: u32::from(control & !SECONDARY_BUS_RESET),
+                observed: u32::from(control),
+            }));
         }
         self.grant
             .state()

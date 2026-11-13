@@ -80,13 +80,12 @@ impl Plan {
         for entry in Capabilities::new(Transport(read)) {
             let entry = entry?;
             let id = u16::from(entry.id);
-            let (relative, clear, event) = match id {
+            let (relative, mut clear, event) = match id {
                 MSI => (2, 1, 0),
                 MSIX => (2, 1 << 15, 0),
                 PCIE => {
                     express = true;
-                    // Device Control bit 15 can initiate FLR or bridge retry.
-                    (8, 1 << 11, 1 << 15)
+                    (8, 1 << 11, 0)
                 }
                 _ => continue,
             };
@@ -97,6 +96,9 @@ impl Plan {
                 });
             }
             record_capability(&mut seen, id, entry.offset, relative, entry.bytes)?;
+            if id == PCIE {
+                clear |= device_control_reset(read(entry.offset + 2, 2)? as u16);
+            }
             plan.disable(read, entry.offset + relative, clear, event)?;
         }
 
@@ -210,6 +212,18 @@ impl Plan {
         Ok(effect)
     }
 
+    /// Whether a function whose COMMAND reads `command` masters no DMA
+    /// this plan has not accounted for: its Bus Master bit reads clear, or
+    /// it is a bit this plan lets hardware hold set (a root-bus host bridge
+    /// or ISA bridge, see [`Plan::read`]). A function that fails its stop
+    /// is judged by this, whatever else it left running.
+    pub fn master_stopped(&self, command: u16) -> bool {
+        command & regs::COMMAND_MASTER == 0
+            || self.0.iter().any(|control| {
+                control.offset == regs::COMMAND && control.hardwired & regs::COMMAND_MASTER != 0
+            })
+    }
+
     /// Recheck the stopped controls with a read-only configuration view.
     pub fn check_disabled(
         &self,
@@ -268,6 +282,24 @@ pub fn hardwired_master(config: &mut impl ConfigSpace, disabled: u16) -> Result<
     }
     config.write16(regs::COMMAND, disabled)?;
     Ok(config.read16(regs::COMMAND)? & regs::COMMAND_MASTER != 0)
+}
+
+/// The Device Control bit 15 a stop clears, given the PCI Express
+/// Capabilities register `flags`. On an endpoint, legacy endpoint or
+/// root complex integrated endpoint it is Initiate Function Level Reset,
+/// which reads 0: written back as read it could reset the function, and
+/// written 0 it does nothing, so the stop clears it. On a PCI Express to
+/// PCI bridge it is Bridge Configuration Retry Enable, and on the other
+/// port types it is reserved and kept as read, so the stop keeps it.
+/// Linux writes it on neither.
+fn device_control_reset(flags: u16) -> u16 {
+    const ENDPOINT: u16 = 0x0;
+    const LEGACY_ENDPOINT: u16 = 0x1;
+    const INTEGRATED_ENDPOINT: u16 = 0x9;
+    match flags >> 4 & 0xf {
+        ENDPOINT | LEGACY_ENDPOINT | INTEGRATED_ENDPOINT => 1 << 15,
+        _ => 0,
+    }
 }
 
 fn record_capability(

@@ -126,6 +126,22 @@ fn parked_bridge_retains_the_original_route_through_promotion() {
             .unwrap_or_else(|_| panic!("attach"))
     };
     let mut config = attach(UnpublishedConfig::prepare(source.into_prepublication()));
+    // A bridge holding Secondary Bus Reset is refused with the bit named,
+    // and the reset is left as found.
+    // SAFETY: model firmware leaving the reset asserted.
+    unsafe { at(0x3e).cast::<u16>().write_volatile(1 << 6 | 1 << 1) };
+    assert_eq!(
+        config.seal_bus_routing(),
+        Err(ConfigError::before_effect(ConfigFailure::Readback {
+            offset: 0x3e,
+            width: 2,
+            expected: 1 << 1,
+            observed: 1 << 6 | 1 << 1,
+        }))
+    );
+    assert_eq!(read(0x3e, 2), Ok(1 << 6 | 1 << 1));
+    // SAFETY: restore the model.
+    unsafe { at(0x3e).cast::<u16>().write_volatile(0) };
     config.seal_bus_routing().unwrap();
     // SAFETY: the original map has no escaping users.
     let prepared = unsafe { config.park() }.unwrap_or_else(|_| panic!("park"));
