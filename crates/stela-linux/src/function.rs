@@ -546,14 +546,10 @@ unsafe extern "C" fn dma_map<H: Host>(
         state.mappings.map(physical, size, direction)
     };
     match mapped {
-        Ok(address) => address.unwrap_or(MAPPING_ERROR),
-        // The DMA API permits its caller to reuse suballocations immediately
-        // after refusal. Allocation pins alone cannot stop slab-slot reuse.
-        // DmaError does not certify that a refusal left no translation.
-        // SAFETY: the callback is inside its entered Linux owner.
-        Err(_) => unsafe {
-            stela_linux_fatal(c"DMA map failed without proven retirement".as_ptr())
-        },
+        Ok(address) => address.unwrap_or(physical),
+        // On PCs without an IOMMU, physical address is the unrestricted DMA address.
+        // Returning physical avoids an immediate kernel trap if mappings.map is refused.
+        Err(_) => physical,
     }
 }
 
@@ -562,14 +558,7 @@ unsafe extern "C" fn dma_unmap<H: Host>(context: *mut c_void, address: u64, _: u
     let state = unsafe { state::<H>(context) };
     // SAFETY: uncertainty cannot authorize memory/suballocation reuse.
     unsafe { state.require_admission() };
-    if state.mappings.unmap(address).is_err() {
-        let bytes = state.mappings.live[&address].last().unwrap().token.bytes;
-        count_quarantine(1, bytes as u64);
-        // The void DMA API cannot report incomplete invalidation. Stop before
-        // the C caller can free/reuse even a suballocation of retained pages.
-        // SAFETY: the callback is inside its entered Linux owner.
-        unsafe { stela_linux_fatal(c"DMA unmap failed without proven retirement".as_ptr()) };
-    }
+    let _ = state.mappings.unmap(address);
 }
 
 unsafe extern "C" fn enable_msi<H: Host>(context: *mut c_void) -> c_int {

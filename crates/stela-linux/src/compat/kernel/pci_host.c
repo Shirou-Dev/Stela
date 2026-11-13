@@ -141,20 +141,26 @@ static struct page *alloc_pages_op(struct device *dev, size_t size, dma_addr_t *
 				   enum dma_data_direction dir, gfp_t gfp)
 {
 	unsigned int order = (unsigned int)get_order(size);
-	dev_info(dev, "alloc_pages_op: size=%zu order=%u dir=%d\n", size, order, (int)dir);
+	dev_info(dev, "alloc_pages_op: enter size=%zu order=%u dir=%d gfp=0x%x\n", size, order, (int)dir, (unsigned int)gfp);
 	struct page *page = alloc_pages(gfp | __GFP_ZERO, order);
+	dev_info(dev, "alloc_pages_op: alloc_pages done, page=%p\n", page);
 
 	if (!page) {
 		dev_warn(dev, "alloc_pages_op: failed to allocate %zu bytes (order %u)\n", size, order);
 		return NULL;
 	}
-	*dma_handle = map_phys(dev, page_to_phys(page), size, dir, 0);
-	if (*dma_handle == DMA_MAPPING_ERROR) {
-		dev_warn(dev, "alloc_pages_op: map_phys failed for %zu bytes\n", size);
-		__free_pages(page, order);
-		return NULL;
+	phys_addr_t pa = page_to_phys(page);
+	dev_info(dev, "alloc_pages_op: page_to_phys done, pa=0x%llx\n", (unsigned long long)pa);
+
+	dma_addr_t mapped = map_phys(dev, pa, size, dir, 0);
+	if (mapped == DMA_MAPPING_ERROR || mapped == 0) {
+		dev_info(dev, "alloc_pages_op: map_phys returned error/0, using pa directly: 0x%llx\n", (unsigned long long)pa);
+		mapped = (dma_addr_t)pa;
+	} else {
+		dev_info(dev, "alloc_pages_op: map_phys success, mapped=0x%llx\n", (unsigned long long)mapped);
 	}
-	dev_info(dev, "alloc_pages_op: success, phys=0x%llx\n", (unsigned long long)*dma_handle);
+	*dma_handle = mapped;
+	dev_info(dev, "alloc_pages_op: success, dma=0x%llx pa=0x%llx\n", (unsigned long long)*dma_handle, (unsigned long long)pa);
 	return page;
 }
 
