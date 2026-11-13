@@ -271,6 +271,31 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
             functions.len() - CENSUS_LINES
         ));
     }
+    let nvidia = functions
+        .iter()
+        .map(crate::pci_io::FunctionObservation::identity)
+        .any(|identity| identity.vendor == NVIDIA && identity.class[0] == 0x03);
+    if !nvidia {
+        output::arguments(format_args!(
+            "UNSUPPORTED host GPU: no NVIDIA display controller among {} PCI functions\n",
+            functions.len()
+        ));
+        NO_NVIDIA_GPU.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+const NVIDIA: u16 = 0x10de;
+static NO_NVIDIA_GPU: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Said once before an install or a start on a PC with no NVIDIA graphics
+/// card: the install itself draws through no GPU and would finish, and the
+/// installed macOS then could not start.
+pub const NO_NVIDIA_GPU_NOTICE: &str = "No NVIDIA graphics card found: macOS can be installed, \
+    but it starts only with a GeForce GTX 16 or RTX 20, 30, 40 or 50 series card.";
+
+/// Whether the census ([`discover`]) found no NVIDIA display controller.
+pub fn no_nvidia_gpu() -> bool {
+    NO_NVIDIA_GPU.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// What the storage drivers need after ExitBootServices: the ECAM windows,

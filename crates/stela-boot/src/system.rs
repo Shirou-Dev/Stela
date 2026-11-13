@@ -336,6 +336,9 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         crate::status::begin("Finding the PCI devices Stela drives itself");
         let found = storage::discover()?;
         crate::status::done("");
+        if storage::no_nvidia_gpu() {
+            crate::status::info(storage::NO_NVIDIA_GPU_NOTICE);
+        }
         Some(found)
     } else {
         None
