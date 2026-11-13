@@ -164,7 +164,7 @@ fn ep_fp_mac_masks_and_ring_publication_follow_complete_backend_setup() {
         publish(&hw, &rx, &tx, read_station(&hw).unwrap()).unwrap();
         assert_eq!(
             model.read32(RX_CONFIG),
-            (1 << 15) | (1 << 14) | (1 << 11) | (7 << 8) | 0xe
+            (1 << 15) | (1 << 11) | (7 << 8) | 0xe
         );
         for id in [0xc912, 0xc913] {
             let model = Model::ep(&time, rev.version, false);

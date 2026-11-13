@@ -102,12 +102,8 @@ impl Ring {
                 return None;
             }
             fence(Ordering::Acquire);
-            let length = (status & LENGTH) as usize;
-            let good = status & RX_ERRORS == 0
-                && status & (FIRST | LAST) == FIRST | LAST
-                && (18..=MAX_FRAME + 4).contains(&length);
-            let frame = good.then(|| {
-                take(&self.buffers.bytes()[self.next * BUFFER..self.next * BUFFER + length - 4])
+            let frame = received_length(status).map(|length| {
+                take(&self.buffers.bytes()[self.next * BUFFER..self.next * BUFFER + length])
             });
             self.offer(self.next);
             self.next = (self.next + 1) % DESCRIPTORS;
@@ -117,6 +113,16 @@ impl Ring {
         }
         None
     }
+}
+/// A completed receive descriptor's frame length without the FCS, as Linux
+/// `rtl8169_rx_interrupt` decodes it: none with an error bit, none for a
+/// fragment (a frame over one buffer), and none outside 14..=1514 bytes.
+fn received_length(status: u32) -> Option<usize> {
+    let length = (status & LENGTH) as usize;
+    (status & RX_ERRORS == 0
+        && status & (FIRST | LAST) == FIRST | LAST
+        && (18..=MAX_FRAME + 4).contains(&length))
+    .then(|| length - 4)
 }
 fn end(index: usize) -> u32 {
     if index == DESCRIPTORS - 1 { END } else { 0 }
@@ -138,6 +144,30 @@ mod tests {
         assert!(!fits32(0xffff_f000, 4097));
         assert!(!fits32(1u64 << 32, 1));
         assert!(!fits32(u64::MAX - 3, 8));
+    }
+    #[test]
+    fn receive_status_decodes_length_fragments_and_errors() {
+        let whole = FIRST | LAST;
+        assert_eq!(received_length(whole | 64), Some(60));
+        assert_eq!(received_length(whole | 18), Some(14));
+        assert_eq!(
+            received_length(whole | (MAX_FRAME as u32 + 4)),
+            Some(MAX_FRAME)
+        );
+        assert_eq!(received_length(whole | 17), None);
+        assert_eq!(received_length(whole | (MAX_FRAME as u32 + 5)), None);
+        // Checksum results, the ring end and the address-match bits above
+        // the 14-bit length change neither the length nor the verdict.
+        let above = (7 << 14) | (1 << 17) | (1 << 18) | (7 << 25) | END;
+        assert_eq!(received_length(whole | above | 64), Some(60));
+        // RWT, RES, RUNT and CRC each drop the frame.
+        for bit in 19..=22 {
+            assert_eq!(received_length(whole | (1 << bit) | 64), None, "{bit}");
+        }
+        // Fragments of a frame over one buffer are dropped, as Linux does.
+        for fragment in [FIRST, LAST, 0] {
+            assert_eq!(received_length(fragment | 64), None);
+        }
     }
     #[test]
     fn device_ownership_ring_wrap_padding_fcs_and_corruption_boundaries() {

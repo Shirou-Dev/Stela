@@ -235,6 +235,46 @@ fn revision(version: u8) -> Revision {
     revision::detect(xid << 20).unwrap()
 }
 
+#[test]
+fn receive_config_follows_linux_per_version_without_multiple_fetch() {
+    let fifo = (7 << 13) | (7 << 8);
+    let interrupt = (1 << 15) | (7 << 8);
+    let early = interrupt | (1 << 11);
+    let fetch = (8 << 27) | (7 << 8);
+    let expected = [
+        (2, fifo),
+        (6, fifo),
+        (17, fifo),
+        (18, interrupt),
+        (24, interrupt),
+        (25, interrupt),
+        (28, interrupt),
+        (33, interrupt),
+        (34, interrupt),
+        (36, interrupt),
+        (38, interrupt),
+        (40, early),
+        (42, early),
+        (44, early),
+        // RTL8168H (XID 541): Linux's 0x2cf0e less RX_MULTI_EN is 0x8f0e.
+        (46, early),
+        (51, early),
+        (52, early),
+        (61, fetch),
+        (63, fetch | (1 << 11)),
+        (66, fetch | (1 << 11)),
+        (70, fetch | (1 << 11)),
+    ];
+    for (version, value) in expected {
+        assert_eq!(receive_config(version), value, "version {version}");
+        // On the 8169 family (through 17) bit 14 is part of the FIFO threshold.
+        if version >= 18 {
+            assert_eq!(receive_config(version) & (1 << 14), 0, "version {version}");
+        }
+    }
+    assert_eq!(receive_config(46) | RX_ACCEPT, 0x8f0e);
+}
+
 mod admission;
 mod aliases;
 mod command_completion;

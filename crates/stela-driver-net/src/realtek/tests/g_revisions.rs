@@ -129,7 +129,7 @@ fn g_mac_sequences_include_exact_8411b_rx_fix_before_any_descriptor_publication(
         publish(&hw, &rx, &tx, mac).unwrap();
         assert_eq!(
             model.read32(RX_CONFIG),
-            (1 << 15) | (1 << 14) | (1 << 11) | (7 << 8) | 0x0e
+            (1 << 15) | (1 << 11) | (7 << 8) | 0x0e
         );
         assert_eq!(
             model.read32(RX_HIGH),

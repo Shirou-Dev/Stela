@@ -752,6 +752,29 @@ fn station(low: u32, high: u32) -> Option<Mac> {
     let mac = Mac([a[0], a[1], a[2], a[3], b[0], b[1]]);
     (!mac.is_multicast() && mac.0 != [0; 6]).then_some(mac)
 }
+/// RxConfig's FIFO, DMA and fetch bits per MAC version, from Linux
+/// `rtl_init_rxcfg`, without its `RX_MULTI_EN` (bit 14).
+///
+/// Linux sets that bit on versions 18..24, 34..38 and 40..53. It lets the
+/// chip fetch several receive descriptors at once, and Linux gives each
+/// descriptor its own 16 KiB buffer, where this driver packs its buffers
+/// 2 KiB apart in one allocation. With this layout an RTL8168H (version 46)
+/// with the bit set wrote frames into the buffers of other descriptors: the
+/// descriptors it returned were complete and error-free, but their own
+/// buffers stayed zero, so every frame arrived empty. With the bit clear it
+/// received every frame. The bit is only a fetch optimization, so it stays
+/// clear on every version rather than on that one.
+fn receive_config(version: u8) -> u32 {
+    match version {
+        2..=17 => RX_FIFO_THRESHOLD | RX_DMA_BURST,
+        40..=53 => RX_128_INTERRUPTS | RX_DMA_BURST | RX_EARLY_OFF,
+        61 => RX_FETCH_8125 | RX_DMA_BURST,
+        // Bit 11 is RX_PAUSE_SLOT_ON on these: the same bit as RX_EARLY_OFF.
+        63..=66 | 70 => RX_FETCH_8125 | RX_DMA_BURST | RX_EARLY_OFF,
+        _ => RX_128_INTERRUPTS | RX_DMA_BURST,
+    }
+}
+
 fn publish<R: Registers, T: Timer>(
     hw: &Hardware<'_, R, T>,
     rx: &Ring,
@@ -796,19 +819,8 @@ fn publish<R: Registers, T: Timer>(
     r.read8(COMMAND);
     fence(Ordering::SeqCst);
     r.write8(COMMAND, ENABLE);
-    // Linux `rtl_init_rxcfg`, per MAC version.
-    let rxconfig = match revision.version {
-        2..=17 => RX_FIFO_THRESHOLD | RX_DMA_BURST,
-        25 | 26 | 28 | 31 | 32 | 33 => RX_128_INTERRUPTS | RX_DMA_BURST,
-        40 | 42 | 44 | 46 | 51 | 52 => {
-            RX_128_INTERRUPTS | RX_MULTI_ENABLE | RX_DMA_BURST | RX_EARLY_OFF
-        }
-        61 => RX_FETCH_8125 | RX_DMA_BURST,
-        63..=66 | 70 => RX_FETCH_8125 | RX_DMA_BURST | RX_EARLY_OFF,
-        _ => RX_128_INTERRUPTS | RX_MULTI_ENABLE | RX_DMA_BURST,
-    };
     // No promiscuous, error, runt or VLAN-stripping acceptance.
-    r.write32(RX_CONFIG, rxconfig | RX_ACCEPT);
+    r.write32(RX_CONFIG, receive_config(revision.version) | RX_ACCEPT);
     r.write32(MAR0, u32::MAX);
     r.write32(MAR0 + 4, u32::MAX);
     let auto_fifo = match (34..=52).contains(&revision.version) {
