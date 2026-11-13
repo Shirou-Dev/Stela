@@ -8,8 +8,9 @@
 //! maps the pool and the unit's reserved regions one to one. A unit with
 //! none starts blocked. When a device the machine needs attaches only
 //! natively (VMD, EHCI) and the fabric cannot be blocked whole, no unit is
-//! taken. With every unit off, a unit the policy leaves leaves them all, as
-//! a taken unit beside it would keep the IOAPICs refused. A driver that
+//! taken. With every unit off, units that cannot all start blocked are all
+//! left, as any other mix of taken units keeps the IOAPICs and every native
+//! device refused. A driver that
 //! asks the native services for a domain gets its own
 //! ([`Remappers::domain`]).
 //!
@@ -508,9 +509,9 @@ impl Remappers {
                     ));
                     continue;
                 }
-                (_, Mode::Left(Left::Beside)) => {
+                (_, Mode::Left(Left::Incomplete)) => {
                     output::arguments(format_args!(
-                        "HOST IOMMU VT-d unit {:#x} left untranslated: another unit is left and every unit is off, so the machine runs untranslated\n",
+                        "HOST IOMMU VT-d unit {:#x} left untranslated: the units form no complete blocked fabric and every unit is off, so the machine runs untranslated\n",
                         unit.base
                     ));
                     continue;

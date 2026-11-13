@@ -16,10 +16,12 @@
 //!
 //! The IOAPICs and every native attachment need the whole machine's
 //! interrupt and DMA state accounted for: a complete blocked fabric, or no
-//! unit taken with every unit off. A taken unit beside a left one gives
-//! neither, so when the policy leaves one unit (a display behind it, a
-//! reserved region, no requester) and every unit is off, it leaves them
-//! all and the machine runs untranslated, as with no IOMMU described.
+//! unit taken with every unit off. Units taken in any other mix (one beside
+//! a left unit, one in the window, a requester no unit covers) give
+//! neither, so when every unit is off and the units cannot form a complete
+//! blocked fabric, the policy leaves them all and the machine runs
+//! untranslated, as with no IOMMU described. Units the boot could not
+//! prove off keep the mix: leaving them gains nothing.
 use super::{Leave, Present};
 use alloc::vec::Vec;
 use stela_drivers::bus::pci::Identity;
@@ -84,11 +86,14 @@ pub enum Left {
     /// [`super::decide`]'s refusal.
     Policy(Leave),
     /// This requester's driver attaches only on a machine whose units are
-    /// all blocked or all left, and some device needs the drivers' pool.
+    /// all blocked or all left, and the units form no complete blocked
+    /// fabric.
     Native { segment: u16, rid: u16 },
-    /// Another unit is left, and with every unit off a machine is accounted
-    /// for only when it takes none.
-    Beside,
+    /// The units form no complete blocked fabric (another unit is left, a
+    /// requester no unit covers, one needs the drivers' pool or a reserved
+    /// region), and with every unit off such a machine is accounted for
+    /// only when it takes none.
+    Incomplete,
 }
 
 /// How a unit starts.
@@ -161,32 +166,26 @@ pub fn modes(
             .iter()
             .all(|candidate| candidate.decision.is_ok() && candidate.blockable)
         && requesters.iter().all(covered);
+    // Taken units short of a complete blocked fabric leave the IOAPICs and
+    // every native attachment refused; with every unit off, leaving all of
+    // them does not.
+    let leave_all = units_off && !fabric;
     let native = requesters
         .iter()
-        .find(|requester| requester.need == Need::Native)
-        .filter(|_| units_off && !fabric);
-    // A unit left beside taken ones leaves the IOAPICs and every native
-    // attachment refused; with every unit off, leaving all of them does not.
-    let beside = units_off
-        && !fabric
-        && (refused
-            || candidates
-                .iter()
-                .any(|candidate| candidate.decision.is_err()));
+        .find(|requester| requester.need == Need::Native);
     candidates
         .iter()
-        .map(|candidate| match (&candidate.decision, native) {
-            (Err(leave), _) => Mode::Left(Left::Policy(*leave)),
-            (Ok(_), _) if fabric => Mode::Blocked,
-            (Ok(_), Some(native)) => Mode::Left(Left::Native {
-                segment: native.segment,
-                rid: native.rid,
-            }),
-            (Ok(_), None) if beside => Mode::Left(Left::Beside),
-            (Ok(rids), None) if !candidate.blockable || physical(candidate.segment, rids) => {
-                Mode::Window
+        .map(|candidate| match &candidate.decision {
+            Err(leave) => Mode::Left(Left::Policy(*leave)),
+            Ok(_) if fabric => Mode::Blocked,
+            Ok(_) if leave_all => {
+                Mode::Left(native.map_or(Left::Incomplete, |native| Left::Native {
+                    segment: native.segment,
+                    rid: native.rid,
+                }))
             }
-            (Ok(_), None) => Mode::Blocked,
+            Ok(rids) if !candidate.blockable || physical(candidate.segment, rids) => Mode::Window,
+            Ok(_) => Mode::Blocked,
         })
         .collect()
 }

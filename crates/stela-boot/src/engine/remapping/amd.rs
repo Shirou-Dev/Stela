@@ -529,9 +529,9 @@ pub(super) unsafe fn take(
                     "HOST IOMMU AMD-Vi unit {base:#x} left untranslated: {} attaches only natively, which a taken unit beside the drivers' window refuses\n",
                     super::address(segment, rid)
                 )),
-                Left::Beside => left(
+                Left::Incomplete => left(
                     base,
-                    &"another unit is left and every unit is off, so the machine runs untranslated",
+                    &"the units form no complete blocked fabric and every unit is off, so the machine runs untranslated",
                 ),
                 Left::Policy(why) => left(base, &why),
             }
@@ -607,10 +607,10 @@ pub(super) unsafe fn take(
                 outcome.uncertain |= !retire(unit);
                 continue;
             }
-            (_, Mode::Left(Left::Beside)) => {
+            (_, Mode::Left(Left::Incomplete)) => {
                 left(
                     base,
-                    &"another unit is left and every unit is off, so the machine runs untranslated",
+                    &"the units form no complete blocked fabric and every unit is off, so the machine runs untranslated",
                 );
                 outcome.uncertain |= !retire(unit);
                 continue;
