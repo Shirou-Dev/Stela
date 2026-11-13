@@ -85,7 +85,12 @@ pub enum Error {
     PciCapability(crate::bus::pci::CapabilityError),
     Firmware,
     Profile,
-    NotCold,
+    /// A register the firmware left set that a stopped unit's reset did not
+    /// clear, or one that says the unit runs: its offset and value.
+    NotCold {
+        register: usize,
+        value: u64,
+    },
     Busy,
     Requester,
     Exhausted,
@@ -419,13 +424,20 @@ impl<P: ColdPlatform, C: UnitConfig> Unit<P, C> {
         let mut table = unsafe { DeviceTable::new(hardware, &admitted.policies, admitted.bits) }
             .map_err(Error::DeviceTable)?;
         let _guard = engine.resources.platform.enter().map_err(Error::Dma)?;
+        engine.reset_stopped()?;
         engine.check_cold()?;
         let base = table
             .register_for_publication()
             .map_err(Error::DeviceTable)?;
         // Arm before even the first store/callback can unwind or fail.
         engine.exposed.set(true);
-        engine.initialize(base)?;
+        if let Err(error) = engine.initialize(base) {
+            // A unit that did not start is turned off again, as far as its
+            // registers still answer: left on, its table blocks every
+            // device behind it, the boot's own disks included.
+            let _ = engine.write(CONTROL, 0);
+            return Err(error);
+        }
         drop(_guard);
         Ok(Self {
             engine,
@@ -740,7 +752,8 @@ impl<P: ColdPlatform, C: UnitConfig> Unit<P, C> {
             .clock()
             .deadline(self.limits.wait_us);
         loop {
-            if self.engine.read(STATUS)? == 0 && self.engine.read(CONTROL)? == 0 {
+            // Its rings have stopped; an event bit left set runs nothing.
+            if self.engine.read(STATUS)? & RUNNING == 0 && self.engine.read(CONTROL)? == 0 {
                 break;
             }
             if deadline.passed() {

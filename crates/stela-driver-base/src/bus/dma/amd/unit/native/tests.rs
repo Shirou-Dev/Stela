@@ -354,6 +354,32 @@ fn cold_preflight_refusals() {
     }
 }
 
+/// Firmware that set the unit up and stopped it again leaves addresses,
+/// pointers and its IVHD flag bits behind; the unit is reset and taken, as
+/// Linux takes it.
+#[test]
+fn a_stopped_unit_with_firmware_leftovers_comes_up() {
+    let (inspection, platform, peer, bytes) = inputs();
+    peer.set(CONTROL, 1 << 8 | 1 << 9 | COHERENT);
+    peer.set(DEVICE_TABLE, 0x7654_3000 | 0x1ff);
+    peer.set(COMMAND_BASE, 0x7654_5000 | RING_LENGTH);
+    peer.set(EVENT_BASE, 0x7654_7000 | RING_LENGTH);
+    peer.set(EXCLUSION_BASE, 0x7000_0000);
+    peer.set(EXCLUSION_LIMIT, 0x7000_f000);
+    peer.set(COMMAND_HEAD, 0x40);
+    peer.set(COMMAND_TAIL, 0x40);
+    peer.set(EVENT_TAIL, 0x20);
+    let ivrs = Ivrs::parse(&bytes, 8).unwrap();
+    // SAFETY: as in `cold_preflight_refusals`: an isolated register and RAM
+    // peer with its matching IVRS, and nothing running beside it.
+    let unit = unsafe { Unit::cold(inspection, &ivrs, platform, limits()) };
+    assert!(unit.is_ok(), "{:?}", unit.err());
+    assert_eq!(peer.register(STATUS), RUNNING);
+    assert_eq!(peer.register(EXCLUSION_BASE), 0);
+    assert_eq!(peer.register(EXCLUSION_LIMIT), 0);
+    assert_ne!(peer.register(DEVICE_TABLE), 0x7654_3000 | 0x1ff);
+}
+
 fn unit_with_entries(entries: &[u8]) -> (Unit<Platform>, Peer) {
     let (inspection, platform, peer, bytes) = inputs_with_entries(entries);
     let ivrs = Ivrs::parse(&bytes, 8).unwrap();
@@ -600,7 +626,9 @@ fn completion_timeout_quarantines_unit() {
         4,
         "table plus all three actual command/event/store targets retained"
     );
-    assert_ne!(peer.register(CONTROL) & IOMMU_ENABLE, 0);
+    // Turned off again: left on, its table would block every device
+    // behind it, the boot's own disks included. Its memory stays held.
+    assert_eq!(peer.register(CONTROL), 0);
 
     let (mut unit, peer) = model::unit();
     peer.mode(Mode::OldStore);

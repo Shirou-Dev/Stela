@@ -14,8 +14,52 @@ impl<P: ColdPlatform, C: UnitConfig> Engine<P, C> {
             .native_write(offset, value)
             .map_err(Error::Register)
     }
-    pub(super) fn check_cold(&self) -> Result<(), Error> {
+    /// Clear what the firmware left in a unit it stopped. Firmware that set
+    /// the unit up and turned it off again, or only wrote its IVHD flags
+    /// into the control register, leaves table and ring addresses, pointers
+    /// and status bits behind. Linux's `early_enable_iommus` turns every
+    /// unit off and writes all of these anew; so does this, and
+    /// [`Self::check_cold`] then reads them back. A unit that translates or
+    /// runs its rings is left as found, and refused there.
+    pub(super) fn reset_stopped(&self) -> Result<(), Error> {
+        let control = self.read(CONTROL)?;
+        let status = self.read(STATUS)?;
+        if control & (IOMMU_ENABLE | EVENT_ENABLE | COMMAND_ENABLE) != 0 {
+            return Err(Error::NotCold {
+                register: CONTROL,
+                value: control,
+            });
+        }
+        if status & RUNNING != 0 {
+            return Err(Error::NotCold {
+                register: STATUS,
+                value: status,
+            });
+        }
         for offset in [
+            CONTROL,
+            DEVICE_TABLE,
+            COMMAND_BASE,
+            EVENT_BASE,
+            EXCLUSION_BASE,
+            EXCLUSION_LIMIT,
+            COMMAND_HEAD,
+            COMMAND_TAIL,
+            EVENT_HEAD,
+            EVENT_TAIL,
+        ] {
+            if self.read(offset)? != 0 {
+                self.write(offset, 0)?;
+            }
+        }
+        // Its event and wait bits are cleared by writing them.
+        if status != 0 {
+            self.write(STATUS, status)?;
+        }
+        Ok(())
+    }
+    pub(super) fn check_cold(&self) -> Result<(), Error> {
+        for register in [
             CONTROL,
             STATUS,
             DEVICE_TABLE,
@@ -28,12 +72,20 @@ impl<P: ColdPlatform, C: UnitConfig> Engine<P, C> {
             EVENT_HEAD,
             EVENT_TAIL,
         ] {
-            if self.read(offset)? != 0 {
-                return Err(Error::NotCold);
+            let value = self.read(register)?;
+            if value != 0 {
+                return Err(Error::NotCold { register, value });
             }
         }
-        if self.hardware_errors && self.read(HARDWARE_EVENT_STATUS)? != 0 {
-            return Err(Error::NotCold);
+        if self.hardware_errors {
+            // A hardware error the firmware saw is kept as evidence.
+            let value = self.read(HARDWARE_EVENT_STATUS)?;
+            if value != 0 {
+                return Err(Error::NotCold {
+                    register: HARDWARE_EVENT_STATUS,
+                    value,
+                });
+            }
         }
         Ok(())
     }
