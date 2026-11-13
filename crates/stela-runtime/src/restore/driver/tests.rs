@@ -12,6 +12,8 @@ struct Harness {
     closed: Vec<u16>,
     ready: bool,
     failed_write: bool,
+    /// A port whose writes the guest never takes.
+    stalled: Option<u16>,
 }
 impl Ports for Harness {
     type Handle = u16;
@@ -37,6 +39,9 @@ impl Ports for Harness {
     fn write(&mut self, h: u16, b: &[u8]) -> Poll<Result<usize>> {
         if self.failed_write {
             return Poll::Ready(Err(Error::Transport("injected write failure".into())));
+        }
+        if self.stalled == Some(h) {
+            return Poll::Pending;
         }
         self.streams.get_mut(&h).unwrap().write(b)
     }
@@ -82,6 +87,7 @@ fn harness() -> Harness {
         closed: vec![],
         ready: false,
         failed_write: false,
+        stalled: None,
     };
     append(
         &mut h,
@@ -149,7 +155,7 @@ fn transcript_short_io_concurrent_control_jobs_and_final_ack_write() {
     for _ in 0..100_000 {
         assert!(d.poll_prefetched(&mut h).is_pending());
         d.work();
-        d.prefetch(1);
+        d.prefetch(1, || false);
         if d.session.ledger().len() == 6 && d.session.outstanding() == 0 {
             break;
         }
@@ -248,7 +254,7 @@ fn file_data_on_the_control_stream_drains_before_a_competing_reply() {
     for _ in 0..1_000 {
         assert!(d.poll_prefetched(&mut h).is_pending());
         d.work();
-        d.prefetch(1);
+        d.prefetch(1, || false);
         if d.session.outstanding() == 0 && d.session.ledger().len() == 4 {
             break;
         }
@@ -437,4 +443,45 @@ fn a_store_prepared_before_the_guest_reads_nothing_at_the_start() {
     assert!(d.failed().is_none(), "{:?}", d.failed());
     assert_eq!(d.answers.store.reader_mut().reads, before);
     assert_eq!(starts(&sent(&mut h)), 1);
+}
+
+/// A read ahead whose time is over after one job leaves the others to the
+/// next call, which reads for them first: a job whose guest takes nothing
+/// never keeps another from moving on.
+#[test]
+fn a_read_ahead_over_its_time_reads_for_each_job_in_turn() {
+    let payload = vec![7; 3 * 8192];
+    let (mut d, mut h) = setup_with(&payload);
+    h.streams.insert(2346, Memory::new(vec![], 1));
+    h.stalled = Some(2345);
+    restoring(&mut d, &mut h);
+    for port in [2345u64, 2346] {
+        let mut r = request("SourceBootObjectV5", false);
+        if let Value::Dict(m) = &mut r {
+            m.insert("DataPort".into(), Value::Integer(port));
+        }
+        append(&mut h, r);
+    }
+    for _ in 0..100_000 {
+        assert!(d.poll_prefetched(&mut h).is_pending());
+        d.work();
+        d.prefetch(1, || true);
+        if h.closed.contains(&2346) {
+            break;
+        }
+    }
+    assert!(!h.closed.contains(&2345));
+    let s = h.streams.get_mut(&2346).unwrap();
+    s.input = core::mem::take(&mut s.output);
+    s.at = 0;
+    let mut f = Framed::new(Endian::Big, Limits::default());
+    let mut sent = Vec::new();
+    loop {
+        let message = receive(&mut f, s).unwrap();
+        match message.get("FileData") {
+            Some(data) => sent.extend_from_slice(data.data().unwrap()),
+            None => break,
+        }
+    }
+    assert_eq!(sent, payload);
 }

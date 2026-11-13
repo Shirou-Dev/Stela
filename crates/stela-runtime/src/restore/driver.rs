@@ -66,6 +66,9 @@ pub struct Driver<R, H> {
     starting: bool,
     failure: Option<Error>,
     complete: bool,
+    /// The job [`Self::prefetch`] reads for first: the one a call left
+    /// unread when its time was over.
+    prefetch_next: usize,
 }
 impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
     /// The complete inventory is verified (`Store::prepare`) just before
@@ -85,6 +88,7 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
             starting: false,
             failure: None,
             complete: false,
+            prefetch_next: 0,
         })
     }
     /// One bounded framing operation and at most one operation per scheduled
@@ -331,11 +335,24 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
     /// caller that must not hold the ports while it reads the source calls
     /// this between polls, and the polls then send only what it read. A
     /// failed read fails the session at its next poll.
-    pub fn prefetch(&mut self, chunks: usize) {
+    ///
+    /// A caller whose processor waits meanwhile bounds the call: once
+    /// `over` says its time has passed, the jobs not yet read for wait for
+    /// the next call, which reads for them first. One job is always read
+    /// for, so each call moves the restore on.
+    pub fn prefetch(&mut self, chunks: usize, mut over: impl FnMut() -> bool) {
         if self.failure.is_some() || self.complete {
             return;
         }
-        for transfer in &mut self.jobs {
+        let count = self.jobs.len();
+        let first = self.prefetch_next % count.max(1);
+        for step in 0..count {
+            let at = (first + step) % count;
+            if step > 0 && over() {
+                self.prefetch_next = at;
+                return;
+            }
+            let transfer = &mut self.jobs[at];
             // A waiting DataPort job has no receiver yet. Keep the ASR
             // sender's existing prefetch activation before its handshake.
             if transfer.closing

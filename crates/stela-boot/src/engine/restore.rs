@@ -303,6 +303,8 @@ pub struct Experiment {
     mode: Mode,
     /// The mux's backpressure as the last poll found it.
     backpressure: MuxBackpressure,
+    /// The counter's rate, for [`PREFETCH_MICROS`].
+    tsc_hz: u64,
 }
 
 /// How long the guest runs on after its restore fails. A failure is often
@@ -319,6 +321,11 @@ const READ_AHEAD_DEPTH: usize = 4;
 /// the store's largest, which the host's storage moves in its largest
 /// commands.
 const PREFETCH_CHUNKS: usize = 8;
+
+/// The time a service's read ahead goes on to the next job for, as a remote
+/// read waits for the network (`ranges::BUDGET_MS`): its PE's guest waits
+/// meanwhile, and one job's read moves 1 MiB at most.
+const PREFETCH_MICROS: u64 = 20_000;
 
 /// Native services kept for the whole restore session.
 pub struct Services {
@@ -880,6 +887,7 @@ impl Experiment {
             ledger: 0,
             mode,
             backpressure: MuxBackpressure::default(),
+            tsc_hz: handoff.tsc_hz,
         })
     }
     /// Read ahead from the host's storage, without the guest's devices.
@@ -899,10 +907,16 @@ impl Experiment {
 
     /// Read ahead, verified, what the restore sends next, without the
     /// guest's devices: [`Self::poll`] then only copies it to the guest.
+    /// The jobs not read for within [`PREFETCH_MICROS`] are read for first
+    /// at the next service.
     pub fn prefetch(&mut self) {
         if !self.terminal {
             self.driver.answers.store.reader_mut().bound();
-            self.driver.prefetch(PREFETCH_CHUNKS);
+            let started = super::host::rdtsc();
+            let budget = self.tsc_hz / 1_000_000 * PREFETCH_MICROS;
+            self.driver.prefetch(PREFETCH_CHUNKS, || {
+                super::host::rdtsc().wrapping_sub(started) >= budget
+            });
         }
     }
 
