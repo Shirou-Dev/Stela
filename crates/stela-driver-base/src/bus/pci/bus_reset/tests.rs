@@ -10,6 +10,15 @@ type Log = Rc<RefCell<Vec<&'static str>>>;
 struct State {
     words: RefCell<[u32; 64]>,
     silence: Cell<u32>,
+    /// The writes its owner admitted for the restore.
+    admitted: RefCell<Vec<(u16, u8, u32)>>,
+}
+
+impl Contained for Child {
+    fn admit_restore(&mut self, writes: &[(u16, u8, u32)]) -> Result<(), ConfigError> {
+        self.0.admitted.borrow_mut().extend_from_slice(writes);
+        Ok(())
+    }
 }
 
 /// One function below the bridge.
@@ -160,13 +169,14 @@ fn child(at: Address, command: u32) -> Function<Child> {
         config: Child(Rc::new(State {
             words: RefCell::new(words),
             silence: Cell::new(0),
+            admitted: RefCell::new(Vec::new()),
         })),
     }
 }
 
 /// `speed`: the port's Max Link Speed; `reporting`: Data Link Layer Link
 /// Active reporting.
-fn bridge(speed: u32, reporting: bool, children: Vec<Child>, log: &Log) -> Function<Bridge> {
+fn bridge(speed: u32, reporting: bool, children: Vec<Child>, log: &Log) -> Bridge {
     let mut words = [0; 64];
     words[0] = 0x1234_8086;
     words[1] = 0x0010_0007;
@@ -181,19 +191,13 @@ fn bridge(speed: u32, reporting: bool, children: Vec<Child>, log: &Log) -> Funct
     words[0x50 / 4] = u32::from(LINK_ACTIVE) << 16;
     words[0x54 / 4] = HOT_PLUG_CAPABLE;
     words[0x58 / 4] = u32::from(PRESENCE_CHANGE_ENABLE | LINK_CHANGE_ENABLE | 1 << 5);
-    Function {
-        address: address(0, 1, 0),
-        vendor: 0x8086,
-        device: 0x1234,
-        class: [6, 4, 0],
-        config: Bridge {
-            words,
-            children,
-            silence: 2,
-            down: Cell::new(0),
-            link_down: 2,
-            log: log.clone(),
-        },
+    Bridge {
+        words,
+        children,
+        silence: 2,
+        down: Cell::new(0),
+        link_down: 2,
+        log: log.clone(),
     }
 }
 
@@ -237,20 +241,30 @@ fn a_bus_reset_resets_the_device_and_puts_every_function_back() {
         *log.borrow(),
         ["mask", "assert", "release", "clear", "unmask"]
     );
-    let words = port.config.words;
+    let words = port.words;
     assert_eq!(words[usize::from(BRIDGE_CONTROL / 4)] >> 16, 0);
     assert_eq!(
         words[0x58 / 4] & 0xffff,
         u32::from(PRESENCE_CHANGE_ENABLE | LINK_CHANGE_ENABLE | 1 << 5)
     );
     assert_eq!(words[0x58 / 4] >> 16, 0);
+    let gpu_admitted_nothing = gpu.config.0.admitted.borrow().is_empty();
     let gpu = gpu.config.0.words.borrow();
     assert_eq!(
         (gpu[1] & 0xffff, gpu[4], gpu[0x48 / 4]),
         (6, 0xf000_0000, 0x2810)
     );
+    // The audio function's owner admitted exactly its saved state: the
+    // header after COMMAND, the four PCI Express controls, then COMMAND.
+    let admitted = audio[0].config.0.admitted.borrow().clone();
+    assert_eq!(admitted.len(), 13 + 4 + 1);
+    assert_eq!(admitted[0], (0x0c, 4, 0));
+    assert_eq!(admitted[1], (0x10, 4, 0xf100_0000));
+    assert_eq!(admitted[13], (0x48, 2, 0x2810));
+    assert_eq!(admitted[17], (0x04, 2, 0x400));
     let audio = audio[0].config.0.words.borrow();
     assert_eq!((audio[1] & 0xffff, audio[4]), (0x400, 0xf100_0000));
+    assert!(gpu_admitted_nothing);
 }
 
 #[test]
@@ -300,7 +314,7 @@ fn a_bridge_elsewhere_or_already_in_reset_refuses() {
         ))
     );
     let mut gpu = child(address(1, 0, 0), 6);
-    port.config.words[usize::from(BRIDGE_CONTROL / 4)] |= u32::from(SECONDARY_BUS_RESET) << 16;
+    port.words[usize::from(BRIDGE_CONTROL / 4)] |= u32::from(SECONDARY_BUS_RESET) << 16;
     // SAFETY: refused before any effect.
     let reset = unsafe {
         reset_with(&mut port, &mut gpu, &mut none, &[address(1, 0, 0)], |_| {
@@ -332,8 +346,8 @@ fn a_slow_link_waits_one_second_unless_it_reports_itself_up() {
         let mut port = bridge(1, reporting, vec![gpu.config.clone()], &log);
         // Silent through polls of 1 to 512 ms, past the first second, and
         // one more.
-        port.config.silence = 12;
-        port.config.link_down = 0;
+        port.silence = 12;
+        port.link_down = 0;
         let mut none: [Function<Child>; 0] = [];
         let mut waited = 0;
         // SAFETY: the simulated bus has no other owner.
@@ -369,7 +383,7 @@ fn a_fast_link_that_never_comes_back_is_an_error() {
     let log = Log::default();
     let mut gpu = child(address(1, 0, 0), 6);
     let mut port = bridge(3, true, vec![gpu.config.clone()], &log);
-    port.config.link_down = u32::MAX;
+    port.link_down = u32::MAX;
     let mut none: [Function<Child>; 0] = [];
     // SAFETY: the simulated bus has no other owner.
     let reset = unsafe {
@@ -387,4 +401,30 @@ fn a_fast_link_that_never_comes_back_is_an_error() {
         *log.borrow(),
         ["mask", "assert", "release", "clear", "unmask"]
     );
+}
+
+#[test]
+fn a_sibling_that_can_still_master_refuses_before_any_effect() {
+    let log = Log::default();
+    let mut gpu = child(address(1, 0, 0), 6);
+    let mut audio = [child(address(1, 0, 1), 0x404)];
+    let mut port = bridge(3, true, vec![gpu.config.clone()], &log);
+    // SAFETY: refused before any effect.
+    let reset = unsafe {
+        reset_with(
+            &mut port,
+            &mut gpu,
+            &mut audio,
+            &[address(1, 0, 0), address(1, 0, 1)],
+            |_| panic!("no wait"),
+        )
+    };
+    assert_eq!(
+        reset,
+        Err(BlockError::Unsupported(
+            "a function sharing the PCI function's bus is not contained"
+        ))
+    );
+    assert!(log.borrow().is_empty());
+    assert_eq!(gpu.config.0.words.borrow()[1] & 0xffff, 6);
 }

@@ -6,7 +6,7 @@
 //! and their saved state is written back after it.
 use super::{
     Address, BlockError, ConfigError, ConfigSpace, Function, HEADER_BRIDGE, SECONDARY_BUS, Saved,
-    owned::OwnedConfig, power, wait_ready,
+    express_offset, owned::OwnedConfig, power, regs, wait_ready,
 };
 use alloc::vec::Vec;
 use core::cell::Cell;
@@ -55,6 +55,15 @@ pub trait SecondaryBusReset: ConfigSpace {
     unsafe fn set_secondary_bus_reset(&mut self, asserted: bool) -> Result<(), ConfigError>;
 }
 
+/// The configuration of a function its owner keeps contained, beside the
+/// one a bus reset is for.
+pub trait Contained: ConfigSpace {
+    /// Admit exactly `writes`, each an offset, a width in bytes and a value:
+    /// the state saved before the reset, which the restore after it writes
+    /// back, each once.
+    fn admit_restore(&mut self, writes: &[(u16, u8, u32)]) -> Result<(), ConfigError>;
+}
+
 impl SecondaryBusReset for OwnedConfig {
     unsafe fn set_secondary_bus_reset(&mut self, asserted: bool) -> Result<(), ConfigError> {
         // SAFETY: forwarded.
@@ -70,7 +79,9 @@ impl SecondaryBusReset for OwnedConfig {
 /// enabled again. A reset link going down is no Surprise Down error, so
 /// AER and DPC see no event. Each function's header and PCI Express
 /// controls are saved before and written back after, as
-/// [`Function::reset`] does; MSI and MSI-X come back off.
+/// [`Function::reset`] does; MSI and MSI-X come back off. `function` is
+/// disabled before the reset; each sibling must already be contained, its
+/// Bus Master bit clear, and is only saved.
 ///
 /// `present` is every function answering on the bridge's secondary bus;
 /// each must be `function` or one of `siblings`, all one device. Refused
@@ -79,13 +90,14 @@ impl SecondaryBusReset for OwnedConfig {
 /// in reset. This sleeps at least 102 ms.
 ///
 /// # Safety
-/// `present` is the complete census of the bridge's secondary bus, and
+/// `bridge` is the bridge directly above `function`. `present` is the
+/// complete census of the bridge's secondary bus, and
 /// `function` and `siblings` are the only owners of those functions, each
 /// stopped or contained with its DMA accounted for. Nothing else resets or
 /// reconfigures the bridge or the bus meanwhile. After a failure the
 /// functions' state is unknown and the caller keeps them all refused.
 pub unsafe fn reset_secondary_bus<B, C, S>(
-    bridge: &mut Function<B>,
+    bridge: &mut B,
     function: &mut Function<C>,
     siblings: &mut [Function<S>],
     present: &[Address],
@@ -94,7 +106,7 @@ pub unsafe fn reset_secondary_bus<B, C, S>(
 where
     B: SecondaryBusReset,
     C: ConfigSpace,
-    S: ConfigSpace,
+    S: Contained,
 {
     timer.check()?;
     // SAFETY: forwarded.
@@ -108,7 +120,7 @@ where
 /// # Safety
 /// As [`reset_secondary_bus`].
 unsafe fn reset_with<B, C, S>(
-    bridge: &mut Function<B>,
+    bridge: &mut B,
     function: &mut Function<C>,
     siblings: &mut [Function<S>],
     present: &[Address],
@@ -117,34 +129,35 @@ unsafe fn reset_with<B, C, S>(
 where
     B: SecondaryBusReset,
     C: ConfigSpace,
-    S: ConfigSpace,
+    S: Contained,
 {
     qualify(bridge, function, siblings, present)?;
-    let express = bridge.express_offset()?;
+    let express = express_offset(bridge)?;
     let mut saved = Vec::with_capacity(siblings.len());
-    let own = function.express_offset()?;
-    let first = Saved::save_and_disable(&mut function.config, own)?;
-    for sibling in siblings.iter_mut() {
+    for sibling in siblings.iter() {
         let express = sibling.express_offset()?;
-        saved.push(Saved::save_and_disable(&mut sibling.config, express)?);
+        saved.push(Saved::save(&sibling.config, express)?);
     }
+    let own = function.express_offset()?;
+    let first = Saved::save(&function.config, own)?;
+    first.disable(&mut function.config)?;
     let slot = match express {
-        Some(express) => mask_slot(&mut bridge.config, express)?,
+        Some(express) => mask_slot(bridge, express)?,
         None => None,
     };
     // SAFETY: the caller owns every function on the bus, all saved and
     // disabled above; the reset is released below on every path.
-    let asserted = unsafe { bridge.config.set_secondary_bus_reset(true) };
+    let asserted = unsafe { bridge.set_secondary_bus_reset(true) };
     let held = match asserted {
         Ok(()) => delay(RESET_HOLD_US),
         Err(error) => Err(error.into()),
     };
     // SAFETY: as above.
-    let released = unsafe { bridge.config.set_secondary_bus_reset(false) };
+    let released = unsafe { bridge.set_secondary_bus_reset(false) };
     held?;
     released?;
-    let ready = wait_for_bus(&bridge.config, express, function, siblings, &mut delay);
-    let unmasked = slot.map_or(Ok(()), |slot| slot.restore(&mut bridge.config));
+    let ready = wait_for_bus(bridge, express, function, siblings, &mut delay);
+    let unmasked = slot.map_or(Ok(()), |slot| slot.restore(bridge));
     if !ready? {
         return Err(BlockError::Unsupported(
             "PCI function did not return from its bus reset",
@@ -153,6 +166,7 @@ where
     unmasked?;
     first.restore(&mut function.config)?;
     for (sibling, saved) in siblings.iter_mut().zip(saved) {
+        sibling.config.admit_restore(&saved.writes())?;
         saved.restore(&mut sibling.config)?;
     }
     Ok(())
@@ -161,21 +175,20 @@ where
 /// `pci_parent_bus_reset`'s checks, with the device's own other functions
 /// admitted when the caller owns them. Reads only.
 fn qualify<B: ConfigSpace, C: ConfigSpace, S: ConfigSpace>(
-    bridge: &Function<B>,
+    bridge: &B,
     function: &Function<C>,
     siblings: &[Function<S>],
     present: &[Address],
 ) -> Result<(), BlockError> {
     let at = function.address;
-    if bridge.address.segment != at.segment
-        || bridge.header_type()? != HEADER_BRIDGE
-        || bridge.config.read8(SECONDARY_BUS)? != at.bus
+    if bridge.read8(regs::HEADER_TYPE)? & 0x7f != HEADER_BRIDGE
+        || bridge.read8(SECONDARY_BUS)? != at.bus
     {
         return Err(BlockError::Unsupported(
             "PCI bridge does not lead to the function's bus",
         ));
     }
-    if bridge.config.read16(BRIDGE_CONTROL)? & SECONDARY_BUS_RESET != 0 {
+    if bridge.read16(BRIDGE_CONTROL)? & SECONDARY_BUS_RESET != 0 {
         return Err(BlockError::Unsupported(
             "PCI bridge already holds its secondary bus in reset",
         ));
@@ -201,6 +214,13 @@ fn qualify<B: ConfigSpace, C: ConfigSpace, S: ConfigSpace>(
         return Err(BlockError::Unsupported(
             "a bridge shares the PCI function's bus",
         ));
+    }
+    for sibling in siblings {
+        if sibling.config.read16(regs::COMMAND)? & regs::COMMAND_MASTER != 0 {
+            return Err(BlockError::Unsupported(
+                "a function sharing the PCI function's bus is not contained",
+            ));
+        }
     }
     Ok(())
 }

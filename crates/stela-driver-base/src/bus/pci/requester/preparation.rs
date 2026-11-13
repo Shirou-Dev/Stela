@@ -102,12 +102,36 @@ pub unsafe trait Root {
     ) -> Result<Box<dyn AttachmentBackend>, DmaError>;
 }
 
+/// A Secondary Bus Reset of the bus a cold requester sits on, by the owner
+/// of the bridge above it ([`crate::bus::pci::bus_reset`]).
+///
+/// # Safety
+/// `reset` resets only through the forwarding bridge directly above
+/// `function`, and only after checking, in the same exclusive context,
+/// that every other function on that bus is a parked function of the same
+/// device that no driver has claimed or refused. It restores each of those
+/// to its parked, contained state and rechecks the bridge's forwarding and
+/// routing seal before success. A failure keeps every uncertain function
+/// refused. Neither method reenters the requester's preparation.
+pub unsafe trait BusReset {
+    /// Whether `reset` would currently find a bus it may reset. Reads only.
+    fn available(&self) -> bool;
+    /// Reset the bus, restoring `function`'s header and PCI Express
+    /// controls after it as [`Function::reset`] does. Waits at least 102 ms.
+    fn reset(
+        &mut self,
+        function: &mut Function<OwnedConfig>,
+        timer: &dyn crate::bus::pci::power::Timer,
+    ) -> Result<(), crate::block::BlockError>;
+}
+
 struct Resources {
     function: Function<OwnedConfig>,
     retained: ConfigRetention,
     address: Address,
     identity: (u16, u16, [u8; 3]),
     root: Box<dyn Root>,
+    bus_reset: Option<Box<dyn BusReset>>,
 }
 
 /// Dropping preparation cannot establish device stop or root completion.
@@ -121,6 +145,9 @@ impl Drop for Owner {
 impl Owner {
     fn resources(&mut self) -> &mut Resources {
         self.0.as_deref_mut().expect("owned cold requester")
+    }
+    fn peek(&self) -> &Resources {
+        self.0.as_deref().expect("owned cold requester")
     }
     fn completed(mut self) -> Resources {
         *self.0.take().expect("owned cold requester")
@@ -213,6 +240,7 @@ impl PreparingRequester {
             address,
             identity,
             root,
+            bus_reset: None,
         });
         // SAFETY: the exact resource record was initialized above.
         let resources = unsafe { resources.assume_init() };
@@ -223,6 +251,43 @@ impl PreparingRequester {
 
     pub fn function_mut(&mut self) -> &mut Function<OwnedConfig> {
         &mut self.owner.resources().function
+    }
+
+    /// Offer the owning driver a Secondary Bus Reset of the requester's bus.
+    ///
+    /// # Safety
+    /// `reset` is the platform's owner of the bridge above this exact
+    /// function, under the same writer exclusion as its preparation.
+    pub unsafe fn with_bus_reset(mut self, reset: Box<dyn BusReset>) -> Self {
+        self.owner.resources().bus_reset = Some(reset);
+        self
+    }
+
+    /// Whether a Secondary Bus Reset is offered and would currently find
+    /// a bus it may reset. Reads only.
+    pub fn bus_reset_available(&self) -> bool {
+        self.owner
+            .peek()
+            .bus_reset
+            .as_ref()
+            .is_some_and(|reset| reset.available())
+    }
+
+    /// Reset the requester's bus through the offered [`BusReset`], with the
+    /// function's state saved and restored around it. The caller's own use
+    /// of the function, and every CPU view of it, has ended.
+    pub fn reset_bus(
+        &mut self,
+        timer: &dyn crate::bus::pci::power::Timer,
+    ) -> Result<(), crate::block::BlockError> {
+        let resources = self.owner.resources();
+        let reset = resources
+            .bus_reset
+            .as_mut()
+            .ok_or(crate::block::BlockError::Unsupported(
+                "no bus reset is offered for this PCI function",
+            ))?;
+        reset.reset(&mut resources.function, timer)
     }
 
     /// Keep this original function for a driver that never sets Bus Master,

@@ -145,6 +145,16 @@ impl Saved {
         config: &mut C,
         express: Option<u16>,
     ) -> Result<Self, ConfigError> {
+        let saved = Self::save(config, express)?;
+        saved.disable(config)?;
+        Ok(saved)
+    }
+    /// Leave only INTx disabled in the command register.
+    fn disable<C: ConfigSpace>(&self, config: &mut C) -> Result<(), ConfigError> {
+        config.write16(regs::COMMAND, regs::COMMAND_INTX_DISABLE)
+    }
+    /// Save the function's state.
+    fn save<C: ConfigSpace>(config: &C, express: Option<u16>) -> Result<Self, ConfigError> {
         let mut header = [0; HEADER_REST_WORDS];
         for (word, value) in header.iter_mut().enumerate() {
             *value = config.read32(HEADER_REST + word as u16 * 4)?;
@@ -168,23 +178,52 @@ impl Saved {
             }
             None => None,
         };
-        config.write16(regs::COMMAND, regs::COMMAND_INTX_DISABLE)?;
         Ok(Self {
             header,
             command,
             controls,
         })
     }
-    /// Write the saved state back, the command register last.
-    fn restore<C: ConfigSpace>(&self, config: &mut C) -> Result<(), ConfigError> {
-        for (word, value) in self.header.into_iter().enumerate() {
-            config.write32(HEADER_REST + word as u16 * 4, value)?;
-        }
-        for (control, value) in self.controls.into_iter().flatten() {
-            config.write16(control, value)?;
-        }
-        config.write16(regs::COMMAND, self.command)
+    /// The writes [`Self::restore`] makes, in order, each an offset, a width
+    /// in bytes and a value: the command register last.
+    fn writes(&self) -> Vec<(u16, u8, u32)> {
+        let header = self
+            .header
+            .into_iter()
+            .enumerate()
+            .map(|(word, value)| (HEADER_REST + word as u16 * 4, 4, value));
+        let controls = self
+            .controls
+            .into_iter()
+            .flatten()
+            .map(|(control, value)| (control, 2, u32::from(value)));
+        header
+            .chain(controls)
+            .chain([(regs::COMMAND, 2, u32::from(self.command))])
+            .collect()
     }
+    /// Write the saved state back.
+    fn restore<C: ConfigSpace>(&self, config: &mut C) -> Result<(), ConfigError> {
+        for (offset, width, value) in self.writes() {
+            match width {
+                4 => config.write32(offset, value)?,
+                _ => config.write16(offset, value as u16)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The PCI Express capability's offset, from the complete checked list.
+fn express_offset<C: ConfigSpace>(config: &C) -> Result<Option<u16>, CapabilityError> {
+    let mut express = None;
+    for entry in capability::capabilities(config) {
+        let entry = entry?;
+        if entry.id == CAPABILITY_EXPRESS && express.is_none() {
+            express = Some(entry.offset);
+        }
+    }
+    Ok(express)
 }
 
 /// Linux `pci_dev_wait`: poll the Vendor ID, waits doubling from 1 ms, until
@@ -878,11 +917,7 @@ impl<C: ConfigSpace> Function<C> {
     }
     /// The PCI Express capability's offset, from the complete checked list.
     fn express_offset(&self) -> Result<Option<u16>, CapabilityError> {
-        Ok(self
-            .capabilities()?
-            .into_iter()
-            .find(|&(_, id)| id == CAPABILITY_EXPRESS)
-            .map(|(offset, _)| u16::from(offset)))
+        express_offset(&self.config)
     }
     /// Complete checked conventional capability inventory; malformed/access
     /// failures are distinct from an absent capability.
