@@ -24,7 +24,40 @@ pub struct RootWindow {
     pub length: u64,
 }
 
+/// How a root bridge window the firmware describes is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// As described.
+    Kept,
+    /// The maximum lies below the minimum but the length is set: the
+    /// window ends at `minimum + length - 1`. The UEFI root bridge
+    /// configuration leaves the maximum unused, and some firmware puts the
+    /// alignment mask there.
+    Derived,
+    /// No length, or a maximum below the minimum with no length to end
+    /// it: an unset window, left out as Linux leaves it out.
+    Empty,
+}
+
 impl RootWindow {
+    /// Read this window as Linux reads an address space descriptor: a
+    /// window without length is unset and left out, the rest are used.
+    pub fn normalize(&mut self) -> Reading {
+        if self.length == 0 {
+            return Reading::Empty;
+        }
+        if self.maximum >= self.minimum {
+            return Reading::Kept;
+        }
+        match self.minimum.checked_add(self.length - 1) {
+            Some(maximum) => {
+                self.maximum = maximum;
+                Reading::Derived
+            }
+            None => Reading::Empty,
+        }
+    }
+
     fn buses(&self) -> Option<RangeInclusive<u8>> {
         (self.space == 2
             && self.translation == 0
@@ -234,6 +267,36 @@ mod tests {
             length: u64::from(last) - u64::from(first) + 1,
             ..RootWindow::default()
         }
+    }
+
+    #[test]
+    fn unset_windows_are_left_out_and_inverted_ones_end_at_their_length() {
+        let memory = |minimum, maximum, length| RootWindow {
+            minimum,
+            maximum,
+            length,
+            ..RootWindow::default()
+        };
+        let mut kept = memory(0xe000_0000, 0xefff_ffff, 0x1000_0000);
+        assert_eq!(kept.normalize(), Reading::Kept);
+        assert_eq!(kept.maximum, 0xefff_ffff);
+        // The alignment mask in the maximum, as one firmware reports it.
+        let mut derived = memory(0xf600_0000, 0xff_ffff, 0x1a0_0000);
+        assert_eq!(derived.normalize(), Reading::Derived);
+        assert_eq!(derived.maximum, 0xf79f_ffff);
+        for mut empty in [
+            memory(0x1_0000_0000, 0, 0),
+            memory(0xe000_0000, 0xefff_ffff, 0),
+            memory(u64::MAX, 0, 2),
+        ] {
+            assert_eq!(empty.normalize(), Reading::Empty);
+        }
+        let mut bus = RootWindow {
+            space: 2,
+            ..memory(0x10, 0, 0x10)
+        };
+        assert_eq!(bus.normalize(), Reading::Derived);
+        assert_eq!(bus.buses(), Some(0x10..=0x1f));
     }
 
     #[test]

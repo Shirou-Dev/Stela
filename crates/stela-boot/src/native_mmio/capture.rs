@@ -8,7 +8,7 @@ use crate::{
     tables::Frames,
 };
 use core::sync::atomic::{AtomicBool, Ordering};
-use stela_boot_core::firmware_map;
+use stela_boot_core::{ecam::Reading, firmware_map};
 use stela_contracts::refuse;
 use stela_runtime::pc::acpi;
 use uefi::{
@@ -269,7 +269,7 @@ impl Prepared {
                         return Err(refuse!("MMIO root resource type unsupported"));
                     }
                 };
-                wire.roots[wire.root_count] = RootWindow {
+                let mut window = RootWindow {
                     segment: root.segment_nr(),
                     bridge: u32::try_from(bridge + 1)
                         .map_err(|_| refuse!("MMIO bridge count overflow"))?,
@@ -282,6 +282,25 @@ impl Prepared {
                     translation: descriptor.translation_offset,
                     length: descriptor.address_length,
                 };
+                let reading = window.normalize();
+                if reading != Reading::Kept {
+                    crate::output::arguments(format_args!(
+                        "HOST root bridge {} window space={space} min={:#x} max={:#x} length={:#x}: {}\n",
+                        window.bridge,
+                        descriptor.address_min,
+                        descriptor.address_max,
+                        descriptor.address_length,
+                        if reading == Reading::Empty {
+                            "unset, left out"
+                        } else {
+                            "maximum below minimum, ends at minimum + length"
+                        },
+                    ));
+                }
+                if reading == Reading::Empty {
+                    continue;
+                }
+                wire.roots[wire.root_count] = window;
                 wire.root_count += 1;
             }
         }
