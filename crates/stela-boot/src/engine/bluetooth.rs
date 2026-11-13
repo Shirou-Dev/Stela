@@ -14,7 +14,11 @@
 //! no answer, as from a controller that stopped responding.
 //!
 //! The controllers' registers and DMA pages are reached through the loader's
-//! identity root, so each exchange runs in it (`storage::RestoreRoot`).
+//! identity root, so each exchange runs in it (`storage::RestoreRoot`). An
+//! exchange does not wait for the host drivers' lock, which another
+//! processor can hold for longer than a PE's exit may take: while it is
+//! busy the guest's packets wait here and the controller's in the
+//! controller, for the next service turn.
 use super::{output, storage::RestoreRoot};
 use alloc::{boxed::Box, collections::VecDeque, string::String, vec::Vec};
 use stela_drivers::{
@@ -179,7 +183,9 @@ impl HostBluetooth {
         self.waiting.extend(packets);
         // SAFETY: the loader root `storage::open` captured, which maps the
         // controllers' registers and DMA pages for the whole run.
-        let _root = unsafe { RestoreRoot::enter(self.root) };
+        let Some(_root) = (unsafe { RestoreRoot::try_enter(self.root) }) else {
+            return;
+        };
         while let Some(packet) = self.waiting.front() {
             let sent = match (&mut self.controller, packet) {
                 (Controller::Usb(hci), Outbound::Command(bytes)) => hci
@@ -233,7 +239,9 @@ impl HostBluetooth {
             return Vec::new();
         }
         // SAFETY: as in `transmit`.
-        let _root = unsafe { RestoreRoot::enter(self.root) };
+        let Some(_root) = (unsafe { RestoreRoot::try_enter(self.root) }) else {
+            return Vec::new();
+        };
         let received = match &mut self.controller {
             Controller::Modeled { .. } => Ok(Vec::new()),
             Controller::Usb(hci) => hci.poll().map_err(|error| alloc::format!("{error}")),
