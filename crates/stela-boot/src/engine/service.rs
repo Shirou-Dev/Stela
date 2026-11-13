@@ -415,8 +415,17 @@ impl Service {
             lap.part(Part::Restore);
             if !interrupted() {
                 experiment.prefetch();
+                let prefetched = host::rdtsc();
                 experiment.work();
-                lap.part(Part::Read);
+                let (hz, work) = (*tsc_hz, host::rdtsc().wrapping_sub(prefetched));
+                lap.part_of(Part::Read, |took| {
+                    let us = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(hz.max(1));
+                    format!(
+                        " prefetch_us={} work_us={}",
+                        us(took.saturating_sub(work)),
+                        us(work)
+                    )
+                });
                 devices.serve(|devices| experiment.poll(devices));
                 lap.part(Part::Restore);
             }
