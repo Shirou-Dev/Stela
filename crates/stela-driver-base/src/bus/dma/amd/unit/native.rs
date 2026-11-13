@@ -91,6 +91,13 @@ pub enum Error {
         register: usize,
         value: u64,
     },
+    /// The unit did not start. It was turned off again; `stopped` says
+    /// whether its registers then read off, `timeout` whether it failed by
+    /// not running in time.
+    DidNotStart {
+        timeout: bool,
+        stopped: bool,
+    },
     Busy,
     Requester,
     Exhausted,
@@ -103,6 +110,25 @@ pub enum Error {
     DeviceTable(DeviceTableError),
     Translation(TranslationError),
     Dma(DmaError),
+}
+
+impl Error {
+    /// Whether a [`Unit::cold`] that failed with this left the unit off: it
+    /// was refused before any register was written, as a unit its caller
+    /// knows stopped, or it was turned off again and read so. A unit found
+    /// translating or running, or one that did not read off, is not.
+    pub fn leaves_unit_off(&self) -> bool {
+        match *self {
+            Self::NotCold { register, value } => {
+                !(register == CONTROL
+                    && value & (IOMMU_ENABLE | EVENT_ENABLE | COMMAND_ENABLE) != 0)
+                    && !(register == STATUS && value & RUNNING != 0)
+            }
+            Self::DidNotStart { stopped, .. } => stopped,
+            Self::Firmware | Self::Profile | Self::Config(_) | Self::PciCapability(_) => true,
+            _ => false,
+        }
+    }
 }
 
 fn invalidation_error(error: Error) -> DmaError {
@@ -436,7 +462,10 @@ impl<P: ColdPlatform, C: UnitConfig> Unit<P, C> {
             // registers still answer: left on, its table blocks every
             // device behind it, the boot's own disks included.
             let _ = engine.write(CONTROL, 0);
-            return Err(error);
+            return Err(Error::DidNotStart {
+                timeout: error == Error::Timeout,
+                stopped: engine.stopped(),
+            });
         }
         drop(_guard);
         Ok(Self {

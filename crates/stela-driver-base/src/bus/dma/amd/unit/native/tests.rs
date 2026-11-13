@@ -634,7 +634,10 @@ fn completion_timeout_quarantines_unit() {
         // SAFETY: inputs constructs this isolated register/RAM peer and matching IVRS
         // inspection. No firmware or requester runs concurrently; the peer keeps every backing allocation.
         unsafe { Unit::cold(inspection, &ivrs, platform, limits()) },
-        Err(Error::Timeout)
+        Err(error @ Error::DidNotStart {
+            timeout: true,
+            stopped: true
+        }) if error.leaves_unit_off()
     ));
     assert_eq!(
         peer.live_ram(),

@@ -435,8 +435,10 @@ pub(super) unsafe fn take(
         let unit = match unsafe { Unit::cold(inspection, &ivrs, platform, limits) } {
             Ok(unit) => unit,
             Err(error) => {
-                // A failure after its first publication leaves it quarantined.
-                outcome.uncertain = true;
+                // A unit refused before any write, or turned off again and
+                // read off, is as off as the boot found it; any other
+                // failure leaves a state no proof covers.
+                outcome.uncertain |= !error.leaves_unit_off();
                 left(base, &error);
                 continue;
             }

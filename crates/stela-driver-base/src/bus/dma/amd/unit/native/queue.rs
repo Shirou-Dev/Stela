@@ -52,11 +52,34 @@ impl<P: ColdPlatform, C: UnitConfig> Engine<P, C> {
                 self.write(offset, 0)?;
             }
         }
-        // Its event and wait bits are cleared by writing them.
+        // Its event and wait bits are cleared by writing them, as are the
+        // hardware errors the firmware saw.
         if status != 0 {
             self.write(STATUS, status)?;
         }
+        if self.hardware_errors {
+            let errors = self.read(HARDWARE_EVENT_STATUS)?;
+            if errors != 0 {
+                self.write(HARDWARE_EVENT_STATUS, errors)?;
+            }
+        }
         Ok(())
+    }
+    /// Whether the unit reads off within its wait: no enable set and
+    /// neither ring running.
+    pub(super) fn stopped(&self) -> bool {
+        let deadline = self.resources.platform.clock().deadline(self.wait_us);
+        loop {
+            if self.read(CONTROL) == Ok(0)
+                && self.read(STATUS).is_ok_and(|status| status & RUNNING == 0)
+            {
+                return true;
+            }
+            if deadline.passed() {
+                return false;
+            }
+            self.resources.platform.relax();
+        }
     }
     pub(super) fn check_cold(&self) -> Result<(), Error> {
         for register in [
@@ -106,7 +129,9 @@ impl<P: ColdPlatform, C: UnitConfig> Engine<P, C> {
             if self.read(CONTROL)? != self.control {
                 return Err(Error::Fault);
             }
-            if self.read(STATUS)? == RUNNING {
+            // An event bit beside the running bits stops nothing here; the
+            // health check after the first command reads it.
+            if self.read(STATUS)? & RUNNING == RUNNING {
                 break;
             }
             if deadline.passed() {
