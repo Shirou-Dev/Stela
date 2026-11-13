@@ -291,10 +291,6 @@ fn main() -> Status {
     // What this start changes on a PC disk is pending until Stela's own
     // drivers run: before the firmware exits, a PC disk is only read.
     let mut pending = stela_runtime::pc::disk_writes::Pending::default();
-    // A stop the USB's log could not keep last time reaches it now.
-    pending
-        .updates
-        .extend(selection::carry_failure_record(&options));
     status::done("");
     let held = system::held_at_start(&options, &pending);
     let choice::Chosen { options, plan } = choice::choose(&mut volume, options, held, &pending);
@@ -309,12 +305,6 @@ fn main() -> Status {
             "the chosen startup option is not a system-mode boot, so the disk chosen for macOS \
              cannot be prepared; nothing was written to it",
         );
-    }
-    if !pending.updates.is_empty() {
-        output::arguments(format_args!(
-            "PREVIOUS BOOT record not cleared: the chosen startup option is not a system-mode \
-             boot\n"
-        ));
     }
     drop(snapshot);
     if options.starts_with(stela_boot_core::options::HOST_CHECK.as_bytes()) {

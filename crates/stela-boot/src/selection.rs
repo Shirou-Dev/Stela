@@ -27,8 +27,8 @@
 //! boot changes on a PC disk before the firmware exits is pending work
 //! (`pc::disk_writes`), which Stela's drivers do after it: the partition
 //! Install macOS's disk picker has just planned, which is not on its disk
-//! yet, or not blank yet; the NVRAM bank saved without the consumed
-//! variables; a failure record cleared. Every search here takes the pending
+//! yet, or not blank yet; and the NVRAM bank saved without the consumed
+//! variables. Every search here takes the pending
 //! work and reads a partition as that work leaves it: where the plan puts
 //! it, the blocks the plan zeroes reading as zero, and the bytes of the
 //! pending updates in place. So a boot routed again after a refusal finds
@@ -61,10 +61,9 @@ use {
     stela_formats::preboot::PrebootError, stela_runtime::pc::disk_plan::Plan,
     stela_runtime::pc::disk_writes::Pending, stela_runtime::pc::disk_writes::Piece,
     stela_runtime::pc::disk_writes::Purpose, stela_runtime::pc::disk_writes::Update,
-    stela_runtime::pc::failure_record, stela_runtime::pc::machine_state,
-    stela_runtime::pc::storage::Target, stela_soc_data::nor::CAPACITY, stela_soc_data::nor::Image,
-    stela_soc_data::nor::SECTOR_SIZE, stela_soc_data::nor::nvram::Variables,
-    stela_soc_data::nor::nvram::empty_bank,
+    stela_runtime::pc::machine_state, stela_runtime::pc::storage::Target,
+    stela_soc_data::nor::CAPACITY, stela_soc_data::nor::Image, stela_soc_data::nor::SECTOR_SIZE,
+    stela_soc_data::nor::nvram::Variables, stela_soc_data::nor::nvram::empty_bank,
 };
 
 /// One GPT partition, or a part of it, read through its whole disk's block
@@ -372,48 +371,6 @@ fn find<'a>(target: &Target, pending: &'a Pending) -> Result<Partition<'a>> {
         }
         Search::EspPartition => refuse!("the partition is an EFI system partition"),
         Search::Found => refuse!("the partition was found"),
-    })
-}
-
-/// The bytes zeroed to clear a failure record: its header, in whole blocks
-/// of any disk (`failure_record::OFFSET`).
-const RECORD_CLEAR_BYTES: usize = 4096;
-
-/// Copy into the log the record a previous start left in the machine state
-/// of the partition `options` name for it (`--storage` and `--nor` alike)
-/// when the USB's own log was out of reach of Stela's drivers
-/// (`failure_record`). Returns the update that clears it, which Stela's
-/// drivers make when this boot starts them on that partition; a boot that
-/// does not leaves the record, and the next start copies it again.
-pub fn carry_failure_record(options: &[u8]) -> Option<Update> {
-    let text = core::str::from_utf8(options).ok()?;
-    let storage = option(text, "--storage");
-    let target = storage
-        .filter(|_| option(text, "--nor") == storage)
-        .and_then(|name| name.parse::<Target>().ok())?;
-    // Before the startup menu: nothing is pending yet.
-    let pending = Pending::default();
-    let mut partition = search(&target, &pending).ok()?.ok()?;
-    partition.confine(Part::State).ok()?;
-    let mut region = vec![0u8; failure_record::BYTES as usize];
-    partition
-        .read_at(failure_record::OFFSET, &mut region)
-        .ok()?;
-    let record = failure_record::decode(&region)?;
-    output::arguments(format_args!(
-        "PREVIOUS BOOT failed where the USB's log was out of reach; the chosen disk kept:\n"
-    ));
-    for line in record.lines() {
-        output::arguments(format_args!("PREVIOUS BOOT {line}\n"));
-    }
-    // A zero header clears the record.
-    Some(Update {
-        target,
-        purpose: Purpose::FailureRecord,
-        pieces: vec![Piece {
-            offset: partition.offset() + failure_record::OFFSET,
-            bytes: vec![0; RECORD_CLEAR_BYTES],
-        }],
     })
 }
 

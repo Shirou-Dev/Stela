@@ -42,9 +42,7 @@ use stela_runtime::pc::{
     device_starts,
     disk_plan::{LocateError, Plan},
     disk_writes::{Pending, Purpose, Update},
-    failure_record,
     gpt::{Guid, PartitionDevice},
-    machine_state,
     storage::{self, Named, Target},
 };
 
@@ -1498,10 +1496,6 @@ pub struct Selection<'a> {
     /// Where the firmware found the disk Stela started from
     /// (`Handoff::boot_disk`), for the account of a failed search.
     pub boot_disk: Option<&'a str>,
-    /// The target whose partition keeps the machine state in its tail,
-    /// where a stop the USB's log cannot keep leaves its record
-    /// (`failure_record`).
-    pub state: Option<&'a Target>,
     /// The PCI functions an earlier boot did not finish starting, or
     /// skipped since (`Handoff::device_skips`).
     pub device_skips: device_starts::Skips,
@@ -1542,7 +1536,6 @@ pub unsafe fn open(
         wifi,
         external,
         boot_disk,
-        state,
         device_skips,
         device_needs,
     } = *selection;
@@ -1750,18 +1743,13 @@ pub unsafe fn open(
             // What Stela's drivers did find, so the stop tells a disk that
             // never started from one that started as another.
             let log = boot_log(&mut devices.disks);
-            let kept = if early_log || log.is_some() {
-                Keeping::Log
-            } else {
-                Keeping::Screen
-            };
             account(
                 &mut devices,
                 "the disk chosen for macOS",
                 0,
                 boot_disk,
                 targets.first().copied(),
-                kept,
+                early_log || log.is_some(),
             );
             return Err(Refused { refusal, log });
         }
@@ -1958,42 +1946,16 @@ pub unsafe fn open(
                 // partition is not, keeps this step's lines and the account.
                 let log = boot_log(&mut devices.disks);
                 let refusal = refuse!("{role}: {refusal}", role, %refusal);
-                // Without it, the chosen partition's machine state keeps the
-                // step's record for the next boot to copy into the log.
-                // The targets come first, so every one was found when a
-                // later partition is refused.
-                let kept = match (&log, state) {
-                    _ if early_log => Keeping::Log,
-                    (Some(_), _) => Keeping::Log,
-                    (None, Some(target)) if at >= targets.len() => Keeping::Record(target),
-                    (None, _) => Keeping::Screen,
-                };
-                let lines = account(
+                // Without it the stop that follows leaves these lines, its
+                // newest, in the PC's firmware (`stop_record`).
+                account(
                     &mut devices,
                     role,
                     waited.waited_us,
                     boot_disk,
                     targets.first().copied(),
-                    kept,
+                    early_log || log.is_some(),
                 );
-                if let Keeping::Record(target) = kept {
-                    let mut text = String::from(
-                        "STEP Starting the PC's disks and USB devices\n\
-                         STELA FATAL host storage could not be opened: ",
-                    );
-                    text.push_str(&format!("{refusal}\n"));
-                    for line in &lines {
-                        text.push_str(&format!("HOST DISKS {line}\n"));
-                    }
-                    match leave_record(&mut devices.disks, target, &text) {
-                        Ok(()) => output::arguments(format_args!(
-                            "HOST DISKS record left on the chosen partition for the next boot's log\n"
-                        )),
-                        Err(why) => output::arguments(format_args!(
-                            "HOST DISKS no record left on the chosen partition: {why}\n"
-                        )),
-                    }
-                }
                 return Err(Refused { refusal, log });
             }
         }
@@ -2191,8 +2153,7 @@ fn prepare(
 
 /// Make the partition updates decided before the firmware exited
 /// (`pc::disk_writes`), in their order, with each disk's driver: the NVRAM
-/// bank without the one-shot variables this boot consumed, and the clearing
-/// of a failure record the loader copied into the log. Called once a boot,
+/// bank without the one-shot variables this boot consumed. Called once a boot,
 /// after the plan's change and the wait for the boot's partitions, before
 /// any of them is opened; every wait in it is the driver's own bounded one
 /// for a single command.
@@ -2201,9 +2162,8 @@ fn prepare(
 /// it does when the disk keeps none of the machine state's writes
 /// (`nor`): the disk then holds what it held. For the NVRAM bank that is
 /// the one-shot variables, which this boot has acted on and the next start
-/// acts on again; for the failure record, the record, which the next start
-/// copies into the log again. An update for a partition this boot does not
-/// use is not made: only the boot's targets are written.
+/// acts on again. An update for a partition this boot does not use is not
+/// made: only the boot's targets are written.
 fn update(updates: &[Update], targets: &[&Target], disks: &mut [Box<dyn BlockDevice>]) {
     for update in updates {
         let Update {
@@ -2230,13 +2190,6 @@ fn update(updates: &[Update], targets: &[&Target], disks: &mut [Box<dyn BlockDev
                     "NVRAM's startup request could not be cleared: the next start repeats it",
                 );
             }
-            (Purpose::FailureRecord, Ok(())) => output::arguments(format_args!(
-                "PREVIOUS BOOT record cleared on {serial}:{partition}\n"
-            )),
-            (Purpose::FailureRecord, Err(why)) => output::arguments(format_args!(
-                "PREVIOUS BOOT record not cleared on {serial}:{partition}: {why}. The next \
-                 start copies it again\n"
-            )),
         }
     }
 }
@@ -2259,8 +2212,8 @@ fn role_of(at: usize, targets: usize, medium: bool, preboot: bool) -> &'static s
 /// names each; the rest are counted.
 const ACCOUNT_USB_LINES: usize = 6;
 
-/// The few lines a failed disk search leaves on the screen, its only
-/// record when the USB's log is not reached (`logged`): what is missing,
+/// The few lines a failed disk search leaves on the screen and in the
+/// log, and says whether the USB's log is reached (`logged`): what is missing,
 /// where the firmware had found the stick, each controller Stela's drivers
 /// found, each USB device with what failed or was left unused, and each
 /// disk with the partitions its GPT holds
@@ -2271,8 +2224,8 @@ fn account(
     waited_us: u64,
     boot_disk: Option<&str>,
     chosen: Option<&Target>,
-    kept: Keeping<'_>,
-) -> Vec<String> {
+    logged: bool,
+) {
     let mut lines = Vec::new();
     lines.push(match waited_us {
         0 => format!("Not usable: {role}."),
@@ -2376,55 +2329,15 @@ fn account(
         lines.push(String::from("Disks found: none."));
     }
     lines.extend(disks.into_iter().map(|disk| format!("Disk {disk}.")));
-    lines.push(String::from(match kept {
-        Keeping::Log => "The boot log on the USB stick keeps these lines.",
-        Keeping::Record(_) => {
-            "The boot log on the USB stick is out of reach; the chosen disk keeps these lines, \
-             and the next start copies them into it."
-        }
-        Keeping::Screen => {
-            "The boot log on the USB stick is out of reach; this screen is this part's only record."
-        }
+    lines.push(String::from(if logged {
+        "The boot log on the USB stick keeps these lines."
+    } else {
+        "The boot log on the USB stick is out of reach."
     }));
     for line in &lines {
         output::arguments(format_args!("HOST DISKS {line}\n"));
         crate::status::info(line);
     }
-    lines
-}
-
-/// Where a failed disk search's account is kept beyond the screen.
-#[derive(Clone, Copy)]
-enum Keeping<'a> {
-    /// The USB's own log, whose disk was found.
-    Log,
-    /// The machine state of this chosen partition (`failure_record`).
-    Record(&'a Target),
-    Screen,
-}
-
-/// Leave `text` in the machine state of `target`'s partition
-/// (`failure_record`), for the next boot to copy into the USB's log.
-fn leave_record(
-    disks: &mut Vec<Box<dyn BlockDevice>>,
-    target: &Target,
-    text: &str,
-) -> core::result::Result<(), String> {
-    let mut partition = storage::open_shared(disks, &[Named::Disk(target.clone())])
-        .map_err(|(_, error)| format!("{error}"))?
-        .pop()
-        .expect("one partition was named");
-    let block = u64::from(partition.identity().block_size);
-    let split =
-        machine_state::split(partition.identity().bytes()).map_err(|error| format!("{error}"))?;
-    let at = split.state_offset() + failure_record::OFFSET;
-    if block == 0 || !at.is_multiple_of(block) {
-        return Err(format!("{block}-byte blocks do not align the record"));
-    }
-    partition
-        .write(at / block, &failure_record::encode(text))
-        .and_then(|()| partition.flush())
-        .map_err(|error| format!("{error}"))
 }
 
 /// Why [`open`] stopped, and the USB's boot log when its disk was found, so

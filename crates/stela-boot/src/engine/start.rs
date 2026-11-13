@@ -2793,12 +2793,6 @@ fn start_devices(
             let boot_disk = handoff.boot_disk().map(alloc::string::String::from);
             let device_skips = handoff.device_skips;
             let device_needs = handoff.device_needs;
-            // `--nor` naming the `--storage` partition keeps the machine
-            // state in its tail, where a failed start leaves its record.
-            let owned_state = options
-                .storage
-                .clone()
-                .filter(|_| options.nor.is_some() && options.nor == options.storage);
             // Each PCI function's start has its own budget
             // (`stela_drivers::probe::DEVICE_START_US`) and is given up past
             // it; this whole bound only catches a stall outside every
@@ -2833,7 +2827,6 @@ fn start_devices(
                             wifi: owned_wifi.as_ref(),
                             external,
                             boot_disk: boot_disk.as_deref(),
-                            state: owned_state.as_ref(),
                             device_skips,
                             device_needs,
                         },

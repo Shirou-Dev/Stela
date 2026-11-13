@@ -21,7 +21,6 @@ pub mod device_starts;
 pub mod disk_plan;
 pub mod disk_writes;
 pub mod display;
-pub mod failure_record;
 pub mod fat32;
 pub mod fdr_store;
 pub mod gpt;

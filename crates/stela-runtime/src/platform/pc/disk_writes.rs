@@ -48,18 +48,14 @@ pub enum Purpose {
     /// The NVRAM bank without the one-shot variables this boot consumed,
     /// in the NOR's next bank.
     NvramBank,
-    /// The zero header that clears a failed start's record
-    /// (`failure_record`) once the loader has copied it into the log.
-    FailureRecord,
 }
 
 impl Purpose {
-    const ALL: [Self; 2] = [Self::NvramBank, Self::FailureRecord];
+    const ALL: [Self; 1] = [Self::NvramBank];
 
     fn code(self) -> u64 {
         match self {
             Self::NvramBank => 1,
-            Self::FailureRecord => 2,
         }
     }
 }
@@ -507,7 +503,7 @@ mod tests {
     fn pieces_outside_the_partition_or_its_blocks_write_nothing() {
         let piece = |offset, bytes| Update {
             target: target(HELD),
-            purpose: Purpose::FailureRecord,
+            purpose: Purpose::NvramBank,
             pieces: vec![
                 Piece {
                     offset: 0,
@@ -670,7 +666,7 @@ mod tests {
         pending.updates.push(save(HELD, 0x10000));
         pending.updates.push(Update {
             target: target(NEW),
-            purpose: Purpose::FailureRecord,
+            purpose: Purpose::NvramBank,
             pieces: vec![Piece {
                 offset: 0x2000,
                 bytes: vec![0; 4096],
