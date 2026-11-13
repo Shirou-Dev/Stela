@@ -4,11 +4,10 @@ Date: Fri, 13 Nov 2026 15:00:00 +0000
 Subject: [PATCH] fix(nouveau): trace tu102 gsp oneinit and bypass vga workspace mmio
 
 ---
- drivers/gpu/drm/nouveau/nvkm/core/subdev.c           | 11 ++++++-----
- drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c          |  3 +++
- drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c | 24 ++++++++++++++++++++++++
- drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c      | 33 ++++++++++++++++++++++++++-------
- 4 files changed, 59 insertions(+), 12 deletions(-)
+ drivers/gpu/drm/nouveau/nvkm/core/subdev.c      | 11 ++++++-----
+ drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c     |  3 +++
+ drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c | 33 ++++++++++++++++++++++++++-------
+ 3 files changed, 35 insertions(+), 12 deletions(-)
 
 diff --git a/drivers/gpu/drm/nouveau/nvkm/core/subdev.c b/drivers/gpu/drm/nouveau/nvkm/core/subdev.c
 index aab5a73f467a1cc4a28ef1ef6000c929d1e0b43d..6e4f97c092267f830d43fb966bf7308cace08cc5 100644
@@ -228,89 +227,5 @@ index 7c43397c19e61d0b9347ec50034a8808ee0db9fa..dc2158fa3c850605581f1e57f94effca
  
 +	nvkm_info(falcon->user, "gm200_flcn_fw_boot: finished with ret=%d (mbox0=%08x mbox1=%08x)\n", ret, mbox0, mbox1);
  	return ret;
- }
- 
-diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
-index 94925f1590ea48820b50cbbe2ba56562f8b75056..46427478e40ec7bfc5f7a2f4b68235f13a0cb4b3 100644
---- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
-+++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
-@@ -2141,31 +2141,39 @@
- 	u64 size;
- 	int ret;
- 
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: starting\n");
- 	mutex_init(&gsp->cmdq.mutex);
- 	mutex_init(&gsp->msgq.mutex);
- 
- 	/* Load GSP firmware from ELF image into DMA-accessible memory. */
- 	ret = r535_gsp_elf_section(gsp, ".fwimage", &data, &size);
--	if (ret)
--		return ret;
--
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: elf .fwimage ret=%d size=%llu\n", ret, size);
-+	if (ret)
-+		return ret;
-+
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: ctor gsp-rm firmware (%llu bytes)...\n", size);
- 	ret = nvkm_firmware_ctor(&r535_gsp_fw, "gsp-rm", device, data, size, &gsp->fw);
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: ctor gsp-rm firmware ret=%d\n", ret);
- 	if (ret)
- 		return ret;
- 
- 	/* Load relevant signature from ELF image. */
- 	ret = r535_gsp_elf_section(gsp, gsp->func->sig_section, &data, &size);
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: elf sig_section ret=%d size=%llu\n", ret, size);
- 	if (ret)
- 		return ret;
- 
- 	ret = nvkm_gsp_mem_ctor(gsp, ALIGN(size, 256), &gsp->sig);
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: mem_ctor sig ret=%d\n", ret);
- 	if (ret)
- 		return ret;
- 
- 	memcpy(gsp->sig.data, data, size);
- 
- 	/* Build radix3 page table for ELF image. */
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: building radix3 table...\n");
- 	ret = nvkm_gsp_radix3_sg(gsp, &gsp->fw.mem.sgt, gsp->fw.len, &gsp->radix3);
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: radix3 ret=%d\n", ret);
- 	if (ret)
- 		return ret;
- 
-@@ -2183,27 +2191,36 @@
- 	if (rmapi->gsp->drop_post_nocat_record)
- 		rmapi->gsp->drop_post_nocat_record(gsp);
- 
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: ctor rm_boot...\n");
- 	ret = r535_gsp_rm_boot_ctor(gsp);
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: rm_boot_ctor ret=%d\n", ret);
- 	if (ret)
- 		return ret;
- 
- 	/* Release FW images - we've copied them to DMA buffers now. */
- 	nvkm_gsp_dtor_fws(gsp);
- 
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: libos_init...\n");
- 	ret = r535_gsp_libos_init(gsp);
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: libos_init ret=%d\n", ret);
- 	if (WARN_ON(ret))
- 		return ret;
- 
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: set_system_info...\n");
- 	ret = rmapi->gsp->set_system_info(gsp);
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: set_system_info ret=%d\n", ret);
- 	if (WARN_ON(ret))
- 		return ret;
- 
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: rpc_set_registry...\n");
- 	ret = r535_gsp_rpc_set_registry(gsp);
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: rpc_set_registry ret=%d\n", ret);
- 	if (WARN_ON(ret))
- 		return ret;
- 
- 	mutex_init(&gsp->client_id.mutex);
- 	idr_init(&gsp->client_id.idr);
-+	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: complete!\n");
- 	return 0;
  }
  
