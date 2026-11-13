@@ -477,6 +477,7 @@ unsafe fn attach_with_timeout(
         ready_timeout_us: 500_000,
         configuration: CONFIGURATION_VALUE & !ENABLE,
         independent_identify: false,
+        fatal_standing: false,
         version: 0,
         commands: 0,
         scans: 0,

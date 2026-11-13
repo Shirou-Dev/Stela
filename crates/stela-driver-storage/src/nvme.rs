@@ -690,6 +690,11 @@ struct Controller {
     configuration: u32,
     /// CAP.CRMS.CRIMS: namespaces report readiness of their own.
     independent_identify: bool,
+    /// CSTS.CFS already stood when CSTS.RDY rose after the last enable.
+    /// Linux looks at CSTS only once a command timed out, so a controller
+    /// that answers is used, and only a timeout resets it; a CFS that rises
+    /// later still fails a command at once.
+    fatal_standing: bool,
     /// The VS register, read at discovery.
     version: u32,
     /// ONCS from Identify Controller.
@@ -740,6 +745,14 @@ impl Controller {
             status if status & FATAL != 0 => Err(BlockError::Device { status }),
             _ => Ok(()),
         }
+    }
+
+    /// Whether CSTS `status` fails a command at once: CSTS.CFS, unless it
+    /// already stood when the controller became ready
+    /// ([`Self::fatal_standing`]). A command's timeout still looks at the
+    /// raw CSTS, as `nvme_timeout` does.
+    fn fails(&self, status: u32) -> bool {
+        status & FATAL != 0 && !self.fatal_standing
     }
 
     fn poison(&mut self, error: BlockError) -> BlockError {
@@ -937,6 +950,7 @@ pub fn attach(
         ready_timeout_us: 500_000,
         configuration: CONFIGURATION_VALUE & !ENABLE,
         independent_identify: false,
+        fatal_standing: false,
         version: 0,
         commands: 0,
         scans: 0,

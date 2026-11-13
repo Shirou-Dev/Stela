@@ -98,23 +98,26 @@ impl Controller {
     }
 
     /// Linux `nvme_wait_ready` after CC.EN is set: CSTS.RDY alone ends the
-    /// wait. CSTS.CFS standing while the controller starts, left from
-    /// before its reset, is not a failure; one still set once the
-    /// controller is ready, or at the timeout, is.
-    fn wait_enabled(&self, timeout: u64) -> Result<(), BlockError> {
-        let fatal = |controller: &Self| {
-            controller
-                .check_fatal()
-                .map_err(|error| within(ENABLE_WAIT, fatal_status(error)))
-        };
+    /// wait, and Linux reads nothing more of CSTS before its first command.
+    /// CSTS.CFS while the controller starts is waited out; one still set
+    /// once it is ready is kept as standing ([`Self::fails`]), so a
+    /// controller that answers its commands is used, as under Linux. At the
+    /// timeout, a set CFS is the error reported.
+    pub(super) fn wait_enabled(&mut self, timeout: u64) -> Result<(), BlockError> {
         match self.wait_status(timeout, |status| status & READY != 0) {
             Err(BlockError::Timeout) => {
-                fatal(self)?;
+                self.check_fatal()
+                    .map_err(|error| within(ENABLE_WAIT, fatal_status(error)))?;
                 return Err(BlockError::Timeout.at(ENABLE_WAIT));
             }
             other => other?,
         }
-        fatal(self)
+        let status = self.registers.read32(STATUS)?;
+        if status == REMOVED {
+            return Err(removed());
+        }
+        self.fatal_standing = status & FATAL != 0;
+        Ok(())
     }
 
     /// The admin command creating the I/O completion queue, or with
@@ -194,7 +197,7 @@ impl Controller {
     ) -> Result<(u32, u32), Lost> {
         match self.registers.read32(STATUS).map_err(Lost::Fatal)? {
             REMOVED => return Err(Lost::Fatal(removed())),
-            status if status & FATAL != 0 => {
+            status if self.fails(status) => {
                 return Err(Lost::Reset(BlockError::Device { status }));
             }
             _ => {}
@@ -211,7 +214,7 @@ impl Controller {
             if polls.is_multiple_of(STATUS_POLL_INTERVAL) {
                 let lost = match self.registers.read32(STATUS) {
                     Ok(REMOVED) => Some(Lost::Fatal(removed())),
-                    Ok(status) if status & FATAL != 0 => {
+                    Ok(status) if self.fails(status) => {
                         Some(Lost::Reset(BlockError::Device { status }))
                     }
                     Ok(_) => None,

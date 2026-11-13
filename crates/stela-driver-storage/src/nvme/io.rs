@@ -418,7 +418,7 @@ impl Controller {
         self.settle()?;
         match self.registers.read32(STATUS)? {
             REMOVED => return Err(self.poison(removed())),
-            status if status & FATAL != 0 => {
+            status if self.fails(status) => {
                 self.reset();
                 self.settle()?;
             }

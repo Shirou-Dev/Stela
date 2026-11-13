@@ -177,19 +177,21 @@ impl Controller {
                 Ok(())
             }
             Some(Recovery::Enabling(deadline)) => {
-                // As Linux `nvme_wait_ready`: CSTS.CFS fails the enable only
-                // once the controller is ready or its time has passed.
+                // As Linux `nvme_wait_ready`: CSTS.RDY alone ends the wait.
+                // A CSTS.CFS still set then stands ([`Self::fails`]); one
+                // set at the timeout is the error reported.
                 let fatal = status & FATAL != 0;
-                if status & READY == 0 && !deadline.passed() {
-                    self.recovery = Some(Recovery::Enabling(deadline));
-                    return Ok(());
-                }
-                if fatal {
-                    return Err(BlockError::Device { status });
-                }
                 if status & READY == 0 {
+                    if !deadline.passed() {
+                        self.recovery = Some(Recovery::Enabling(deadline));
+                        return Ok(());
+                    }
+                    if fatal {
+                        return Err(BlockError::Device { status });
+                    }
                     return Err(BlockError::Timeout);
                 }
+                self.fatal_standing = fatal;
                 self.bring_up(Step::Identify, Vec::new())
             }
             Some(Recovery::Admin {

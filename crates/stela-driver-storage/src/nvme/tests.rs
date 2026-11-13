@@ -56,6 +56,7 @@ impl Fixture {
             ready_timeout_us: 500_000,
             configuration: CONFIGURATION_VALUE & !ENABLE,
             independent_identify: false,
+            fatal_standing: false,
             version: 0,
             commands: 0,
             scans: 0,
@@ -393,6 +394,66 @@ fn running_id(controller: &Controller, tag: u32) -> u16 {
         Tag::Running { id, .. } => id,
         _ => panic!("tag {tag} runs nothing"),
     }
+}
+
+/// Post, before it is sent, the successful completion of the next admin
+/// command, reporting it fetched.
+fn answer_next_admin(controller: &mut Controller) {
+    let id = controller.command_id.wrapping_add(1);
+    let entry = usize::from(controller.admin.head) * 16;
+    let head = u32::from(controller.admin.next(controller.admin.tail));
+    let phase = u32::from(controller.admin.phase) << 16;
+    controller.admin.completions.write(entry + 8, head);
+    controller
+        .admin
+        .completions
+        .write(entry + 12, phase | u32::from(id));
+}
+
+/// Linux `nvme_wait_ready` ends at CSTS.RDY and reads no more of CSTS
+/// before its first command, whose completion it takes: a CSTS.CFS still
+/// set once the controller is ready stands, at attach and after a reset,
+/// and fails no command the controller answers. A CFS that rises after a
+/// clean start fails the next command before it is sent.
+#[test]
+fn a_fatal_status_standing_at_ready_fails_no_command_the_controller_answers() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.registers.write32(STATUS, READY | FATAL).unwrap();
+    c.wait_enabled(1000).unwrap();
+    assert!(c.fatal_standing);
+    answer_next_admin(&mut c);
+    let identify = c.identify_command(IDENTIFY_CONTROLLER, 0).unwrap();
+    assert_eq!(c.admin(identify), Ok(0));
+    assert_eq!(c.fault, None);
+
+    // A clean start: the CFS that rises later is the controller's failure.
+    c.registers.write32(STATUS, READY).unwrap();
+    c.wait_enabled(1000).unwrap();
+    assert!(!c.fatal_standing);
+    c.registers.write32(STATUS, READY | FATAL).unwrap();
+    let tail = c.admin.tail;
+    assert!(matches!(
+        c.admin_wait(identify, true),
+        Err(Lost::Reset(BlockError::Device { status: 3 }))
+    ));
+    assert_eq!(c.admin.tail, tail, "nothing sent to the failed controller");
+
+    // A reset's enable keeps a CFS standing at ready the same way and
+    // goes on to Identify Controller.
+    c.fatal_standing = false;
+    let deadline = c.deadline(1000).unwrap();
+    c.recovery = Some(Recovery::Enabling(deadline));
+    c.recover().unwrap();
+    assert!(c.fatal_standing);
+    assert!(matches!(
+        c.recovery,
+        Some(Recovery::Admin {
+            step: Step::Identify,
+            ..
+        })
+    ));
 }
 
 #[test]
