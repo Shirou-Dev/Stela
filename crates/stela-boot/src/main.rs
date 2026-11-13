@@ -215,6 +215,21 @@ static MOUNT_INTERFACE: [u8; stela_loader::mount_interface::MARKER_BYTES] =
 #[used]
 static HOST_FIRMWARE_INTERFACE: [u8; 21] = stela_loader::host_firmware::MOUNT_CAPABILITY;
 
+/// Turn off the watchdog firmware arms before it starts a boot program,
+/// which resets the machine unless boot services end within 5 minutes: the
+/// menu, the disk chooser, a slow stick and install verification all take
+/// longer. Nothing arms it again. Firmware without the service is common,
+/// so a refusal is reported once and the boot continues.
+fn stop_firmware_watchdog() {
+    match uefi::boot::set_watchdog_timer(0, 0x10000, None) {
+        Ok(()) => output::arguments(format_args!("FIRMWARE watchdog off\n")),
+        Err(error) => output::arguments(format_args!(
+            "FIRMWARE watchdog not turned off: {:?}; if the firmware armed it, the machine resets 5 minutes after Stela's start\n",
+            error.status()
+        )),
+    }
+}
+
 #[uefi::entry]
 fn main() -> Status {
     // Before any Rust state exists: the system engine runs from this copy.
@@ -227,6 +242,7 @@ fn main() -> Status {
         "STELA UEFI MOUNT version={}\n",
         env!("CARGO_PKG_VERSION")
     ));
+    stop_firmware_watchdog();
     let heap_bytes =
         initial_heap_bytes().unwrap_or_else(|error| output::early_fatal(error.as_str()));
     let heap = uefi::boot::allocate_pages(

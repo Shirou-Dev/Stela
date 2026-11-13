@@ -145,8 +145,6 @@ pub fn run(options: Vec<u8>) -> Result<Vec<u8>> {
         .build
         .as_deref()
         .ok_or(refuse!("install mode needs --install-build"))?;
-    // Verifying tens of gigabytes outlasts the firmware's 5-minute watchdog.
-    boot::set_watchdog_timer(0, 0x10000, None).map_err(|_| refuse!("cannot stop the watchdog"))?;
     let (mut source, payload_path) = Source::find(build)?;
     output::arguments(format_args!(
         "PAYLOAD build={} model={} layout={:?} members={} bytes={} volume={payload_path}\n",
