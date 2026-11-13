@@ -168,12 +168,8 @@ fn read_sized(mut file: RegularFile, path: &str, bytes: u64) -> Result<ReadPages
         .ok_or(refuse!("bundle file is too large"))?;
     let count = length.div_ceil(PAGE).max(1);
     let pages = ReadPages {
-        start: boot::allocate_pages(
-            boot::AllocateType::AnyPages,
-            boot::MemoryType::LOADER_DATA,
-            count,
-        )
-        .map_err(|_| refuse!("firmware has no memory for Stela"))?,
+        start: crate::firmware::any_pages(count)
+            .map_err(|_| refuse!("firmware has no memory for Stela"))?,
         count,
         length,
     };

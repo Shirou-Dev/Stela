@@ -5,7 +5,6 @@ use crate::{
     layout,
 };
 use stela_boot_core::{pe, resident_image::Layout};
-use uefi::boot::{self, AllocateType, MemoryType};
 
 pub(crate) enum Error {
     Allocation(uefi::Status),
@@ -75,8 +74,8 @@ impl ResidentImage {
             .and_then(|bytes| bytes.checked_next_multiple_of(4096))
             .ok_or(Error::Overflow)?;
         let pages = usize::try_from(bytes / 4096).map_err(|_| Error::Overflow)?;
-        let page = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
-            .map_err(|error| Error::Allocation(error.status()))?;
+        let page =
+            crate::firmware::any_pages(pages).map_err(|error| Error::Allocation(error.status()))?;
         // SAFETY: successful fresh firmware allocation owns exactly bytes;
         // zero padding before copying prevents exposing former RAM contents.
         unsafe { page.as_ptr().write_bytes(0, bytes as usize) };

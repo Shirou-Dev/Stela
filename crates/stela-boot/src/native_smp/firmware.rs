@@ -21,7 +21,7 @@ use core::{
     time::Duration,
 };
 use uefi::{
-    boot::{self, AllocateType, MemoryType},
+    boot,
     proto::pi::mp::{CPU_V2_EXTENDED_TOPOLOGY, MpServices},
 };
 
@@ -558,8 +558,7 @@ pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
         snapshots.push(snapshot);
     }
     let pages = record_pages(processors.len()).ok_or(Error::Memory)?;
-    let memory = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
-        .map_err(|_| Error::Memory)?;
+    let memory = crate::firmware::any_pages(pages).map_err(|_| Error::Memory)?;
     // SAFETY: fresh owned firmware pages; all-zero is valid for this closed
     // record of integers/booleans/arrays. No large intermediate sits on a UEFI
     // stack. All protocol/callback/Vec borrows end before ExitBootServices.

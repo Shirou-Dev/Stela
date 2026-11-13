@@ -1,7 +1,7 @@
 //! Firmware task-page ownership, moved once into the engine handoff.
 use crate::{handoff::Region, tables::PAGE};
 use core::sync::atomic::{AtomicBool, Ordering};
-use uefi::boot::{self, AllocateType, MemoryType};
+use uefi::boot;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AllocationError {
@@ -63,7 +63,7 @@ impl Allocation {
             });
         let placed = stela_boot_core::writeback_placement::place(
             || {
-                boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, count)
+                crate::firmware::any_pages(count)
                     .map(|page| page.as_ptr() as u64)
                     .map_err(|error| AllocationError::Firmware(error.status()))
             },

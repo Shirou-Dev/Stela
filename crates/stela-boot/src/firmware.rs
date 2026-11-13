@@ -52,9 +52,49 @@ pub struct Handoff {
 }
 
 pub(crate) fn pages(count: usize) -> Result<usize> {
-    boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, count)
+    any_pages(count)
         .map(|page| page.as_ptr() as usize)
         .map_err(|_| refuse!("firmware has no memory for Stela"))
+}
+
+/// `count` pages of `LOADER_DATA` at any address. Where the firmware refuses
+/// a request that a free run of its own memory map holds, the pages are
+/// taken by address at the top of such a run
+/// ([`stela_boot_core::firmware_pages`]); a refusal that stands is logged
+/// with the largest free runs.
+pub(crate) fn any_pages(count: usize) -> uefi::Result<NonNull<u8>> {
+    use stela_boot_core::firmware_pages;
+    let refusal = match boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, count)
+    {
+        Ok(page) => return Ok(page),
+        Err(refusal) => refusal,
+    };
+    let Ok(map) = boot::memory_map(MemoryType::LOADER_DATA) else {
+        return Err(refusal);
+    };
+    let free: Vec<(u64, u64)> = map
+        .entries()
+        .filter(|entry| entry.ty == MemoryType::CONVENTIONAL)
+        .map(|entry| (entry.phys_start, entry.page_count))
+        .collect();
+    drop(map);
+    for base in firmware_pages::placements(&free, count as u64) {
+        if let Ok(page) =
+            boot::allocate_pages(AllocateType::Address(base), MemoryType::LOADER_DATA, count)
+        {
+            crate::output::arguments(format_args!(
+                "FIRMWARE MEMORY refused {count} pages at any address ({:?}); taken at {base:#x}\n",
+                refusal.status()
+            ));
+            return Ok(page);
+        }
+    }
+    crate::output::arguments(format_args!(
+        "FIRMWARE MEMORY refused {count} pages ({:?}); largest free runs in pages: {:?}\n",
+        refusal.status(),
+        firmware_pages::largest(&free, 4)
+    ));
+    Err(refusal)
 }
 
 fn configured(volume: &mut FileSystem) -> bool {

@@ -93,6 +93,8 @@ pub(crate) fn take_snapshot() -> Option<Snapshot> {
     let (base, bytes) = image.info();
     let extent = firmware::loaded_extent(base as usize, bytes).ok()?;
     let bytes = extent.mapped_bytes;
+    // Taken before the loader's heap exists, so without the fallback of
+    // `firmware::any_pages`, which reads the memory map into it.
     let copy = boot::allocate_pages(
         AllocateType::AnyPages,
         MemoryType::LOADER_DATA,
