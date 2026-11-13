@@ -23,7 +23,7 @@ use super::firmware_requests::Requests;
 use super::storage::RestoreRoot;
 use crate::output;
 use alloc::{string::String, vec::Vec};
-use stela_boot_core::poll_timer::PollTimer;
+use stela_boot_core::{poll_timer::PollTimer, service_watch::Split};
 use stela_drivers::{
     bus::{
         dma::RegionAllocator,
@@ -111,6 +111,15 @@ pub(super) fn report_usb4(location: &str, family: icm::Family, event: &icm::Even
 /// most 255 ms.
 const POLL_HZ: u64 = 16;
 
+/// The pieces of a poll that are timed apart ([`HostUsb::split`]).
+const PIECES: usize = 5;
+const PIECE_NAMES: [&str; PIECES] = ["usb4", "between", "enter", "driver", "leave"];
+const USB4: usize = 0;
+const BETWEEN: usize = 1;
+const ENTER: usize = 2;
+const DRIVER: usize = 3;
+const LEAVE: usize = 4;
+
 /// The owners a poll found that no consumer takes, with the locations of
 /// the devices they came with that are still attached.
 struct Kept {
@@ -158,6 +167,8 @@ pub struct HostUsb {
     _storage: Vec<UsbStorage>,
     /// The timed poll's timer: a poll put off stays due ([`PollTimer`]).
     timer: PollTimer,
+    /// Where the last poll's time went ([`Self::split`]).
+    split: Split<PIECES>,
 }
 
 impl HostUsb {
@@ -190,7 +201,16 @@ impl HostUsb {
             kept: Vec::new(),
             _storage: storage,
             timer: PollTimer::new(tsc_hz / POLL_HZ, super::host::rdtsc()),
+            split: Split::new(PIECE_NAMES),
         }
+    }
+
+    /// Where the last poll's time went, for the report of a service turn
+    /// that held its PE: the USB4 hosts, then over the xHCI controllers the
+    /// time before each, entering the host drivers, inside them and leaving
+    /// them. What the poll took beyond these is its reports of changes.
+    pub(super) fn split(&self) -> &Split<PIECES> {
+        &self.split
     }
 
     /// Whether a host driver found firmware the USB lacks.
@@ -211,30 +231,47 @@ impl HostUsb {
         let mut inputs = Vec::new();
         let now = super::host::rdtsc();
         let timed = self.timer.due(now);
+        self.split.clear();
         let mut put_off = self.poll_usb4(now, timed);
+        let mut stamp = super::host::rdtsc();
+        self.split.add(USB4, now, stamp);
         let firmware = self.firmware;
         for host in &mut self.hosts {
-            let mut changes = {
-                // SAFETY: the loader root captured by `storage::open`
-                // keeps the engine window and maps the controller and DMA pages.
-                // This service runs with the processor's pinned record active.
-                // A busy owner leaves the driver state untouched.
-                let Some(_root) = (unsafe { RestoreRoot::try_enter(self.root) }) else {
-                    put_off = true;
-                    continue;
-                };
-                if !(if host.signals() {
-                    host.due()
-                } else {
-                    timed || host.attachment_due()
-                }) {
-                    continue;
-                }
+            // Each piece of the poll ends at a stamp, so a turn that holds
+            // its PE names the piece ([`Self::split`]).
+            let mut lap = |split: &mut Split<PIECES>, piece: usize| {
+                let now = super::host::rdtsc();
+                split.add(piece, stamp, now);
+                stamp = now;
+            };
+            lap(&mut self.split, BETWEEN);
+            // SAFETY: the loader root captured by `storage::open`
+            // keeps the engine window and maps the controller and DMA pages.
+            // This service runs with the processor's pinned record active.
+            // A busy owner leaves the driver state untouched.
+            let root = unsafe { RestoreRoot::try_enter(self.root) };
+            lap(&mut self.split, ENTER);
+            let Some(root) = root else {
+                put_off = true;
+                continue;
+            };
+            let due = if host.signals() {
+                host.due()
+            } else {
+                timed || host.attachment_due()
+            };
+            let changes = due.then(|| {
                 let changes = host.poll(&mut self.dma, firmware);
                 // A new device's driver may have found its firmware missing;
                 // the record is reached under the same lock.
                 firmware.report();
                 changes
+            });
+            lap(&mut self.split, DRIVER);
+            drop(root);
+            lap(&mut self.split, LEAVE);
+            let Some(mut changes) = changes else {
+                continue;
             };
             for device in &changes.removed {
                 output::arguments(format_args!("USB removed {}\n", device.location));
