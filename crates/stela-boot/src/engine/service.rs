@@ -266,10 +266,7 @@ impl Service {
         };
         let inputs_due = due(INPUTS, false, next);
         if let Some(usb) = usb.as_mut().filter(|_| inputs_due) {
-            let arrived = usb.poll(
-                #[cfg(feature = "diagnostics")]
-                &mut input_turn.usb_wait,
-            );
+            let arrived = usb.poll();
             if let Some(input) = input.as_mut() {
                 input.add(arrived);
             }
@@ -485,7 +482,6 @@ pub(super) struct InputTurn {
     read_done: u64,
     delivery_entered: u64,
     end: u64,
-    usb_wait: u64,
     pub(super) led_wait: u64,
     pub(super) read_wait: u64,
     pub(super) led_changed: bool,
@@ -508,14 +504,13 @@ impl InputTurn {
             self.delivery_entered.wrapping_sub(self.read_done)
         };
         format!(
-            " input_turn_us={} input_turn_boot={} input_usb_us={} input_usb_wait_us={} \
+            " input_turn_us={} input_turn_boot={} input_usb_us={} \
              input_led_us={} input_led_wait_us={} input_led_changed={} input_read_us={} \
              input_read_wait_us={} input_devices={} input_delivery_us={} \
              input_delivery_entry_us={} input_reports={}",
             us(self.duration()),
             self.boot,
             us(self.usb_done.wrapping_sub(self.start)),
-            us(self.usb_wait),
             us(self.led_done.wrapping_sub(self.usb_done)),
             us(self.led_wait),
             self.led_changed,

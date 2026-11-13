@@ -23,6 +23,7 @@ use super::firmware_requests::Requests;
 use super::storage::RestoreRoot;
 use crate::output;
 use alloc::{string::String, vec::Vec};
+use stela_boot_core::poll_timer::PollTimer;
 use stela_drivers::{
     bus::{
         dma::RegionAllocator,
@@ -126,6 +127,20 @@ struct Usb4 {
     pcie_tunnels: usize,
 }
 
+/// Drop the `kept` class owners whose devices are all gone, which can stop
+/// their transfers, unless another processor is inside the host drivers:
+/// they keep for a later turn. `root` is the loader's.
+fn drop_detached(kept: &mut Vec<Kept>, root: u64) {
+    if kept.iter().any(|kept| kept.attached.is_empty()) {
+        // SAFETY: the loader root captured by `storage::open`, as for the
+        // controllers' polls; the service runs with the processor's pinned
+        // record active.
+        if let Some(_root) = unsafe { RestoreRoot::try_enter(root) } {
+            kept.retain(|kept| !kept.attached.is_empty());
+        }
+    }
+}
+
 pub struct HostUsb {
     hosts: Vec<xhci::Host>,
     usb4: Vec<Usb4>,
@@ -141,8 +156,8 @@ pub struct HostUsb {
     /// The storage interfaces probe configured, whose disks the mount
     /// opened: their class owners outlive `open`.
     _storage: Vec<UsbStorage>,
-    interval: u64,
-    last: u64,
+    /// The timed poll's timer: a poll put off stays due ([`PollTimer`]).
+    timer: PollTimer,
 }
 
 impl HostUsb {
@@ -174,8 +189,7 @@ impl HostUsb {
             root,
             kept: Vec::new(),
             _storage: storage,
-            interval: tsc_hz / POLL_HZ,
-            last: super::host::rdtsc(),
+            timer: PollTimer::new(tsc_hz / POLL_HZ, super::host::rdtsc()),
         }
     }
 
@@ -187,43 +201,26 @@ impl HostUsb {
     /// Poll controllers with work or a due attachment timer, and check
     /// non-signalling controllers on the fallback interval. Return the
     /// keyboards and pointers that arrived.
-    pub fn poll(&mut self, #[cfg(feature = "diagnostics")] wait: &mut u64) -> Vec<InputDevice> {
+    ///
+    /// No poll waits for the host drivers' lock: the turn may be a step of
+    /// a PE that runs guest code, and another processor can hold the lock
+    /// for longer than a step may take. A controller whose poll the holder
+    /// put off keeps its work, and the timed poll stays due, for the next
+    /// turn.
+    pub fn poll(&mut self) -> Vec<InputDevice> {
         let mut inputs = Vec::new();
         let now = super::host::rdtsc();
-        let timed = now.wrapping_sub(self.last) >= self.interval;
-        if timed {
-            self.last = now;
-        }
-        self.poll_usb4(
-            now,
-            timed,
-            #[cfg(feature = "diagnostics")]
-            wait,
-        );
+        let timed = self.timer.due(now);
+        let mut put_off = self.poll_usb4(now, timed);
         let firmware = self.firmware;
         for host in &mut self.hosts {
             let mut changes = {
-                // The software attachment timer is owned by this HostUsb.
-                // Before it or the regular timer is due, a busy driver can
-                // leave topology work queued for another service turn.
-                let root = if timed || host.attachment_due() {
-                    // SAFETY: the loader root captured by `storage::open`
-                    // keeps the engine window and maps the controller and DMA pages.
-                    // This service runs with the processor's pinned record active.
-                    let root = unsafe {
-                        RestoreRoot::enter_input(
-                            self.root,
-                            #[cfg(feature = "diagnostics")]
-                            wait,
-                        )
-                    };
-                    Some(root)
-                } else {
-                    // SAFETY: the same root and active pinned record apply here.
-                    // A busy owner leaves the driver state untouched.
-                    unsafe { RestoreRoot::try_enter(self.root) }
-                };
-                let Some(_root) = root else {
+                // SAFETY: the loader root captured by `storage::open`
+                // keeps the engine window and maps the controller and DMA pages.
+                // This service runs with the processor's pinned record active.
+                // A busy owner leaves the driver state untouched.
+                let Some(_root) = (unsafe { RestoreRoot::try_enter(self.root) }) else {
+                    put_off = true;
                     continue;
                 };
                 if !(if host.signals() {
@@ -246,12 +243,7 @@ impl HostUsb {
                         .retain(|location| *location != device.location);
                 }
             }
-            if self.kept.iter().any(|kept| kept.attached.is_empty()) {
-                // Dropping class owners can stop their transfers.
-                // SAFETY: as for the poll above.
-                let _root = unsafe { RestoreRoot::enter(self.root) };
-                self.kept.retain(|kept| !kept.attached.is_empty());
-            }
+            drop_detached(&mut self.kept, self.root);
             let added = &mut changes.added;
             for (location, error) in &added.failures {
                 output::arguments(format_args!("{}", xhci::failure_line(location, error)));
@@ -285,14 +277,21 @@ impl HostUsb {
                 });
             }
         }
+        // Owners a busy lock kept on an earlier turn.
+        drop_detached(&mut self.kept, self.root);
+        if timed {
+            self.timer.ended(now, put_off);
+        }
         inputs
     }
 
     /// Run each running USB4 host's software connection manager for up to a
     /// millisecond, and, when `timed`, service each firmware's events. A host whose
-    /// transport faults is reported once and left stopped.
-    fn poll_usb4(&mut self, now: u64, timed: bool, #[cfg(feature = "diagnostics")] wait: &mut u64) {
+    /// transport faults is reported once and left stopped. Whether a host
+    /// was put off because another processor is inside the host drivers.
+    fn poll_usb4(&mut self, now: u64, timed: bool) -> bool {
         let now_ms = now / self.tsc_per_ms;
+        let mut put_off = false;
         for usb4 in &mut self.usb4 {
             if !usb4.running {
                 continue;
@@ -304,12 +303,9 @@ impl HostUsb {
                     for _ in 0..USB4_EVENTS {
                         let event = {
                             // SAFETY: as for the xHCI controllers below.
-                            let _root = unsafe {
-                                RestoreRoot::enter_input(
-                                    self.root,
-                                    #[cfg(feature = "diagnostics")]
-                                    wait,
-                                )
+                            let Some(_root) = (unsafe { RestoreRoot::try_enter(self.root) }) else {
+                                put_off = true;
+                                break;
                             };
                             icm.poll(now_ms)
                         };
@@ -330,12 +326,9 @@ impl HostUsb {
                 usb4::Connection::Software { manager } => {
                     {
                         // SAFETY: as for the xHCI controllers below.
-                        let _root = unsafe {
-                            RestoreRoot::enter_input(
-                                self.root,
-                                #[cfg(feature = "diagnostics")]
-                                wait,
-                            )
+                        let Some(_root) = (unsafe { RestoreRoot::try_enter(self.root) }) else {
+                            put_off = true;
+                            continue;
                         };
                         loop {
                             usb4.running = manager.poll();
@@ -358,5 +351,6 @@ impl HostUsb {
                 }
             }
         }
+        put_off
     }
 }
