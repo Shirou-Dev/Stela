@@ -1567,6 +1567,33 @@ pub unsafe fn probe_observed(
         }};
     }
     let mut claimed = Claimed::default();
+    // A driver that enables a function needs every bridge above it to
+    // forward the function's DMA and message interrupts upstream: Linux's
+    // `pci_enable_bridge`. A mount that stopped the bridges and did not
+    // reopen them itself leaves that to this probe, which opens them all
+    // before any function starts, the observer's first one included.
+    let mut scanned = scanned;
+    if legacy_pci_writes {
+        for function in scanned.iter_mut().flatten() {
+            if function.class[..2] != [6, 4] {
+                continue;
+            }
+            let address = function.address;
+            let opened = (|| -> Result<bool, BlockError> {
+                use crate::bus::pci::{ConfigSpace, regs};
+                if function.config().read16(regs::COMMAND)? & regs::COMMAND_MASTER != 0 {
+                    return Ok(false);
+                }
+                function.enable_memory_and_bus_master()?;
+                Ok(true)
+            })();
+            match opened {
+                Ok(true) => devices.bridges_reopened.push(address),
+                Ok(false) => {}
+                Err(error) => devices.failures.push((address, error.into())),
+            }
+        }
+    }
     let (scanned, mut first_pending) = first_of(scanned, observer.first());
     let mut seen = 0usize;
     for found in scanned {
@@ -1609,20 +1636,6 @@ pub unsafe fn probe_observed(
             if function.class[..2] == [6, 4] {
                 use crate::bus::pci::ConfigSpace;
                 let checked = (|| -> Result<_, BlockError> {
-                    // A driver that enables a function needs every bridge
-                    // above it to forward the function's DMA and message
-                    // interrupts upstream: Linux's `pci_enable_bridge`. A
-                    // mount that stopped the bridges and did not reopen
-                    // them itself leaves that to this scan, which visits a
-                    // bridge before the functions below it.
-                    if legacy_pci_writes
-                        && function.config().read16(crate::bus::pci::regs::COMMAND)?
-                            & crate::bus::pci::regs::COMMAND_MASTER
-                            == 0
-                    {
-                        function.enable_memory_and_bus_master()?;
-                        devices.bridges_reopened.push(address);
-                    }
                     Ok(native::Bridge {
                         address,
                         secondary: function.config().read8(0x19)?,
@@ -3226,15 +3239,36 @@ mod tests {
     /// `pci_enable_bridge` does, and says so. One that forwards is left.
     #[test]
     fn a_bridge_with_bus_mastering_off_is_reopened_for_the_functions_below_it() {
+        /// Whether the bridge forwarded as each function's start was told.
+        struct Forwarding {
+            command: *const u32,
+            first: Address,
+            seen: Vec<bool>,
+        }
+        impl Observer for Forwarding {
+            fn first(&self) -> Option<Address> {
+                Some(self.first)
+            }
+            fn starting(&mut self, _: &crate::bus::pci::Identity) -> Start {
+                // SAFETY: the test's own ECAM words, alive for the probe.
+                self.seen
+                    .push(unsafe { self.command.read_volatile() } & 4 != 0);
+                Start::Skip("left alone")
+            }
+        }
         let mut ecam = alloc::vec![u32::MAX; (1 << 20) / 4];
-        for (device, command) in [(0, 0x0002), (1, 0x0006)] {
+        for (device, command, class, header) in [
+            (0, 0x0002, 0x0604_0000, 0x0001_0000),
+            (1, 0x0006, 0x0604_0000, 0x0001_0000),
+            (2, 0x0002, 0x0c03_3000, 0),
+        ] {
             let start = device * (1 << 15) / 4;
             let page = &mut ecam[start..start + 4096 / 4];
             page.fill(0);
             page[0] = 0x5678_1234;
             page[1] = command;
-            page[2] = 0x0604_0000;
-            page[3] = 0x0001_0000;
+            page[2] = class;
+            page[3] = header;
         }
         let window = EcamWindow {
             base: ecam.as_mut_ptr() as u64,
@@ -3252,31 +3286,38 @@ mod tests {
             firmware: None,
             completion: None,
         };
+        let address = |device| Address {
+            segment: 0,
+            bus: 0,
+            device,
+            function: 0,
+        };
         let services = services::tests::Refusing::minimum_only();
+        // The boot's own controller starts first, ahead of the scan's order:
+        // the bridge above it forwards by then.
+        let mut observer = Forwarding {
+            command: &raw const ecam[1],
+            first: address(2),
+            seen: Vec::new(),
+        };
         // SAFETY: no DMA pages, only the synthetic ECAM mapped, and every
         // native grant refused.
         let mut dma = unsafe { crate::bus::dma::RegionAllocator::new(0..0) };
         // SAFETY: as above.
         let devices = unsafe {
-            probe_with_provider(
+            probe_observed(
                 &handoff,
                 PlatformCaptures::default(),
                 &mut dma,
                 handoff_provider(&handoff),
                 Some(&services),
                 None,
+                &mut observer,
             )
         };
-        assert_eq!(
-            devices.bridges_reopened,
-            [Address {
-                segment: 0,
-                bus: 0,
-                device: 0,
-                function: 0,
-            }]
-        );
+        assert_eq!(devices.bridges_reopened, [address(0)]);
         assert!(devices.failures.is_empty());
+        assert!(!observer.seen.is_empty() && observer.seen.iter().all(|&forwarded| forwarded));
         assert_eq!(ecam[1] & 0xffff, 0x0006);
         assert_eq!(ecam[(1 << 15) / 4 + 1] & 0xffff, 0x0006);
     }
