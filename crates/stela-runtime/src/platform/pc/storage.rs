@@ -221,6 +221,16 @@ fn locate(
     Ok((index, partition))
 }
 
+/// The index in `devices` of the disk holding the partition `target` names,
+/// and that partition, as [`open_shared`] finds a [`Named::Disk`]; no disk
+/// is taken.
+pub fn find_partition(
+    devices: &mut [Box<dyn BlockDevice>],
+    target: &Target,
+) -> Result<(usize, gpt::Partition), StorageError> {
+    locate(devices, &Named::Disk(target.clone()))
+}
+
 /// The disk and partition `target` names. The serial was read through the
 /// firmware when the target was chosen; Stela's own driver may report the
 /// same disk under another serial (a USB bridge's INQUIRY serial against

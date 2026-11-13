@@ -6,9 +6,10 @@
 //! recovery, so, as Linux does, only Stela's drivers write a PC disk. What
 //! the picker decided is a [`Plan`] ([`plan`]): the disk as the picker saw
 //! it, the partition table's blocks, the blocks to zero and the partition
-//! macOS gets. The loader carries it in memory ([`Plan::encode`]); once the
-//! drivers have started and before the partition is looked up, the engine
-//! finds the disk ([`Plan::locate`]) and makes the change ([`Plan::apply`]).
+//! macOS gets. The loader carries it in memory with the boot's other
+//! pending disk work (`disk_writes`); once the drivers have started and
+//! before the partition is looked up, the engine finds the disk
+//! ([`Plan::locate`]) and makes the change ([`Plan::apply`]).
 //!
 //! A plan is made for one boot and never stored. A boot that stops before
 //! it is applied leaves the disk as it was, and the next one finds no
@@ -572,18 +573,25 @@ impl Plan {
     }
 }
 
-/// The bytes of an encoded plan not decoded yet.
-struct Rest<'a>(&'a [u8]);
+/// The bytes of an encoded plan, or of the pending work around it
+/// (`disk_writes`), not decoded yet.
+pub(super) struct Rest<'a>(pub(super) &'a [u8]);
 
 impl<'a> Rest<'a> {
-    fn take(&mut self, count: u64) -> Option<&'a [u8]> {
+    pub(super) fn take(&mut self, count: u64) -> Option<&'a [u8]> {
         let (taken, rest) = self.0.split_at_checked(usize::try_from(count).ok()?)?;
         self.0 = rest;
         Some(taken)
     }
 
-    fn number(&mut self) -> Option<u64> {
+    pub(super) fn number(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    /// A length and that many bytes.
+    pub(super) fn counted(&mut self) -> Option<&'a [u8]> {
+        let count = self.number()?;
+        self.take(count)
     }
 }
 

@@ -7,8 +7,10 @@
 //! reads files from such a partition. [`boot_log`] keeps the mount's output
 //! on the machine-state partition, and `stela` reads it back;
 //! [`machine_state`] keeps that partition's layout in the tail of the Apple
-//! region instead. [`disk_plan`] is the change Install macOS's disk picker
-//! decided on, which the drivers make to the chosen disk. [`acpi`] reads the firmware's ACPI tables, through which
+//! region instead. [`disk_writes`] is every change to a PC disk decided
+//! before the firmware exited, which the drivers make: [`disk_plan`], the
+//! change Install macOS's disk picker decided on for the chosen disk, and
+//! the partition updates after it. [`acpi`] reads the firmware's ACPI tables, through which
 //! [`power`] restarts and powers off the host and reads its power button.
 //! [`display`] chooses the graphics mode the screen runs in while boot
 //! services still allow it.
@@ -17,6 +19,7 @@ pub mod board_flash;
 pub mod boot_log;
 pub mod device_starts;
 pub mod disk_plan;
+pub mod disk_writes;
 pub mod display;
 pub mod failure_record;
 pub mod fat32;
