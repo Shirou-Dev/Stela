@@ -353,7 +353,23 @@ impl Remappers {
         // Whether a unit was left in a state no proof covers: partly
         // programmed, or not stopped after the policy refused it.
         let mut uncertain = false;
-        if let Some(ivrs) = &ivrs {
+        // A table with blocks or entries stepped over may hide units or
+        // routes, so no AMD-Vi unit translates from it; each stays as the
+        // boot left it, and `settle` decides from whether all read off.
+        let ivrs_complete = ivrs.as_ref().is_none_or(|table| {
+            match stela_drivers::bus::dma::amd::ivrs::Ivrs::parse(table, amd::MAXIMUM_BLOCKS) {
+                Ok(parsed) if !parsed.skipped().is_empty() => {
+                    output::arguments(format_args!(
+                        "UNSUPPORTED host IVRS parts stepped over {:?}: AMD-Vi units stay untranslated\n",
+                        parsed.skipped()
+                    ));
+                    false
+                }
+                // `amd::take` reports a table it cannot read.
+                _ => true,
+            }
+        });
+        if let Some(ivrs) = ivrs.as_ref().filter(|_| ivrs_complete) {
             // SAFETY: forwarded.
             let outcome = unsafe {
                 amd::take(
@@ -393,8 +409,10 @@ impl Remappers {
         }
         let Some(table) = dmar else {
             let units_off = ivrs.as_ref().is_some_and(|ivrs| {
-                stela_drivers::bus::dma::amd::ivrs::Ivrs::parse(ivrs, amd::MAXIMUM_BLOCKS)
-                    .is_ok_and(|ivrs| inactive_firmware_units.off_amd(&ivrs))
+                match stela_drivers::bus::dma::amd::ivrs::Ivrs::parse(ivrs, amd::MAXIMUM_BLOCKS) {
+                    Ok(ivrs) => inactive_firmware_units.off_amd(&ivrs),
+                    Err(_) => inactive_firmware_units.all_off(),
+                }
             });
             remappers.settle(units_off && !uncertain);
             return remappers;
@@ -402,12 +420,27 @@ impl Remappers {
         let parsed = match dmar::parse(&table) {
             Ok(parsed) => parsed,
             Err(error) => {
+                // No unit was taken from this table. With every unit the
+                // early inventory found off, nothing translates, as with no
+                // IOMMU; otherwise native attachments stay refused.
                 output::arguments(format_args!(
-                    "UNSUPPORTED host DMAR unreadable ({error:?}): host DMA stays untranslated\n"
+                    "UNSUPPORTED host DMAR unreadable ({error:?}): no VT-d unit translates\n"
                 ));
+                remappers.settle(inactive_firmware_units.all_off() && !uncertain);
                 return remappers;
             }
         };
+        if !parsed.skipped.is_empty() {
+            output::arguments(format_args!(
+                "UNSUPPORTED host DMAR parts passed over {:?}{}\n",
+                parsed.skipped,
+                if parsed.complete() {
+                    ""
+                } else {
+                    ": no VT-d unit translates"
+                }
+            ));
+        }
         let mut cohorts = Vec::new();
         remappers.dmar = Some(parsed.clone());
         if cohorts.try_reserve_exact(parsed.units.len()).is_err()

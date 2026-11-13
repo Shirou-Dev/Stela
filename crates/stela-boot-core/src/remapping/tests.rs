@@ -126,6 +126,7 @@ fn disjoint_ecam_windows_share_one_complete_segment_inventory() {
         physical_bits: 39,
         flags: 0,
         additional_structures: vec![],
+        skipped: vec![],
         units: vec![Drhd {
             base: 0xfed9_0000,
             bytes: 4096,
@@ -217,6 +218,7 @@ fn an_include_all_unit_covers_what_listed_units_leave() {
         physical_bits: 39,
         flags: 0,
         additional_structures: vec![],
+        skipped: vec![],
         units: vec![unit(true, vec![]), unit(false, vec![graphics])],
         reserved: vec![Rmrr {
             segment: 0,
@@ -314,6 +316,7 @@ fn ambiguous_explicit_units_and_duplicate_include_all_units_are_not_taken() {
             physical_bits: 39,
             flags: 0,
             additional_structures: vec![],
+            skipped: vec![],
             units,
             reserved: vec![],
         };
@@ -331,6 +334,7 @@ fn ambiguous_explicit_units_and_duplicate_include_all_units_are_not_taken() {
         physical_bits: 39,
         flags: 0,
         additional_structures: vec![],
+        skipped: vec![],
         units: vec![drhd(
             false,
             vec![
@@ -355,6 +359,7 @@ fn an_arriving_child_uses_its_explicit_unit_even_when_the_bridge_uses_include_al
         physical_bits: 39,
         flags: 0,
         additional_structures: vec![],
+        skipped: vec![],
         units: vec![
             drhd(true, vec![]),
             drhd(
@@ -388,6 +393,7 @@ fn future_isolation_includes_unresolved_child_scopes_and_excludes_unrelated_endp
         physical_bits: 39,
         flags: 0,
         additional_structures: vec![],
+        skipped: vec![],
         units: vec![
             drhd(true, vec![]),
             drhd(
@@ -458,6 +464,7 @@ fn unowned_firmware_dma_sources_block_plans_routes_and_future_isolation() {
         physical_bits: 39,
         flags: 1,
         additional_structures: vec![],
+        skipped: vec![],
         units: vec![drhd(true, vec![])],
         reserved: vec![],
     };
@@ -508,6 +515,34 @@ fn unowned_firmware_dma_sources_block_plans_routes_and_future_isolation() {
         assert_eq!(
             route(&remapping, 0, &present, 0x0200),
             Err(Leave::UnsupportedStructure(kind))
+        );
+        assert_eq!(subtree_routes(&remapping, 0, &present, 0x00e0), None);
+    }
+}
+
+#[test]
+fn a_dropped_scope_or_region_leaves_every_unit_while_ignored_bits_do_not() {
+    use crate::dmar::{Remapping, Skipped};
+    let present = inventory();
+    let baseline = Remapping {
+        physical_bits: 39,
+        flags: 1,
+        additional_structures: vec![],
+        skipped: vec![Skipped::ReservedBits, Skipped::UnalignedRegion],
+        units: vec![drhd(true, vec![])],
+        reserved: vec![],
+    };
+    assert!(plan(&baseline, 0, &present, &[0x10])[0].1.is_ok());
+    for dropped in [Skipped::UnusableScope, Skipped::UnusableRegion] {
+        let mut remapping = baseline.clone();
+        remapping.skipped.push(dropped);
+        assert_eq!(
+            plan(&remapping, 0, &present, &[0x10]),
+            [(0, Err(Leave::Incomplete))]
+        );
+        assert_eq!(
+            route(&remapping, 0, &present, 0x0200),
+            Err(Leave::Incomplete)
         );
         assert_eq!(subtree_routes(&remapping, 0, &present, 0x00e0), None);
     }

@@ -11,6 +11,9 @@
 //! alignment, reserved bits and policy semantics require separate live admission
 //! and explicit refusal of unresolved requirements. Range starts must be followed
 //! immediately by their end; interleaved entries, including padding, are refused.
+//! Blocks and fixed-length device entries of unknown types are stepped over by
+//! their length, as Linux's `init_iommu_all` and `init_iommu_from_acpi` do, and
+//! recorded in [`Ivrs::skipped`].
 use alloc::vec::Vec;
 use core::cmp::Reverse;
 
@@ -34,9 +37,7 @@ pub enum ErrorKind {
     TableLength,
     Checksum,
     BlockLength,
-    UnsupportedBlock(u8),
     UnsupportedEntry(u8),
-    HidVersion,
     DeviceRange,
     DuplicateVersion,
     UnitIdentity,
@@ -61,12 +62,34 @@ fn read64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("checked field"))
 }
 
+/// A part of an IVRS table the parser stepped over, each once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Skipped {
+    /// A block of this unknown type. It may describe a unit or memory this
+    /// boot does not see.
+    Block(u8),
+    /// A fixed-length device entry of this unknown type. It may name
+    /// requesters whose routing this boot does not see.
+    Entry(u8),
+}
+
+fn skip(skipped: &mut Vec<Skipped>, kind: Skipped) -> Result<(), ParseError> {
+    if !skipped.contains(&kind) {
+        skipped
+            .try_reserve(1)
+            .map_err(|_| error(TABLE_HEADER, ErrorKind::OutOfMemory))?;
+        skipped.push(kind);
+    }
+    Ok(())
+}
+
 /// An entire, checksum-validated IVRS table. Input must have its exact declared
 /// length; callers with a larger firmware mapping must first bound that view.
 #[derive(Debug)]
 pub struct Ivrs<'a> {
     raw: &'a [u8],
     units: Vec<Ivhd<'a>>,
+    skipped: Vec<Skipped>,
 }
 
 impl<'a> Ivrs<'a> {
@@ -89,6 +112,7 @@ impl<'a> Ivrs<'a> {
         }
         let mut offset = TABLE_HEADER;
         let mut hardware_blocks = 0usize;
+        let mut skipped = Vec::new();
         while offset < raw.len() {
             let remaining = &raw[offset..];
             if remaining.len() < BLOCK_HEADER {
@@ -111,7 +135,7 @@ impl<'a> Ivrs<'a> {
                     if length < header {
                         return Err(error(offset + 2, ErrorKind::BlockLength));
                     }
-                    validate_entries(&block[header..], block[0], offset + header)?;
+                    validate_entries(&block[header..], offset + header, &mut skipped)?;
                     if hardware_blocks == maximum_hardware_blocks {
                         return Err(error(offset, ErrorKind::ResourceLimit));
                     }
@@ -128,7 +152,7 @@ impl<'a> Ivrs<'a> {
                         .checked_add(read64(block, 24))
                         .ok_or_else(|| error(offset + 16, ErrorKind::AddressOverflow))?;
                 }
-                other => return Err(error(offset, ErrorKind::UnsupportedBlock(other))),
+                other => skip(&mut skipped, Skipped::Block(other))?,
             }
             offset += length;
         }
@@ -169,7 +193,18 @@ impl<'a> Ivrs<'a> {
             selected
         });
         units.sort_unstable_by_key(|unit| unit.offset);
-        Ok(Self { raw, units })
+        Ok(Self {
+            raw,
+            units,
+            skipped,
+        })
+    }
+
+    /// The unknown blocks and device entries stepped over, each type once.
+    /// While any is listed, the table does not describe every unit and
+    /// requester route.
+    pub fn skipped(&self) -> &[Skipped] {
+        &self.skipped
     }
 
     pub fn raw(&self) -> &'a [u8] {
@@ -324,19 +359,22 @@ impl<'a> Iterator for Blocks<'a> {
     type Item = Block<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining.is_empty() {
-            return None;
+        loop {
+            if self.remaining.is_empty() {
+                return None;
+            }
+            let length = usize::from(read16(self.remaining, 2));
+            let (raw, rest) = self.remaining.split_at(length);
+            let offset = self.offset;
+            self.offset += length;
+            self.remaining = rest;
+            match raw[0] {
+                0x10 | 0x11 | 0x40 => return Some(Block::Hardware(Ivhd { raw, offset })),
+                0x20..=0x22 => return Some(Block::Memory(Ivmd { raw, offset })),
+                // Recorded in `Ivrs::skipped` by the validating parse.
+                _ => {}
+            }
         }
-        let length = usize::from(read16(self.remaining, 2));
-        let (raw, rest) = self.remaining.split_at(length);
-        let offset = self.offset;
-        self.offset += length;
-        self.remaining = rest;
-        Some(match raw[0] {
-            0x10 | 0x11 | 0x40 => Block::Hardware(Ivhd { raw, offset }),
-            0x20..=0x22 => Block::Memory(Ivmd { raw, offset }),
-            _ => unreachable!("validated IVRS block"),
-        })
     }
 }
 
@@ -405,16 +443,16 @@ pub struct DeviceEntries<'a> {
     segment: u16,
 }
 
-fn entry_length(raw: &[u8], version: u8, offset: usize) -> Result<usize, ParseError> {
+/// The entry's length and whether its type is known. Fixed-length types
+/// encode their length in the type; of the variable-length types only the
+/// ACPI HID entry is defined, in any IVHD type as Linux reads it.
+fn entry_length(raw: &[u8], offset: usize) -> Result<(usize, bool), ParseError> {
     let Some(&kind) = raw.first() else {
         return Err(error(offset, ErrorKind::Truncated));
     };
     let length = if kind < 0x80 {
         4usize << (kind >> 6)
     } else if kind == 0xf0 {
-        if version != 0x40 {
-            return Err(error(offset, ErrorKind::HidVersion));
-        }
         let prefix = raw
             .get(..HID_PREFIX)
             .ok_or_else(|| error(offset, ErrorKind::Truncated))?;
@@ -425,16 +463,23 @@ fn entry_length(raw: &[u8], version: u8, offset: usize) -> Result<usize, ParseEr
     if length > raw.len() {
         return Err(error(offset, ErrorKind::Truncated));
     }
-    match kind {
-        0x00..=0x04 | 0x40..=0x43 | 0x46..=0x48 | 0xf0 => Ok(length),
-        other => Err(error(offset, ErrorKind::UnsupportedEntry(other))),
-    }
+    Ok((
+        length,
+        matches!(kind, 0x00..=0x04 | 0x40..=0x43 | 0x46..=0x48 | 0xf0),
+    ))
 }
 
-fn validate_entries(mut raw: &[u8], version: u8, mut offset: usize) -> Result<(), ParseError> {
+fn validate_entries(
+    mut raw: &[u8],
+    mut offset: usize,
+    skipped: &mut Vec<Skipped>,
+) -> Result<(), ParseError> {
     let mut range: Option<(u16, usize)> = None;
     while !raw.is_empty() {
-        let length = entry_length(raw, version, offset)?;
+        let (length, known) = entry_length(raw, offset)?;
+        if !known {
+            skip(skipped, Skipped::Entry(raw[0]))?;
+        }
         match (range, raw[0]) {
             (None, 0x03 | 0x43 | 0x47) => range = Some((read16(raw, 1), offset)),
             (Some((start, _)), 0x04) if read16(raw, 1) >= start => range = None,
@@ -454,13 +499,18 @@ impl<'a> Iterator for DeviceEntries<'a> {
     type Item = DeviceEntry<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining.is_empty() {
-            return None;
-        }
-        // A HID can only be present in the already-validated type 40 header.
-        let length = entry_length(self.remaining, 0x40, 0).expect("validated IVHD entry");
-        let (raw, rest) = self.remaining.split_at(length);
-        self.remaining = rest;
+        let raw = loop {
+            if self.remaining.is_empty() {
+                return None;
+            }
+            let (length, known) = entry_length(self.remaining, 0).expect("validated IVHD entry");
+            let (raw, rest) = self.remaining.split_at(length);
+            self.remaining = rest;
+            // Unknown types are recorded in `Ivrs::skipped`.
+            if known {
+                break raw;
+            }
+        };
         let requester = RequesterId {
             segment: self.segment,
             device_id: read16(raw, 1),

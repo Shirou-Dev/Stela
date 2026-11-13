@@ -202,15 +202,32 @@ fn complete_table_and_every_block_are_checked_before_success() {
     short.truncate(IVHD_LONG - 1);
     put16(&mut short, 2, (IVHD_LONG - 1) as u16);
     fail(&table(&[&short]), ErrorKind::BlockLength);
-    fail(
-        &table(&[&[0x23, 0, 4, 0]]),
-        ErrorKind::UnsupportedBlock(0x23),
-    );
+    fail(&table(&[&[0x23, 0, 3, 0]]), ErrorKind::BlockLength);
     fail(&table(&[&[0, 0, 0]]), ErrorKind::Truncated);
     // A valid first unit does not hide malformed bytes in a later block.
     fail(
-        &table(&[&hardware(0x10, 0, 8, &[]), &[0x23, 0, 4, 0]]),
-        ErrorKind::UnsupportedBlock(0x23),
+        &table(&[&hardware(0x10, 0, 8, &[]), &[0x23, 0, 9, 0]]),
+        ErrorKind::Truncated,
+    );
+}
+
+#[test]
+fn unknown_blocks_are_stepped_over_by_length_and_reported_once() {
+    let unit = hardware(0x10, 0, 8, &[]);
+    let unknown = [0x23, 0, 8, 0, 1, 2, 3, 4];
+    let raw = table(&[&unknown, &unit, &unknown, &[0x30, 0, 4, 0]]);
+    let parsed = Ivrs::parse(&raw, usize::MAX).unwrap();
+    assert_eq!(
+        parsed.skipped(),
+        [Skipped::Block(0x23), Skipped::Block(0x30)]
+    );
+    assert_eq!(parsed.units().count(), 1);
+    assert_eq!(parsed.blocks().count(), 1);
+    assert!(
+        Ivrs::parse(&table(&[&unit]), usize::MAX)
+            .unwrap()
+            .skipped()
+            .is_empty()
     );
 }
 
@@ -463,12 +480,37 @@ fn malformed_ranges_and_unsupported_or_truncated_entries_are_rejected() {
             ErrorKind::DeviceRange,
         );
     }
+    // Unknown fixed-length entries are stepped over; an unknown
+    // variable-length entry has no length to step over.
     for kind in [0x05, 0x44, 0x80, 0xff] {
         let bytes = vec![kind; if kind < 0x40 { 4 } else { 8 }];
-        fail(
-            &table(&[&hardware(0x40, 0, 8, &bytes)]),
-            ErrorKind::UnsupportedEntry(kind),
-        );
+        let select = entry(2, 0x1234, 0, None);
+        let raw = table(&[&hardware(
+            0x40,
+            0,
+            8,
+            &[&bytes[..], &select, &bytes].concat(),
+        )]);
+        if kind < 0x80 {
+            let parsed = Ivrs::parse(&raw, usize::MAX).unwrap();
+            assert_eq!(parsed.skipped(), [Skipped::Entry(kind)]);
+            let kinds: Vec<_> = parsed
+                .units()
+                .next()
+                .unwrap()
+                .entries()
+                .map(|entry| entry.kind)
+                .collect();
+            assert_eq!(
+                kinds,
+                [DeviceKind::Select(RequesterId {
+                    segment: 0,
+                    device_id: 0x1234
+                })]
+            );
+        } else {
+            fail(&raw, ErrorKind::UnsupportedEntry(kind));
+        }
     }
     for entry in [
         entry(2, 0x1234, 0, None),
@@ -484,7 +526,7 @@ fn malformed_ranges_and_unsupported_or_truncated_entries_are_rejected() {
 }
 
 #[test]
-fn hid_has_version_and_exact_variable_length_bounds_without_uid_conversion() {
+fn hid_has_exact_variable_length_bounds_in_any_block_type_without_uid_conversion() {
     let mut hid = entry(0xf0, 0xabcd, 0x96, None);
     hid.extend_from_slice(b"AMDI0040");
     hid.extend_from_slice(b"COMPAT00");
@@ -513,11 +555,16 @@ fn hid_has_version_and_exact_variable_length_bounds_without_uid_conversion() {
     );
     assert_eq!(entry.flags(), 0x96);
     assert_eq!(entry.raw(), hid);
+    // Linux reads a HID entry in any IVHD type.
     for version in [0x10, 0x11] {
-        fail(
-            &table(&[&hardware(version, 0, 8, &hid)]),
-            ErrorKind::HidVersion,
-        );
+        let raw = table(&[&hardware(version, 0, 8, &hid)]);
+        let parsed = Ivrs::parse(&raw, usize::MAX).unwrap();
+        assert!(parsed.skipped().is_empty());
+        let unit = parsed.units().next().unwrap();
+        assert!(matches!(
+            unit.entries().next().unwrap().kind,
+            DeviceKind::Hid { .. }
+        ));
     }
     for length in 1..hid.len() {
         fail(

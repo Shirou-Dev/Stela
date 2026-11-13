@@ -78,11 +78,18 @@ fn parses_units_reserved_regions_and_bridge_paths() {
     assert_eq!(parsed.additional_structures, [3]);
     assert_eq!(parsed.reserved[0].limit, 0x7d01ffff);
     assert_eq!(parsed.reserved[0].scopes[0].path, [(0x14, 0)]);
-    let mut broken = fixture();
-    broken.extend([1, 0, 24, 0, 0, 0, 0, 0]);
-    broken.extend(0x1000u64.to_le_bytes());
-    broken.extend(0x1000u64.to_le_bytes());
-    assert_eq!(parse(&seal(broken)), Err(DmarError::InvalidStructure));
+    assert!(parsed.skipped.is_empty());
+    let mut unaligned = fixture();
+    unaligned.extend([1, 0, 24, 0, 0, 0, 0, 0]);
+    unaligned.extend(0x1800u64.to_le_bytes());
+    unaligned.extend(0x1900u64.to_le_bytes());
+    let parsed = parse(&seal(unaligned)).unwrap();
+    assert_eq!(
+        (parsed.reserved[0].base, parsed.reserved[0].limit),
+        (0x1000, 0x1fff)
+    );
+    assert_eq!(parsed.skipped, [Skipped::UnalignedRegion]);
+    assert!(parsed.complete());
 }
 
 #[test]
@@ -121,44 +128,95 @@ fn source_inventory_preserves_ids_paths_flags_and_unknown_requirements() {
 }
 
 #[test]
-fn source_scopes_require_whole_valid_paths_without_losing_new_pci_flags() {
+fn unusable_scopes_are_dropped_and_mark_the_table_incomplete() {
     for scope in [
         [3, 6, 0, 0, 1, 0, 0, 0],
         [4, 8, 0, 0, 1, 0, 32, 0],
         [5, 8, 0, 0, 1, 0, 0, 8],
-        [1, 8, 1, 0, 0, 0, 0, 0],
-        [2, 8, 0, 1, 0, 0, 0, 0],
-        [1, 8, 0, 0, 1, 0, 0, 0],
+        [1, 8, 0, 0, 0, 0, 32, 0],
     ] {
-        assert_eq!(parse(&scoped(&[scope])), Err(DmarError::InvalidStructure));
+        let mut table = scoped(&[[1, 8, 0, 0, 0, 0, 2, 0]]);
+        let bytes = usize::from(scope[1]);
+        table.extend(&scope[..bytes]);
+        let length = (table.len() - HEADER) as u16;
+        table[50..52].copy_from_slice(&length.to_le_bytes());
+        let parsed = parse(&seal(table)).unwrap();
+        assert_eq!(parsed.units[0].scopes.len(), 1, "{scope:?}");
+        assert!(parsed.units[0].sources.is_empty());
+        assert_eq!(parsed.skipped, [Skipped::UnusableScope]);
+        assert!(!parsed.complete());
     }
-    for kind in [4, 5] {
-        let mut table = scoped(&[[kind, 8, 0, 0, 1, 0, 0, 0]]);
-        table.extend([1, 0]);
-        table[65] = 10;
-        table[50..52].copy_from_slice(&26u16.to_le_bytes());
+    // A scope too short to step over still fails the structure.
+    for bytes in [0, 5] {
+        let mut table = scoped(&[[1, 8, 0, 0, 0, 0, 2, 0]]);
+        table[65] = bytes;
         assert_eq!(parse(&seal(table)), Err(DmarError::InvalidStructure));
     }
 }
 
 #[test]
-fn reserved_headers_and_register_window_alignment_refuse_new_semantics() {
+fn reserved_scope_bytes_odd_lengths_and_long_source_paths_are_passed_over() {
+    for scope in [
+        [1, 8, 1, 0, 0, 0, 0, 0],
+        [2, 8, 0, 1, 0, 0, 0, 0],
+        [1, 8, 0, 0, 1, 0, 0, 0],
+    ] {
+        let parsed = parse(&scoped(&[scope])).unwrap();
+        assert_eq!(parsed.units[0].scopes[0].path, [(0, 0)]);
+        assert_eq!(parsed.skipped, [Skipped::ReservedBits]);
+        assert!(parsed.complete());
+    }
+    // An HPET or namespace path through a bridge, as Linux walks it.
+    for kind in [4, 5] {
+        let mut table = scoped(&[[kind, 8, 0, 0, 1, 0, 0x1c, 0]]);
+        table.extend([1, 0]);
+        table[65] = 10;
+        table[50..52].copy_from_slice(&26u16.to_le_bytes());
+        let parsed = parse(&seal(table)).unwrap();
+        assert_eq!(parsed.units[0].sources[0].path, [(0x1c, 0), (1, 0)]);
+        assert!(parsed.skipped.is_empty());
+    }
+    // An odd length: the trailing byte is ignored.
+    let mut table = scoped(&[[1, 8, 0, 0, 0, 0, 2, 0]]);
+    table.push(0x55);
+    table[65] = 9;
+    table[50..52].copy_from_slice(&25u16.to_le_bytes());
+    let parsed = parse(&seal(table)).unwrap();
+    assert_eq!(parsed.units[0].scopes[0].path, [(2, 0)]);
+    assert_eq!(parsed.skipped, [Skipped::OddScopeLength]);
+    // Source flags stay recorded for the policy to refuse.
+    let parsed = parse(&scoped(&[[3, 8, 1, 2, 9, 0, 0x1f, 0]])).unwrap();
+    let source = &parsed.units[0].sources[0];
+    assert_eq!((source.flags, source.reserved), (1, 2));
+}
+
+#[test]
+fn reserved_header_unit_and_region_bits_are_ignored_once() {
     for (offset, value) in [(37, 0x80), (38, 1), (47, 1), (52, 2), (53, 0x10)] {
         let mut table = fixture();
         table[offset] = value;
-        assert!(parse(&seal(table)).is_err());
+        let parsed = parse(&seal(table)).unwrap();
+        assert_eq!(parsed.skipped, [Skipped::ReservedBits], "byte {offset}");
+        assert_eq!(parsed.units[0].bytes, 4096);
+        assert!(parsed.complete());
     }
+    // Include-all covers its listed requesters anyway.
     let mut table = scoped(&[[1, 8, 0, 0, 0, 0, 1, 0]]);
     table[52] = 1;
-    assert_eq!(parse(&seal(table)), Err(DmarError::InvalidStructure));
+    let parsed = parse(&seal(table)).unwrap();
+    assert!(parsed.units[0].include_all && parsed.units[0].scopes.is_empty());
+    assert_eq!(parsed.skipped, [Skipped::IncludeAllScopes]);
     for offset in [4, 5] {
         let mut table = fixture();
         let mut rmrr = vec![1, 0, 24, 0, 0, 0, 0, 0];
         rmrr.extend(0x1000u64.to_le_bytes());
         rmrr.extend(0x1fffu64.to_le_bytes());
         rmrr[offset] = 1;
+        table.extend(rmrr.clone());
         table.extend(rmrr);
-        assert_eq!(parse(&seal(table)), Err(DmarError::InvalidStructure));
+        let parsed = parse(&seal(table)).unwrap();
+        assert_eq!(parsed.reserved.len(), 2);
+        assert_eq!(parsed.skipped, [Skipped::ReservedBits]);
     }
     let mut table = fixture();
     table[53] = 1;
@@ -177,10 +235,14 @@ fn reserved_headers_and_register_window_alignment_refuse_new_semantics() {
         parse(&seal(table)).unwrap().units[0].sources[0].path,
         [(0x1c, 0), (0, 0)]
     );
+    // A structure too short to step over still fails the table.
+    let mut table = fixture();
+    table.extend([1, 0, 0, 0]);
+    assert_eq!(parse(&seal(table)), Err(DmarError::InvalidStructure));
 }
 
 #[test]
-fn reserved_ranges_require_a_representable_end_within_the_host_width() {
+fn reserved_ranges_past_the_host_width_are_dropped() {
     for (bits, limit, valid) in [
         (48, u64::MAX, false),
         (64, u64::MAX, false),
@@ -193,11 +255,14 @@ fn reserved_ranges_require_a_representable_end_within_the_host_width() {
         table.extend((limit & !4095).to_le_bytes());
         table.extend(limit.to_le_bytes());
         table.extend([1, 8, 0, 0, 0, 0, 0x14, 0]);
-        let result = parse(&seal(table));
+        let parsed = parse(&seal(table)).unwrap();
         if valid {
-            assert_eq!(result.unwrap().reserved[0].limit, limit);
+            assert_eq!(parsed.reserved[0].limit, limit);
+            assert!(parsed.complete());
         } else {
-            assert_eq!(result, Err(DmarError::InvalidStructure));
+            assert!(parsed.reserved.is_empty());
+            assert_eq!(parsed.skipped, [Skipped::UnusableRegion]);
+            assert!(!parsed.complete());
         }
     }
 }

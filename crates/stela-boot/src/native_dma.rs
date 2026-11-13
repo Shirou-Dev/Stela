@@ -63,6 +63,13 @@ impl InactiveFirmwareUnits {
             .is_some_and(|units| matches_amd(units, ivrs))
     }
 
+    /// Every unit of the complete early inventory is off now. This holds for
+    /// a table the boot could not fully parse later: the early walk only
+    /// needs each structure's length and register base.
+    pub(crate) fn all_off(&self) -> bool {
+        self.off.is_some()
+    }
+
     /// Every unit of `descriptors` is off now.
     pub(crate) fn off_dmar(&self, descriptors: &[dmar::Drhd]) -> bool {
         self.off
@@ -183,20 +190,24 @@ fn amd_table_range_is_private(region: crate::handoff::Region) -> bool {
     let Ok(ivrs) = Ivrs::parse(ivrs, firmware_state::MAX_UNITS) else {
         return false;
     };
-    if ivrs
-        .memory_definitions()
-        .any(|range| range.start() < end && start < range.end())
+    // A block stepped over may define memory this check cannot see.
+    if !ivrs.skipped().is_empty()
+        || ivrs
+            .memory_definitions()
+            .any(|range| range.start() < end && start < range.end())
     {
         return false;
     }
     // SAFETY: same mapped firmware table inventory. Missing DMAR means no
     // Intel reserved windows. An unreadable table supplies no exclusion proof.
     match unsafe { acpi::find(rsdp, b"DMAR") } {
+        // A dropped region supplies no exclusion proof either.
         Ok(table) => dmar::parse(table).is_ok_and(|table| {
-            table
-                .reserved
-                .iter()
-                .all(|range| range.base >= end || range.limit < start)
+            table.complete()
+                && table
+                    .reserved
+                    .iter()
+                    .all(|range| range.base >= end || range.limit < start)
         }),
         Err(acpi::AcpiError::Missing(_)) => true,
         Err(_) => false,

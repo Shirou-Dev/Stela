@@ -217,6 +217,9 @@ pub enum Leave {
     UnsupportedSource(crate::dmar::SourceKind),
     /// A firmware structure constrains DMA semantics not implemented here.
     UnsupportedStructure(u16),
+    /// The parser dropped a device scope or reserved region, so no unit's
+    /// coverage or reserved memory is fully known.
+    Incomplete,
 }
 
 /// The requesters a unit covers, sorted, when the policy takes it.
@@ -253,6 +256,9 @@ pub fn decide(
 /// PCI requesters. Until resolved, exclude their entire segment from grants.
 fn unsupported_sources(remapping: &crate::dmar::Remapping, segment: u16) -> Option<Leave> {
     use crate::dmar::SourceKind;
+    if !remapping.complete() {
+        return Some(Leave::Incomplete);
+    }
     if let Some(&kind) = remapping
         .additional_structures
         .iter()

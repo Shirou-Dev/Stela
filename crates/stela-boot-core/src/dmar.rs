@@ -91,6 +91,43 @@ pub struct Rmrr {
     pub sources: Vec<SourceScope>,
 }
 
+/// A part of a DMAR table the parser passed over, as Linux's
+/// `dmar_table_init` and `dmar_parse_dev_scope` do. Each kind is recorded
+/// once per table, for one report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Skipped {
+    /// Reserved bits or bytes are set in the table header, a DRHD, an RMRR
+    /// or a device scope. They are ignored.
+    ReservedBits,
+    /// An include-all DRHD lists PCI device scopes. It covers those
+    /// requesters anyway; the scopes are ignored.
+    IncludeAllScopes,
+    /// A device scope has an odd length. Its last byte is ignored.
+    OddScopeLength,
+    /// An RMRR is not page-aligned. It is widened to whole pages.
+    UnalignedRegion,
+    /// A device scope names no path, or a device or function out of range.
+    /// It is dropped, so the units' coverage is not fully known.
+    UnusableScope,
+    /// An RMRR is empty, wraps, or ends past the host address width. It is
+    /// dropped, so the memory its requesters keep using is not fully known.
+    UnusableRegion,
+}
+
+impl Skipped {
+    /// Whether the routing or reserved memory the table describes is no
+    /// longer fully known, so no unit may translate from it.
+    pub fn incomplete(self) -> bool {
+        matches!(self, Self::UnusableScope | Self::UnusableRegion)
+    }
+}
+
+fn skip(skipped: &mut Vec<Skipped>, kind: Skipped) {
+    if !skipped.contains(&kind) {
+        skipped.push(kind);
+    }
+}
+
 /// A parsed DMAR table: the host address width and the units and reserved
 /// regions. ATSR, RHSA, ANDD, SATC and later structures describe ATS,
 /// proximity and namespace devices. Their kinds remain recorded for policies
@@ -105,10 +142,21 @@ pub struct Remapping {
     /// Structures not interpreted by the DMA planner. Root-mode admission must
     /// account for them rather than assume a complete interrupt inventory.
     pub additional_structures: Vec<u16>,
+    /// What the parser passed over, each kind once.
+    pub skipped: Vec<Skipped>,
+}
+
+impl Remapping {
+    /// Whether every unit's coverage and every reserved region is known.
+    pub fn complete(&self) -> bool {
+        !self.skipped.iter().any(|kind| kind.incomplete())
+    }
 }
 
 /// Partition PCI DMA scopes from the remaining original firmware sources.
-fn scopes(entry: &[u8], from: usize) -> Result<Scopes, DmarError> {
+/// Only a scope too short to step over fails the structure. Reserved bytes,
+/// an odd length and unusable paths are passed over as Linux does.
+fn scopes(entry: &[u8], from: usize, skipped: &mut Vec<Skipped>) -> Result<Scopes, DmarError> {
     let mut found = Scopes {
         pci: Vec::new(),
         sources: Vec::new(),
@@ -119,70 +167,75 @@ fn scopes(entry: &[u8], from: usize) -> Result<Scopes, DmarError> {
             .get(scope..scope + 6)
             .ok_or(DmarError::InvalidStructure)?;
         let bytes = usize::from(header[1]);
-        if bytes < 8 || !bytes.is_multiple_of(2) {
+        if bytes < 6 {
             return Err(DmarError::InvalidStructure);
         }
-        let end = scope
-            .checked_add(bytes)
-            .ok_or(DmarError::InvalidStructure)?;
-        let path = entry
+        let end = scope + bytes;
+        let (hops, odd) = entry
             .get(scope + 6..end)
             .ok_or(DmarError::InvalidStructure)?
-            .as_chunks::<2>()
-            .0;
-        if path.iter().any(|hop| hop[0] > 31 || hop[1] > 7) {
-            return Err(DmarError::InvalidStructure);
+            .as_chunks::<2>();
+        scope = end;
+        if !odd.is_empty() {
+            skip(skipped, Skipped::OddScopeLength);
         }
-        let path = path.iter().map(|hop| (hop[0], hop[1])).collect();
-        if matches!(header[0], 1 | 2) {
-            // These fields are reserved for PCI scopes outside SIDP. Refuse
-            // new semantics instead of losing them in the DMA-only view.
+        let path = hops.iter().map(|hop| (hop[0], hop[1])).collect();
+        let kind = match header[0] {
+            1 | 2 => None,
+            3 => Some(SourceKind::IoApic),
+            4 => Some(SourceKind::Hpet),
+            5 => Some(SourceKind::Namespace),
+            other => Some(SourceKind::Reserved(other)),
+        };
+        // A reserved scope type keeps its unknown path for the policy.
+        if !matches!(kind, Some(SourceKind::Reserved(_)))
+            && (hops.is_empty() || hops.iter().any(|hop| hop[0] > 31 || hop[1] > 7))
+        {
+            skip(skipped, Skipped::UnusableScope);
+            continue;
+        }
+        let Some(kind) = kind else {
+            // Linux reads only the type, bus and path of a PCI scope.
             if header[2..5] != [0, 0, 0] {
-                return Err(DmarError::InvalidStructure);
+                skip(skipped, Skipped::ReservedBits);
             }
             found.pci.push(Scope {
                 bridge: header[0] == 2,
                 bus: header[5],
                 path,
             });
-        } else {
-            let kind = match header[0] {
-                3 => SourceKind::IoApic,
-                4 => SourceKind::Hpet,
-                5 => SourceKind::Namespace,
-                other => SourceKind::Reserved(other),
-            };
-            if !matches!(kind, SourceKind::Reserved(_)) && header[2..4] != [0, 0] {
-                return Err(DmarError::InvalidStructure);
-            }
-            if matches!(kind, SourceKind::Hpet | SourceKind::Namespace) && bytes != 8 {
-                return Err(DmarError::InvalidStructure);
-            }
-            found.sources.push(SourceScope {
-                kind,
-                flags: header[2],
-                reserved: header[3],
-                enumeration_id: header[4],
-                bus: header[5],
-                path,
-            });
-        }
-        scope = end;
+            continue;
+        };
+        // Flags and reserved bytes stay recorded: the policy refuses
+        // sources whose meaning they could change.
+        found.sources.push(SourceScope {
+            kind,
+            flags: header[2],
+            reserved: header[3],
+            enumeration_id: header[4],
+            bus: header[5],
+            path,
+        });
     }
     Ok(found)
 }
 
-/// Parse a DMAR table, validating its checksum, width and every DRHD and
-/// RMRR it holds.
+/// Parse a DMAR table, validating its checksum, width and the framing of
+/// every structure. Like Linux's `dmar_walk_remapping_entries`, it steps over
+/// structures of other types by their length and fails only on framing it
+/// cannot step over or a register window it cannot use; what it passes over
+/// is recorded in [`Remapping::skipped`].
 pub fn parse(table: &[u8]) -> Result<Remapping, DmarError> {
     if table.len() < HEADER
         || &table[..4] != b"DMAR"
         || u32::from_le_bytes(table[4..8].try_into().unwrap()) as usize != table.len()
         || table.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0
-        || table[37] & !7 != 0
-        || table[38..HEADER].iter().any(|byte| *byte != 0)
     {
         return Err(DmarError::InvalidTable);
+    }
+    let mut skipped = Vec::new();
+    if table[37] & !7 != 0 || table[38..HEADER].iter().any(|byte| *byte != 0) {
+        skip(&mut skipped, Skipped::ReservedBits);
     }
     let physical_bits = table[36]
         .checked_add(1)
@@ -194,6 +247,7 @@ pub fn parse(table: &[u8]) -> Result<Remapping, DmarError> {
         units: Vec::new(),
         reserved: Vec::new(),
         additional_structures: Vec::new(),
+        skipped,
     };
     let mut offset = HEADER;
     while offset < table.len() {
@@ -209,8 +263,11 @@ pub fn parse(table: &[u8]) -> Result<Remapping, DmarError> {
         let entry = table.get(offset..end).ok_or(DmarError::InvalidStructure)?;
         match kind {
             DRHD => {
-                if length < 16 || entry[4] & !1 != 0 || entry[5] & 0xf0 != 0 {
+                if length < 16 {
                     return Err(DmarError::InvalidStructure);
+                }
+                if entry[4] & !1 != 0 || entry[5] & 0xf0 != 0 {
+                    skip(&mut remapping.skipped, Skipped::ReservedBits);
                 }
                 let base = quad(entry, 8);
                 let bytes = 1usize
@@ -222,34 +279,46 @@ pub fn parse(table: &[u8]) -> Result<Remapping, DmarError> {
                 {
                     return Err(DmarError::InvalidStructure);
                 }
-                let scopes = scopes(entry, 16)?;
-                if entry[4] & 1 != 0 && !scopes.pci.is_empty() {
-                    return Err(DmarError::InvalidStructure);
+                let mut scopes = scopes(entry, 16, &mut remapping.skipped)?;
+                let include_all = entry[4] & 1 != 0;
+                if include_all && !scopes.pci.is_empty() {
+                    scopes.pci.clear();
+                    skip(&mut remapping.skipped, Skipped::IncludeAllScopes);
                 }
                 remapping.units.push(Drhd {
                     base,
                     bytes,
                     segment: word(entry, 6),
-                    include_all: entry[4] & 1 != 0,
+                    include_all,
                     scopes: scopes.pci,
                     sources: scopes.sources,
                 });
             }
             RMRR => {
-                if length < 24 || entry[4..6] != [0, 0] {
+                if length < 24 {
                     return Err(DmarError::InvalidStructure);
                 }
+                if entry[4..6] != [0, 0] {
+                    skip(&mut remapping.skipped, Skipped::ReservedBits);
+                }
                 let (base, limit) = (quad(entry, 8), quad(entry, 16));
-                if !base.is_multiple_of(4096)
-                    || limit < base
-                    || limit & 0xfff != 0xfff
-                    || limit
+                // Linux's `rmrr_sanity_check` warns about an unaligned
+                // region and maps the pages it touches.
+                let (page, last) = (base & !0xfff, limit | 0xfff);
+                if limit < base
+                    || last
                         .checked_add(1)
                         .is_none_or(|end| physical_bits < 64 && end > 1u64 << physical_bits)
                 {
-                    return Err(DmarError::InvalidStructure);
+                    skip(&mut remapping.skipped, Skipped::UnusableRegion);
+                    offset = end;
+                    continue;
                 }
-                let scopes = scopes(entry, 24)?;
+                if (page, last) != (base, limit) {
+                    skip(&mut remapping.skipped, Skipped::UnalignedRegion);
+                }
+                let (base, limit) = (page, last);
+                let scopes = scopes(entry, 24, &mut remapping.skipped)?;
                 remapping.reserved.push(Rmrr {
                     segment: word(entry, 6),
                     base,

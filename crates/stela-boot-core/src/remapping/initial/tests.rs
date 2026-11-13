@@ -68,6 +68,7 @@ fn dmar(units: Vec<Drhd>, reserved: Vec<Rmrr>) -> Remapping {
         physical_bits: 39,
         flags: 0,
         additional_structures: vec![],
+        skipped: vec![],
         units,
         reserved,
     }
