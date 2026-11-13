@@ -532,8 +532,6 @@ pub(super) struct InputTurn {
     read_done: u64,
     delivery_entered: u64,
     end: u64,
-    pub(super) led_wait: u64,
-    pub(super) read_wait: u64,
     pub(super) led_changed: bool,
     pub(super) devices: usize,
     reports: usize,
@@ -555,17 +553,15 @@ impl InputTurn {
         };
         format!(
             " input_turn_us={} input_turn_boot={} input_usb_us={} \
-             input_led_us={} input_led_wait_us={} input_led_changed={} input_read_us={} \
-             input_read_wait_us={} input_devices={} input_delivery_us={} \
+             input_led_us={} input_led_changed={} input_read_us={} \
+             input_devices={} input_delivery_us={} \
              input_delivery_entry_us={} input_reports={}",
             us(self.duration()),
             self.boot,
             us(self.usb_done.wrapping_sub(self.start)),
             us(self.led_done.wrapping_sub(self.usb_done)),
-            us(self.led_wait),
             self.led_changed,
             us(self.read_done.wrapping_sub(self.led_done)),
-            us(self.read_wait),
             self.devices,
             us(self.end.wrapping_sub(self.read_done)),
             us(delivery_entry),

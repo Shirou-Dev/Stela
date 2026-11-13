@@ -7,12 +7,21 @@
 //! root (`storage::RestoreRoot`). The guest sees an input change at
 //! its peripheral's next interrupt poll after the slice it arrived in. A
 //! device that gave no input for a few seconds is polled every
-//! [`IDLE_MILLIS`], so its first input waits that long, or for a busy
-//! host-drivers lock up to [`STARVED_MILLIS`] more. A device whose polls
-//! cost more than a [`COST_SHARE`]th of that is polled as much less often,
-//! but at most [`SLOW_MILLIS`] apart when idle and [`ACTIVE_MILLIS`] when
-//! active, which bound its first input's wait. A posted
-//! GPU call is pumped between devices (`gpu::pump_posted`).
+//! [`IDLE_MILLIS`], so its first input waits that long. A device whose
+//! polls cost more than a [`COST_SHARE`]th of that is polled as much less
+//! often, but at most [`SLOW_MILLIS`] apart when idle and [`ACTIVE_MILLIS`]
+//! when active, which bound its first input's wait while the host drivers'
+//! lock is free. A posted GPU call is pumped between devices
+//! (`gpu::pump_posted`).
+//!
+//! No call waits for the host drivers' lock for longer than
+//! [`STARVED_WAIT_MICROS`]: the turn may be a step of a PE that runs guest
+//! code, and another processor can hold the lock for longer than one exit
+//! may take. A poll, an LED change or a stopped device's removal that finds
+//! the lock busy stays due for the next turn. A device holds its input
+//! meanwhile as far as its hardware does: a USB device one report in its
+//! queued transfer and what it keeps itself behind the endpoint's NAKs, a
+//! PS/2 device its own buffer behind the controller's.
 //!
 //! Each device's first polling and LED failure is reported once. A device
 //! that stops is reported and dropped, so re-plugged keyboards do not pile
@@ -28,6 +37,8 @@ use stela_soc::machine::AppleDevices;
 struct Reported {
     failed: bool,
     leds: bool,
+    /// The keyboard LEDs last wanted have not reached the device yet.
+    leds_due: bool,
     /// The counter when the device was last polled, and when a poll last
     /// found input.
     looked: u64,
@@ -64,10 +75,16 @@ const TIMES_SECONDS: u64 = 10;
 /// full. USB low-speed keyboards and mice are polled as rarely.
 const IDLE_MILLIS: u64 = 8;
 /// How long a busy host-drivers lock may leave a due device unpolled before
-/// a poll waits for the lock. A disk command can hold it for tens of
-/// milliseconds, and a service that waits for it holds the boot PE as long;
-/// below this a due device is polled at the next turn the lock is free.
+/// a poll waits for the lock, for [`STARVED_WAIT_MICROS`] at most. A disk
+/// command can hold it for tens of milliseconds; below this a due device is
+/// polled at the next turn the lock is free.
 const STARVED_MILLIS: u64 = 32;
+/// How long a turn waits for the host drivers' lock for a device unpolled
+/// past [`STARVED_MILLIS`], once for all its devices: about a service
+/// step's length. The wait shows a holder that works in steps (the GPUs'
+/// pump) that the lock is wanted, so it lets go at its next step; a holder
+/// that keeps it longer leaves the poll due for the next turn.
+const STARVED_WAIT_MICROS: u64 = 1000;
 /// How long a device is polled at every service turn after it last gave
 /// input, so a pointer's motion keeps its full rate.
 const ACTIVE_SECONDS: u64 = 5;
@@ -158,18 +175,24 @@ impl HostInput {
             {
                 turn.led_changed = true;
             }
+            for reported in &mut self.reported {
+                reported.leds_due = true;
+            }
+        }
+        if let Some(leds) = self.leds {
             for (device, reported) in self.inputs.devices.iter_mut().zip(&mut self.reported) {
+                if !reported.leds_due || device.stopped() {
+                    continue;
+                }
                 let set = {
-                    // SAFETY: as below, for the device's controller.
-                    let _root = unsafe {
-                        RestoreRoot::enter_input(
-                            self.inputs.root,
-                            #[cfg(feature = "diagnostics")]
-                            &mut turn.led_wait,
-                        )
+                    // SAFETY: as below, for the device's controller. A busy
+                    // lock leaves the change due for the next turn.
+                    let Some(_root) = (unsafe { RestoreRoot::try_enter(self.inputs.root) }) else {
+                        continue;
                     };
                     device.set_leds(leds)
                 };
+                reported.leds_due = false;
                 if let Err(error) = set
                     && !core::mem::replace(&mut reported.leds, true)
                 {
@@ -187,7 +210,14 @@ impl HostInput {
         let now = super::host::fresh_counter();
         let millis = super::host::COUNTER_HZ / 1000;
         let starved = millis * STARVED_MILLIS;
+        // Whether this turn may still wait for the lock.
+        let mut may_wait = true;
         for (device, reported) in self.inputs.devices.iter_mut().zip(&mut self.reported) {
+            // A stopped device a busy lock kept from being dropped.
+            if device.stopped() {
+                stopped = true;
+                continue;
+            }
             let active =
                 now.wrapping_sub(reported.active) < super::host::COUNTER_HZ * ACTIVE_SECONDS;
             let interval = if active {
@@ -206,12 +236,8 @@ impl HostInput {
                 // SAFETY: the loader root `storage::open` captured, which
                 // maps this device.
                 let root = unsafe {
-                    if since >= interval + starved {
-                        Some(RestoreRoot::enter_input(
-                            self.inputs.root,
-                            #[cfg(feature = "diagnostics")]
-                            &mut turn.read_wait,
-                        ))
+                    if since >= interval + starved && core::mem::take(&mut may_wait) {
+                        RestoreRoot::enter_within(self.inputs.root, STARVED_WAIT_MICROS)
                     } else {
                         RestoreRoot::try_enter(self.inputs.root)
                     }
@@ -284,7 +310,8 @@ impl HostInput {
     }
 
     /// Report and drop every device that stopped. Dropping one can stop its
-    /// transfers, so it runs in the loader's root as a poll does.
+    /// transfers, so it runs in the loader's root as a poll does; a device
+    /// a busy lock keeps is dropped at a later turn, unpolled meanwhile.
     fn remove_stopped(&mut self) {
         let mut index = 0;
         while index < self.inputs.devices.len() {
@@ -292,16 +319,18 @@ impl HostInput {
                 index += 1;
                 continue;
             }
-            let device = self.inputs.devices.remove(index);
-            self.reported.remove(index);
-            output::arguments(format_args!(
-                "INPUT {} stopped and removed\n",
-                device.name()
-            ));
             // SAFETY: the loader root `storage::open` captured, which maps
             // this device; the processor's pinned record is active.
-            let _root = unsafe { RestoreRoot::enter(self.inputs.root) };
+            let Some(root) = (unsafe { RestoreRoot::try_enter(self.inputs.root) }) else {
+                index += 1;
+                continue;
+            };
+            let device = self.inputs.devices.remove(index);
+            self.reported.remove(index);
+            let name = device.name();
             drop(device);
+            drop(root);
+            output::arguments(format_args!("INPUT {name} stopped and removed\n"));
         }
     }
 }

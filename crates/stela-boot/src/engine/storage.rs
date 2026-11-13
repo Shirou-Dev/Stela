@@ -259,6 +259,35 @@ static HOST_DRIVERS_SITE: AtomicPtr<Location<'static>> = AtomicPtr::new(ptr::nul
 /// wait), so only a holder that never lets go reaches it.
 const HOST_DRIVERS_WAIT_SECONDS: u64 = 90;
 
+/// Spin for the host drivers' lock for `limit` counter ticks at most,
+/// counted as a waiter meanwhile ([`host_drivers_wanted`]).
+fn spin_for_host_drivers(limit: u64) -> stela_boot_core::bounded_spin::Spin {
+    HOST_DRIVERS_WAITERS.fetch_add(1, Ordering::Relaxed);
+    let spun = stela_boot_core::bounded_spin::spin(
+        || {
+            HOST_DRIVERS
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        },
+        super::host::rdtsc,
+        limit,
+        || {
+            // A driver holding this lock can be retiring an aperture mapping.
+            // An interrupt cannot reach this waiter if it entered with IF clear.
+            crate::native_mmio::shootdown::service();
+            core::hint::spin_loop();
+        },
+    );
+    HOST_DRIVERS_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    spun
+}
+
+/// Count a wait of `waited` ticks that took the lock, for the report.
+fn count_host_drivers_wait(waited: u64) {
+    HOST_DRIVERS_WAITED[0].fetch_add(waited, Ordering::Relaxed);
+    HOST_DRIVERS_WAITED[1].fetch_max(waited, Ordering::Relaxed);
+}
+
 /// Take the host drivers' lock, counting the wait. A wait past
 /// [`HOST_DRIVERS_WAIT_SECONDS`] stops the mount with a report naming the
 /// holder instead of spinning forever.
@@ -271,24 +300,7 @@ fn lock_host_drivers() -> u64 {
         0 => 10_000_000_000,
         hz => hz,
     };
-    HOST_DRIVERS_WAITERS.fetch_add(1, Ordering::Relaxed);
-    let spun = stela_boot_core::bounded_spin::spin(
-        || {
-            HOST_DRIVERS
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-        },
-        super::host::rdtsc,
-        hz.saturating_mul(HOST_DRIVERS_WAIT_SECONDS),
-        || {
-            // A driver holding this lock can be retiring an aperture mapping.
-            // An interrupt cannot reach this waiter if it entered with IF clear.
-            crate::native_mmio::shootdown::service();
-            core::hint::spin_loop();
-        },
-    );
-    HOST_DRIVERS_WAITERS.fetch_sub(1, Ordering::Relaxed);
-    let waited = match spun {
+    let waited = match spin_for_host_drivers(hz.saturating_mul(HOST_DRIVERS_WAIT_SECONDS)) {
         stela_boot_core::bounded_spin::Spin::Taken(waited) => waited,
         stela_boot_core::bounded_spin::Spin::Overrun(waited) => {
             let site = HOST_DRIVERS_SITE.load(Ordering::Relaxed);
@@ -303,8 +315,7 @@ fn lock_host_drivers() -> u64 {
             ))
         }
     };
-    HOST_DRIVERS_WAITED[0].fetch_add(waited, Ordering::Relaxed);
-    HOST_DRIVERS_WAITED[1].fetch_max(waited, Ordering::Relaxed);
+    count_host_drivers_wait(waited);
     waited
 }
 
@@ -359,30 +370,26 @@ impl RestoreRoot {
         unsafe { Self::enter_locked(root) }
     }
 
-    /// Enter for input service, attributing this acquisition's actual
-    /// contention to the current phase in a diagnostics build.
+    /// Enter for a service turn's work that was put off for long: wait for
+    /// the lock for `micros` at most, as a waiter a holder that works in
+    /// steps lets in at its next step ([`host_drivers_wanted`]). `None`
+    /// when the holder kept it; an unknown counter rate waits for nothing.
     ///
     /// # Safety
     /// As for [`Self::enter`].
-    #[inline]
     #[track_caller]
-    pub(super) unsafe fn enter_input(
-        root: u64,
-        #[cfg(feature = "diagnostics")] wait: &mut u64,
-    ) -> Self {
-        #[cfg(feature = "diagnostics")]
-        {
-            let waited = lock_host_drivers();
-            // SAFETY: the caller supplies the live root, and this core holds the lock.
-            let guard = unsafe { Self::enter_locked(root) };
-            *wait = wait.saturating_add(waited);
-            guard
+    pub(super) unsafe fn enter_within(root: u64, micros: u64) -> Option<Self> {
+        if !try_lock_host_drivers() {
+            let limit = crate::firmware::tsc_hz() / 1_000_000 * micros;
+            match spin_for_host_drivers(limit) {
+                stela_boot_core::bounded_spin::Spin::Taken(waited) => {
+                    count_host_drivers_wait(waited);
+                }
+                stela_boot_core::bounded_spin::Spin::Overrun(_) => return None,
+            }
         }
-        #[cfg(not(feature = "diagnostics"))]
-        // SAFETY: same loader root and pinned-core requirement as enter.
-        unsafe {
-            Self::enter(root)
-        }
+        // SAFETY: the caller supplies the live root, and this core holds the lock.
+        Some(unsafe { Self::enter_locked(root) })
     }
 
     /// Enter for work that can wait until another service turn.
