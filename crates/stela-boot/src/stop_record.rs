@@ -10,14 +10,14 @@
 //! them in the loader's root, which keeps the firmware's runtime regions
 //! mapped by identity, as `SetVirtualAddressMap` is never called.
 use crate::output;
-use alloc::boxed::Box;
+use alloc::{boxed::Box, string::String};
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicU8, AtomicU64, Ordering},
 };
 use stela_boot_core::stop_record::{
-    ATTRIBUTES, HEADER_NAME, Header, Kept, PIECES, Space, Tail, VENDOR, fitting, piece_name,
-    pieces, read,
+    ATTRIBUTES, HEADER_NAME, Header, Kept, PIECES, Space, Tail, VENDOR, carried_notice, fitting,
+    piece_name, pieces, read, stop_reason,
 };
 use uefi::{
     CStr16, Guid,
@@ -283,9 +283,10 @@ fn write(fill: impl FnOnce(&mut Tail)) -> bool {
 }
 
 /// Copy the record an earlier start left on this PC into the log, between
-/// marker lines, and delete its variables once the USB's log holds the
-/// lines. Variables that are no whole record are reported in one line and
-/// deleted. Called once the USB's log is open, while boot services run;
+/// marker lines, tell the screen that start stopped, why and where its
+/// lines are (`carried_notice`), and delete its variables once the USB's
+/// log holds the lines. Variables that are no whole record are reported in
+/// one line and deleted. Called once the USB's log is open, while boot services run;
 /// a PC that holds no record, as one the stick was moved to, gets no line
 /// and no write.
 pub(crate) fn carry() {
@@ -299,25 +300,37 @@ pub(crate) fn carry() {
     let header = value(&HEADER_NAME);
     let values: [Option<Box<[u8]>>; PIECES] =
         core::array::from_fn(|index| value(&piece_name(index)));
-    match read(header.as_deref(), &values) {
+    // The stop's reason, for the screen: a stop after the GPU's reset left
+    // none of its own.
+    let reason = match read(header.as_deref(), &values) {
         Kept::Absent => return,
-        Kept::Damaged(why) => output::arguments(format_args!(
-            "PREVIOUS BOOT left a stop record in this PC's firmware that cannot be read: {why}\n"
-        )),
+        Kept::Damaged(why) => {
+            output::arguments(format_args!(
+                "PREVIOUS BOOT left a stop record in this PC's firmware that cannot be read: \
+                 {why}\n"
+            ));
+            None
+        }
         Kept::Record { boot, text } => {
             output::arguments(format_args!(
-                "PREVIOUS BOOT stopped where the USB's log was out of reach (boot {boot} of its \
-                 USB's log); this PC's firmware kept its last lines:\n"
+                "PREVIOUS BOOT stopped (boot {boot} of its USB's log) where the USB's log was \
+                 out of reach or the screen may have been dead; this PC's firmware kept its last \
+                 lines:\n"
             ));
             for line in text.lines() {
                 output::arguments(format_args!("PREVIOUS BOOT {line}\n"));
             }
             output::arguments(format_args!("PREVIOUS BOOT stop record ends\n"));
+            Some(stop_reason(&text).map(String::from))
         }
-    }
+    };
     // On the stick first: the variables are the only other copy.
     output::flush_log();
-    if !output::usb_log_kept() {
+    let in_log = output::usb_log_kept();
+    if let Some(reason) = reason {
+        crate::status::warning(&carried_notice(reason.as_deref(), in_log));
+    }
+    if !in_log {
         output::arguments(format_args!(
             "PREVIOUS BOOT stop record stays in this PC's firmware: the USB's log did not take \
              it\n"

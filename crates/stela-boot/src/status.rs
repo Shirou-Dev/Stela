@@ -456,6 +456,12 @@ pub fn info(text: &str) {
     with(|state| state.line(Mark::Info, text));
 }
 
+/// A warning line of its own, with no step to end, as for what an earlier
+/// start left.
+pub fn warning(text: &str) {
+    with(|state| state.line(Mark::Warn, text));
+}
+
 /// Draw with Stela's console on `screen` from now on, starting with the
 /// finished lines so far and the running step.
 pub fn take_screen(screen: Option<console::Framebuffer>) {

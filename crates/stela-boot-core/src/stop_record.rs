@@ -305,10 +305,86 @@ pub fn read<P: AsRef<[u8]>>(header: Option<&[u8]>, pieces: &[Option<P>; PIECES])
     }
 }
 
+/// What a stop's line holds before its reason (`output::fatal`).
+const FATAL: &str = "STELA FATAL ";
+/// The most of a reason the screen shows ([`carried_notice`]).
+const REASON_CHARACTERS: usize = 200;
+
+/// The reason a record's stop gave, the text after [`FATAL`] on the newest
+/// line that holds it; `None` where none does, as in a record whose stop
+/// line was never written.
+pub fn stop_reason(text: &str) -> Option<&str> {
+    text.lines()
+        .rev()
+        .find_map(|line| line.split_once(FATAL).map(|(_, reason)| reason.trim()))
+        .filter(|reason| !reason.is_empty())
+}
+
+/// What the screen says at the start after a stop whose record this PC's
+/// firmware kept: the last start stopped, why where the record says
+/// ([`stop_reason`]), and where its lines are now; `in_log` when the USB's
+/// log took them. A stop that left no screen, as one after the GPU's
+/// reset, is then told at the next start.
+pub fn carried_notice(reason: Option<&str>, in_log: bool) -> String {
+    let mut notice = String::from("The last start of Stela on this PC stopped");
+    if let Some(reason) = reason {
+        notice.push_str(": ");
+        match reason.char_indices().nth(REASON_CHARACTERS) {
+            Some((end, _)) => {
+                notice.push_str(&reason[..end]);
+                notice.push_str("...");
+            }
+            None => notice.push_str(reason),
+        }
+    }
+    notice.push_str(if in_log {
+        ". This PC kept its last lines, now in the log on this USB: on another computer, plug \
+         in this USB and run `stela log`, which saves it to log.txt; include that file in a \
+         report."
+    } else {
+        ". This PC keeps its last lines, but the log on this USB did not take them; they stay \
+         for the next start."
+    });
+    notice
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::{vec, vec::Vec};
+
+    #[test]
+    fn the_stop_reason_is_the_newest_fatal_line() {
+        let text = "[  27.553] LINUX <6> kthreadd pid 2 published\n\
+                    [  28.001] STELA FATAL first\n\
+                    [  28.002] x86 exception\n\
+                    [  28.003] STELA FATAL unexpected x86 exception: vector=6 drivers=here \n\
+                    [  28.004] STELA STOPPED code=0x11; power off to continue\n";
+        assert_eq!(
+            stop_reason(text),
+            Some("unexpected x86 exception: vector=6 drivers=here")
+        );
+        assert_eq!(stop_reason("[ 1.000] STEP Starting the GPU\n"), None);
+        assert_eq!(stop_reason("STELA FATAL \n"), None);
+        assert_eq!(stop_reason(""), None);
+    }
+
+    #[test]
+    fn the_carried_notice_says_why_and_where_the_lines_are() {
+        let logged = carried_notice(Some("GPU startup exceeded its deadline"), true);
+        assert!(logged.starts_with(
+            "The last start of Stela on this PC stopped: GPU startup exceeded its deadline. "
+        ));
+        assert!(logged.contains("`stela log`"));
+        let kept = carried_notice(None, false);
+        assert!(kept.starts_with("The last start of Stela on this PC stopped. "));
+        assert!(kept.contains("did not take them"));
+        // A long reason is cut on a character, not a byte.
+        let long = "é".repeat(REASON_CHARACTERS + 5);
+        let cut = carried_notice(Some(&long), true);
+        assert!(cut.contains(&alloc::format!("{}...", "é".repeat(REASON_CHARACTERS))));
+        assert!(!cut.contains(&"é".repeat(REASON_CHARACTERS + 1)));
+    }
 
     /// What a stop writes for `text`: the header's value and each piece's.
     fn written(boot: u64, text: &[u8]) -> (Option<Vec<u8>>, [Option<Vec<u8>>; PIECES]) {
