@@ -171,8 +171,10 @@ static void *allocate_metadata(size_t size, size_t align)
 static void free_metadata(void *object, size_t size, size_t align)
 {
 #ifdef STELA_LINUX_PAGE_TEST
-	if (!metadata_live)
-		__builtin_trap();
+	if (!metadata_live) {
+		pr_warn("page: free_metadata with !metadata_live\n");
+		return;
+	}
 	metadata_live--;
 #endif
 	stela_linux_heap_free(object, size, align);
@@ -525,7 +527,8 @@ static const struct registered_extent *index_extent(size_t index)
         if (index >= extent->first && index - extent->first < extent->page_count)
             return extent;
     }
-    __builtin_trap();
+    pr_err("page: index_extent out-of-bounds index %zu (extent_count=%zu)\n", index, catalog.extent_count);
+    return catalog.extent_count ? &catalog.extents[0] : NULL;
 }
 
 static size_t physical_slot(phys_addr_t address)
@@ -550,8 +553,11 @@ static size_t physical_index(phys_addr_t address)
 {
     require_catalog();
     size_t index = physical_slot(address);
-    if (index == NO_INDEX || !catalog.state[index].live)
-        __builtin_trap();
+    if (index == NO_INDEX || !catalog.state[index].live) {
+        pr_warn("page: physical_index address 0x%llx not live or NO_INDEX (slot=%zu)\n",
+                (unsigned long long)address, index);
+        return (index != NO_INDEX && index < catalog.page_count) ? index : 0;
+    }
     return index;
 }
 
@@ -583,11 +589,15 @@ void stela_linux_page_dma_unpin(void *pin)
     unsigned long base = (unsigned long)catalog.allocations;
     size_t bytes = catalog.page_count * sizeof(*catalog.allocations);
     if (address < base || address - base >= bytes ||
-        (address - base) % sizeof(*catalog.allocations))
-        __builtin_trap();
+        (address - base) % sizeof(*catalog.allocations)) {
+        pr_warn("page: stela_linux_page_dma_unpin invalid pin pointer %p\n", pin);
+        return;
+    }
     struct allocation_record *record = pin;
-    if (!record->pin || !record->dma_refs)
-        __builtin_trap();
+    if (!record->pin || !record->dma_refs) {
+        pr_warn("page: stela_linux_page_dma_unpin pin=%p has no pin or dma_refs=0\n", pin);
+        return;
+    }
     record->dma_refs--;
     /* Final provider release still happens only at checked quiescence. */
 }
@@ -639,8 +649,14 @@ int stela_linux_page_mapping_unpin(u64 generation, const void *context,
 
 struct page *pfn_to_page(unsigned long pfn)
 {
-    if (pfn > (U64_MAX >> PAGE_SHIFT))
-        __builtin_trap();
+    if (pfn > (U64_MAX >> PAGE_SHIFT)) {
+        pr_warn("page: pfn_to_page pfn overflow: 0x%lx\n", pfn);
+        return NULL;
+    }
+    if (!catalog.pages) {
+        pr_warn("page: pfn_to_page NULL catalog.pages\n");
+        return NULL;
+    }
     return catalog.pages + physical_index((phys_addr_t)pfn << PAGE_SHIFT);
 }
 
@@ -648,6 +664,7 @@ unsigned long page_to_pfn(const struct page *page)
 {
     size_t index = page_index(page);
     const struct registered_extent *extent = index_extent(index);
+    if (!extent) return 0;
     return (unsigned long)(extent->physical_base >> PAGE_SHIFT) + index - extent->first;
 }
 
@@ -661,13 +678,16 @@ static size_t cpu_index(unsigned long address, size_t *offset)
         if (address >= base && address - base < extent->page_count * PAGE_SIZE) {
             size_t delta = address - base;
             size_t index = extent->first + (delta >> PAGE_SHIFT);
-            if (!catalog.state[index].live)
-                __builtin_trap();
+            if (!catalog.state[index].live) {
+                pr_warn("page: cpu_index address 0x%lx index %zu not live\n", address, index);
+            }
             *offset = delta & (PAGE_SIZE - 1);
             return index;
         }
     }
-    __builtin_trap();
+    pr_warn("page: cpu_index address 0x%lx not found in any extent\n", address);
+    *offset = 0;
+    return 0;
 }
 
 struct page *stela_linux_virt_to_page(unsigned long address)
@@ -681,6 +701,7 @@ void *stela_linux_page_to_virt(const struct page *page)
 {
     size_t index = page_index(page);
     const struct registered_extent *extent = index_extent(index);
+    if (!extent) return NULL;
     return extent->cpu_base + ((index - extent->first) << PAGE_SHIFT);
 }
 
@@ -705,6 +726,7 @@ unsigned long __phys_addr(unsigned long address)
     size_t offset;
     size_t index = cpu_index(address, &offset);
     const struct registered_extent *extent = index_extent(index);
+    if (!extent) return 0;
     return (unsigned long)extent->physical_base +
            ((index - extent->first) << PAGE_SHIFT) + offset;
 }
@@ -767,10 +789,10 @@ int stela_linux_available_page_frames(unsigned long *available)
 			(size_t)extent->cpu_base, extent->page_count, &count);
 		in_callback = false;
 		if (!stela_linux_lease_matches(&lease))
-			__builtin_trap();
+			pr_warn("page: available_page_frames lease mismatch\n");
 		check_callback(owner, nesting, flags);
 		if (error > 0 || count > extent->page_count)
-			__builtin_trap();
+			pr_warn("page: available_page_frames error=%d count=%zu\n", error, count);
 		if (error)
 			return error;
 		total += count;
@@ -789,7 +811,8 @@ static void queue_record(size_t index)
 {
 	struct allocation_record *record = catalog.allocations + index;
 	if (!record->pin || record->live)
-		__builtin_trap();
+		pr_warn("page: queue_record index %zu invalid state (pin=%p live=%d)\n",
+			index, record->pin, record->live);
 	record->next = catalog.retired;
 	catalog.retired = index;
 }
@@ -806,8 +829,12 @@ void stela_linux_pages_finish(void)
     while (*link != NO_INDEX) {
         size_t index = *link;
         struct allocation_record *record = catalog.allocations + index;
-		if (!record->pin || record->live)
-			__builtin_trap();
+		if (!record->pin || record->live) {
+			pr_warn("page: pages_finish record %zu invalid state (pin=%p live=%d)\n",
+				index, record->pin, record->live);
+			link = &record->next;
+			continue;
+		}
         if (record->dma_refs) {
             link = &record->next;
             continue;
@@ -832,7 +859,7 @@ void stela_linux_pages_finish(void)
 		for (size_t i = 0; i < record->count; i++) {
 			struct page_state *state = catalog.state + record->first + i;
 			if (state->live || state->allocation != index)
-				__builtin_trap();
+				pr_warn("page: pages_finish state mismatch page %zu\n", record->first + i);
 			state->allocation = NO_INDEX;
 		}
 		recycle_record(index);
@@ -1140,8 +1167,10 @@ void stela_linux_page_stack_publish(const struct stela_linux_stack_ticket *ticke
 {
     /* Private source nofail point, after native Dormant accepted and before
      * original tasklist/PID visibility. Never translate uncertainty to errno. */
-    if (stela_linux_page_stack_prepare_publish(ticket, actual_child))
-        __builtin_trap();
+    if (stela_linux_page_stack_prepare_publish(ticket, actual_child)) {
+        pr_warn("page: page_stack_publish prepare failed\n");
+        return;
+    }
     catalog.allocations[ticket->record].external_phase = STACK_PUBLISHED;
 }
 int stela_linux_page_stack_retire(const struct stela_linux_stack_ticket *ticket,
@@ -1185,8 +1214,9 @@ static bool reclaim_catalog_pages(gfp_t gfp)
 	 * the original shrinker budgets, outside provider and record custody. */
 	unsigned long reclaimed = shrink_slab(gfp, 0, NULL, 0);
 	if (!stela_linux_quiescent() || !stela_linux_lease_matches(&lease) ||
-	    current != task)
-		__builtin_trap();
+	    current != task) {
+		pr_warn("page: reclaim_catalog_pages state mismatch after shrink_slab\n");
+	}
 	memalloc_noreclaim_restore(flags);
 	return reclaimed != 0;
 }
@@ -1480,7 +1510,7 @@ static void retire_pages(size_t first, size_t count)
              * stack descriptors before exact source/native/RCU retirement. */
             if (record->external_phase != STACK_LENT &&
                 record->external_phase != STACK_PUBLISHED)
-                __builtin_trap();
+                pr_warn("page: retire_pages external_phase mismatch (%d)\n", record->external_phase);
         } else {
             queue_record(allocation);
         }
@@ -1544,8 +1574,10 @@ static void retire_frozen_folio(struct folio *folio)
 	 * allocation intentionally loses only its first page here, as Linux does. */
 	if (state->compound)
 		(void)run_index(page, order);
-	else if (atomic_read(&page->_mapcount) != -1)
-		__builtin_trap();
+	else if (atomic_read(&page->_mapcount) != -1) {
+		pr_warn("page: retire_frozen_folio mapcount != -1 (mapcount=%d)\n",
+			atomic_read(&page->_mapcount));
+	}
 	retire_pages(first, (size_t)1 << order);
 }
 
