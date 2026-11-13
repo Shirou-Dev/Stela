@@ -908,9 +908,10 @@ pub(super) unsafe fn vmd(
     // child's, forwarded upstream under its requester ID. Its Bus Master bit
     // has been clear since the mount parked it, the preparation's seal keeps
     // it so, and finalization releases the seal without setting the bit.
-    // Only the hierarchy owner sets it again, after discovery refused any
-    // child left mastering, preparation cleared every child's Bus Master and
-    // the NVMe driver disabled its controller. The cold grant excludes prior
+    // Only the hierarchy owner sets it again, after discovery stopped every
+    // child firmware left mastering (refusing one that does not stop),
+    // preparation cleared every child's Bus Master and the NVMe driver
+    // disabled its controller. The cold grant excludes prior
     // firmware, IRQ and work users; no Stela producer exists yet. The BARs
     // were sized with decode as the mount left it, and finalization rechecks
     // the stopped state after the original root's drain.
@@ -926,46 +927,55 @@ pub(super) unsafe fn vmd(
         Some(bar @ Bar::Memory { .. }) => services.bar_resource(address, bar),
         _ => Err(ServiceError::Refused("missing memory BAR")),
     };
-    let cfgbar = reserve(0).map_err(refused)?;
-    let membar1 = reserve(2).map_err(refused)?;
-    let membar2 = reserve(4).map_err(refused)?;
-    let authority = services.authority().map_err(refused)?;
-    let map = |resource: &crate::bus::mmio::owned::Resource, window: core::ops::Range<u64>| {
-        authority
-            .map(
-                resource.clone(),
-                window.start as usize,
-                (window.end - window.start) as usize,
-                CacheAttribute::Uncached,
-                Protection::ReadWrite,
-            )
-            .map_err(|error| refused(ServiceError::Mapping(error)))
+    // A failure here keeps the stopped requester and its attachment, as
+    // every later failure keeps them with the host.
+    let reserved = (|| {
+        let bars = [reserve(0)?, reserve(2)?, reserve(4)?];
+        let authority = services.authority()?;
+        let map = |resource: &crate::bus::mmio::owned::Resource, window: core::ops::Range<u64>| {
+            authority
+                .map(
+                    resource.clone(),
+                    window.start as usize,
+                    (window.end - window.start) as usize,
+                    CacheAttribute::Uncached,
+                    Protection::ReadWrite,
+                )
+                .map_err(ServiceError::Mapping)
+        };
+        let configuration = map(&bars[0], 0..bars[0].physical_span().bytes())?;
+        let shadow = profile
+            .shadow_window()
+            .map(|window| map(&bars[2], window))
+            .transpose()?;
+        Ok::<_, ServiceError>((bars, authority, configuration, shadow))
+    })();
+    let (bars, authority, configuration, shadow) = match reserved {
+        Ok(reserved) => reserved,
+        Err(error) => return Err(keep_error(Error::Native(error), (requester, attachment))),
     };
-    let configuration = map(&cfgbar, 0..cfgbar.physical_span().bytes())?;
-    let shadow = profile
-        .shadow_window()
-        .map(|window| map(&membar2, window))
-        .transpose()?;
     let resources = vmd::NativeResources {
         requester,
-        bars: [cfgbar, membar1, membar2],
+        bars,
         cfgbar: configuration,
         shadow,
         msix: None,
     };
     // SAFETY: the mount reserved and mapped these BARs for this stopped host,
     // and no other owner reaches the hierarchy behind it.
-    let registers = unsafe { vmd::NativeRegisters::claim(resources) }
-        .map_err(|(error, resources)| failed(error, Box::new(resources)))?;
-    let mut host = vmd::Host::initialize(registers).map_err(|(error, registers)| {
-        (
-            Error::Vmd(error),
-            registers.map(|r| Box::new(r) as Box<dyn Any>),
-        )
-    })?;
+    let registers = match unsafe { vmd::NativeRegisters::claim(resources) } {
+        Ok(registers) => registers,
+        Err((error, resources)) => return Err(failed(error, Box::new((resources, attachment)))),
+    };
+    let mut host = match vmd::Host::initialize(registers) {
+        Ok(host) => host,
+        Err((error, registers)) => {
+            return Err(keep_error(Error::Vmd(error), (registers, attachment)));
+        }
+    };
     let mut others = match host.scan() {
         Ok(children) => children,
-        Err(error) => return Err(failed(error, Box::new(host))),
+        Err(error) => return Err(failed(error, Box::new((host, attachment)))),
     };
     let Some(index) = others.iter().position(|child| child.class == [1, 8, 2]) else {
         return Ok(Vmd {
@@ -977,13 +987,13 @@ pub(super) unsafe fn vmd(
     let child = others.remove(index);
     let bytes = match host.memory_bar_bytes(child.address) {
         Ok(bytes) => bytes,
-        Err(error) => return Err(failed(error, Box::new(host))),
+        Err(error) => return Err(failed(error, Box::new((host, attachment)))),
     };
     // SAFETY: `bytes` is the child's firmware-assigned BAR0, sized with its
     // decode off, and the stopped hierarchy has no other owner.
     let bar = match unsafe { vmd::endpoint::FirmwareBar::claim(&mut host, child.address, bytes) } {
         Ok(bar) => bar,
-        Err(error) => return Err(failed(error, Box::new(host))),
+        Err(error) => return Err(failed(error, Box::new((host, attachment)))),
     };
     let label = alloc::format!(
         "{address} VMD {:02x}:{:02x}.{}",
