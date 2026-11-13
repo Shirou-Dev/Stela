@@ -1,4 +1,5 @@
-//! Function-local GPU reset while the original configuration and DMA root stay owned.
+//! GPU reset while the original configuration and DMA root stay owned: a
+//! function-local reset, else a Secondary Bus Reset of the GPU's own bus.
 use alloc::{boxed::Box, rc::Rc};
 use core::mem::ManuallyDrop;
 use stela_driver_base::{
@@ -34,11 +35,21 @@ pub enum Error {
     Identity,
     Claim(ClaimError),
     Capability(CapabilityError),
-    /// No function-local reset, and DMA is not translated.
+    /// No function-local reset, no bus reset, and DMA is not translated.
     ResetUnavailable,
     Views(ViewError),
     Reset(BlockError),
     Preparation(preparation::Error),
+}
+
+/// The reset a cold start performed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Reset {
+    /// FLR or a D3hot soft reset ([`Function::reset`]).
+    Function(ResetMethod),
+    /// Secondary Bus Reset on the bridge above the GPU's own bus, as Linux
+    /// `pci_reset_function` falls back to `pci_parent_bus_reset`.
+    SecondaryBus,
 }
 
 /// The original CPU framebuffer/register writers and their translation owners.
@@ -76,13 +87,19 @@ pub unsafe trait Preparation: 'static {
     type Bound: 'static;
     type Failure;
     fn function_mut(&mut self) -> &mut Function<Self::Config>;
+    /// Whether a Secondary Bus Reset of the function's own bus is offered
+    /// and would currently find a bus it may reset. Reads only.
+    fn bus_reset_available(&self) -> bool;
+    /// Reset the function's own bus, the function's state saved and
+    /// restored around it.
+    fn reset_bus(&mut self, timer: &dyn Timer) -> Result<(), BlockError>;
     /// # Safety
-    /// A function-local reset (FLR or D3hot soft reset) and readiness/
-    /// containment revalidation completed with CPU views sealed and all old
-    /// owners still kept, or the function has no such reset and the private
-    /// domain translates its every request, so engines firmware left running
-    /// reach only that domain. Nothing can rearm the function before the
-    /// original root drain and private bind.
+    /// A function-local reset (FLR or D3hot soft reset) or a Secondary Bus
+    /// Reset, and readiness/containment revalidation, completed with CPU
+    /// views sealed and all old owners still kept, or the function has no
+    /// reset and the private domain translates its every request, so
+    /// engines firmware left running reach only that domain. Nothing can
+    /// rearm the function before the original root drain and private bind.
     unsafe fn finalize(self) -> Result<Self::Bound, (preparation::Error, Self::Failure)>;
 }
 
@@ -95,9 +112,15 @@ unsafe impl Preparation for PreparingRequester {
     fn function_mut(&mut self) -> &mut Function<Self::Config> {
         self.function_mut()
     }
+    fn bus_reset_available(&self) -> bool {
+        self.bus_reset_available()
+    }
+    fn reset_bus(&mut self, timer: &dyn Timer) -> Result<(), BlockError> {
+        self.reset_bus(timer)
+    }
     unsafe fn finalize(self) -> Result<Self::Bound, (preparation::Error, Self::Failure)> {
-        // SAFETY: Cold reset the function, or found it has no reset and its
-        // DMA translated, and sealed the original CPU views.
+        // SAFETY: Cold reset the function or its bus, or found it has no
+        // reset and its DMA translated, and sealed the original CPU views.
         unsafe { self.acknowledge_quiescence() }
             .finalize()
             .map_err(|failure| (failure.error, failure))
@@ -134,12 +157,12 @@ pub struct Failure<P: Preparation, V: Views<P::Config>> {
 pub struct Ready<B, V> {
     bound: ManuallyDrop<B>,
     views: ManuallyDrop<V>,
-    reset: Option<ResetMethod>,
+    reset: Option<Reset>,
 }
 impl<B, V> Ready<B, V> {
     /// The reset the function had, or None when it started in the state
     /// firmware left, as Linux starts it.
-    pub fn reset(&self) -> Option<ResetMethod> {
+    pub fn reset(&self) -> Option<Reset> {
         self.reset
     }
     /// # Safety
@@ -159,7 +182,8 @@ fn preflight<C: ConfigSpace>(
     function: &mut Function<C>,
     timer: &dyn Timer,
     translated: bool,
-) -> Result<Option<ResetMethod>, Error> {
+    bus_reset: bool,
+) -> Result<Option<Reset>, Error> {
     timer.check().map_err(Error::Clock)?;
     if function.vendor != NVIDIA || function.class[0] != DISPLAY {
         return Err(Error::Identity);
@@ -172,27 +196,32 @@ fn preflight<C: ConfigSpace>(
             return Err(Error::Identity);
         }
     }
-    // Linux `pci_reset_function` falls back from FLR to a D3hot soft reset.
-    // nouveau itself never resets: it starts what firmware left. Without
-    // translation, an engine firmware left running could write recycled
-    // RAM once bus mastering is on, so then a reset stays required.
-    let reset = function.reset_method().map_err(Error::Reset)?;
-    if reset.is_none() && !translated {
-        return Err(Error::ResetUnavailable);
+    // Linux `pci_reset_function` falls back from FLR to a D3hot soft reset,
+    // then to a reset of the bus the function sits on alone. nouveau itself
+    // never resets: it starts what firmware left, which translation keeps
+    // safe. Without translation, an engine firmware left running could
+    // write recycled RAM once bus mastering is on, so then a reset stays
+    // required, the bus reset the last one.
+    match function.reset_method().map_err(Error::Reset)? {
+        Some(method) => Ok(Some(Reset::Function(method))),
+        None if translated => Ok(None),
+        None if bus_reset => Ok(Some(Reset::SecondaryBus)),
+        None => Err(Error::ResetUnavailable),
     }
-    Ok(reset)
 }
 
 /// Read-only early qualification before native BAR probing/mapping. Success
 /// grants no stop, root drain, view seal or private-domain authority; Cold
 /// repeats the same checks immediately before its consumed reset attempt.
 /// `translated`: whether an active remapper confines the function's DMA.
+/// `bus_reset`: whether a Secondary Bus Reset of its bus is available.
 pub fn check_candidate<C: ConfigSpace>(
     function: &mut Function<C>,
     timer: &dyn Timer,
     translated: bool,
-) -> Result<Option<ResetMethod>, Error> {
-    preflight(function, timer, translated)
+    bus_reset: bool,
+) -> Result<Option<Reset>, Error> {
+    preflight(function, timer, translated, bus_reset)
 }
 impl<P: Preparation, V: Views<P::Config>> Cold<P, V> {
     pub fn new(inputs: Inputs<P, V>) -> Self {
@@ -221,25 +250,33 @@ impl<P: Preparation, V: Views<P::Config>> Cold<P, V> {
         let attempt = &mut **self.kept;
         let requester = attempt.requester.as_mut().expect("original cold requester");
         let result = (|| {
+            let bus_reset = requester.bus_reset_available();
             let reset = preflight(
                 requester.function_mut(),
                 attempt.timer.as_ref(),
                 attempt.translated,
+                bus_reset,
             )?;
             attempt
                 .views
                 .seal(requester.function_mut())
                 .map_err(Error::Views)?;
-            let function = requester.function_mut();
-            if reset.is_some()
-                && function
-                    .reset(attempt.timer.as_ref())
-                    .map_err(Error::Reset)?
-                    != reset
-            {
-                return Err(Error::ResetUnavailable);
+            let timer = attempt.timer.as_ref();
+            match reset {
+                Some(Reset::Function(method)) => {
+                    if requester
+                        .function_mut()
+                        .reset(timer)
+                        .map_err(Error::Reset)?
+                        != Some(method)
+                    {
+                        return Err(Error::ResetUnavailable);
+                    }
+                }
+                Some(Reset::SecondaryBus) => requester.reset_bus(timer).map_err(Error::Reset)?,
+                None => {}
             }
-            requester::validate_stopped(function).map_err(Error::Claim)?;
+            requester::validate_stopped(requester.function_mut()).map_err(Error::Claim)?;
             Ok(reset)
         })();
         let reset = match result {
@@ -254,8 +291,8 @@ impl<P: Preparation, V: Views<P::Config>> Cold<P, V> {
         };
 
         let requester = attempt.requester.take().expect("original cold requester");
-        // SAFETY: this exact function completed its reset, or has none and its
-        // DMA is translated, and stopped revalidation.
+        // SAFETY: this exact function completed its reset or its bus's, or has
+        // none and its DMA is translated, and stopped revalidation.
         // The original CPU views remain parked through the root drain and bind.
         match unsafe { requester.finalize() } {
             Ok(bound) => {

@@ -950,13 +950,14 @@ fn claim(
     let address = adapter.address;
     let timer = services.minimum_delay()?;
     let mut requester = services.prepare_requester(address)?;
+    let bus_reset = requester.bus_reset_available();
     let function = requester.function_mut();
     if (function.vendor, function.device, function.class) != (0x10de, adapter.device, adapter.class)
     {
         return Err(ServiceError::Refused("the GPU's original identity changed"));
     }
     let translated = services.dma_translated(address);
-    gpu::cold::check_candidate(function, timer.as_ref(), translated)
+    gpu::cold::check_candidate(function, timer.as_ref(), translated, bus_reset)
         .map_err(|error| cold_refusal(address, error))?;
     let owns_screen = match gop {
         ScreenOwner::Function(source) if source.address == address => {
@@ -1086,10 +1087,14 @@ fn claim(
     let ready = cold
         .quiesce_and_bind()
         .map_err(|failure| cold_refusal(address, failure.error))?;
-    if ready.reset().is_none() {
-        output::arguments(format_args!(
+    match ready.reset() {
+        None => output::arguments(format_args!(
             "GPU {address}: no function-local reset; started as firmware left it, DMA translated\n"
-        ));
+        )),
+        Some(gpu::cold::Reset::SecondaryBus) => output::arguments(format_args!(
+            "GPU {address}: no function-local reset; reset through its bridge's secondary bus\n"
+        )),
+        Some(gpu::cold::Reset::Function(_)) => {}
     }
     // SAFETY: both original owners transfer into this retained function
     // lifetime before Linux probe. Only the temporary UC observation is retired.

@@ -22,6 +22,9 @@ struct State {
     panic_reset: bool,
     fail_drain: bool,
     panic_drain: bool,
+    /// A bus reset is offered, and whether it fails.
+    bus_reset: bool,
+    fail_bus_reset: bool,
 }
 struct Config {
     words: Box<[u32; 128]>,
@@ -97,6 +100,18 @@ unsafe impl Preparation for Peer {
     type Failure = ManuallyDrop<Peer>;
     fn function_mut(&mut self) -> &mut Function<Config> {
         &mut self.function
+    }
+    fn bus_reset_available(&self) -> bool {
+        self.state.borrow().bus_reset
+    }
+    fn reset_bus(&mut self, timer: &dyn Timer) -> Result<(), BlockError> {
+        timer.wait_us(100_000).map_err(BlockError::from)?;
+        let mut state = self.state.borrow_mut();
+        state.events.push("bus-reset");
+        if state.fail_bus_reset {
+            return Err(BlockError::Unsupported("bus reset failed"));
+        }
+        Ok(())
     }
     unsafe fn finalize(self) -> Result<Self::Bound, (preparation::Error, Self::Failure)> {
         let peer = ManuallyDrop::new(self);
@@ -357,7 +372,10 @@ fn a_function_without_flr_gets_a_d3hot_soft_reset() {
     let ready = Cold::new(inputs)
         .quiesce_and_bind()
         .unwrap_or_else(|error| panic!("{:?}", error.error));
-    assert_eq!(ready.reset(), Some(ResetMethod::PowerManagement));
+    assert_eq!(
+        ready.reset(),
+        Some(Reset::Function(ResetMethod::PowerManagement))
+    );
     assert_eq!(
         state.borrow().events,
         ["views-seal", "d3hot", "d0", "root-drain", "bind"]
@@ -379,6 +397,7 @@ fn no_reset_starts_unreset_only_when_dma_is_translated() {
             &mut inputs.requester.function,
             &PhysicalTimer(state.clone()),
             translated,
+            false,
         );
         let mut cold = Cold::new(inputs);
         if translated {
@@ -398,5 +417,77 @@ fn no_reset_starts_unreset_only_when_dma_is_translated() {
             assert!(state.borrow().events.is_empty());
             kept(&state.borrow());
         }
+    }
+}
+#[test]
+fn without_a_function_reset_or_translation_the_bus_is_reset() {
+    for fail in [false, true] {
+        let (mut inputs, state) = inputs();
+        {
+            let words = &mut inputs.requester.function.config().words;
+            words[0x44 / 4] = 0;
+            words[0x84 / 4] = 8;
+        }
+        state.borrow_mut().bus_reset = true;
+        state.borrow_mut().fail_bus_reset = fail;
+        let candidate = check_candidate(
+            &mut inputs.requester.function,
+            &PhysicalTimer(state.clone()),
+            false,
+            true,
+        );
+        assert_eq!(candidate, Ok(Some(Reset::SecondaryBus)));
+        let result = Cold::new(inputs).quiesce_and_bind();
+        if fail {
+            let failed = failure(result);
+            assert_eq!(
+                failed.error,
+                Error::Reset(BlockError::Unsupported("bus reset failed"))
+            );
+            drop(failed);
+            assert_eq!(state.borrow().events, ["views-seal", "bus-reset"]);
+            kept(&state.borrow());
+        } else {
+            let ready = result.unwrap_or_else(|error| panic!("{:?}", error.error));
+            assert_eq!(ready.reset(), Some(Reset::SecondaryBus));
+            assert_eq!(
+                state.borrow().events,
+                ["views-seal", "bus-reset", "root-drain", "bind"]
+            );
+        }
+    }
+}
+#[test]
+fn a_function_reset_or_translation_comes_before_the_bus_reset() {
+    for translated in [false, true] {
+        let (mut inputs, state) = inputs();
+        state.borrow_mut().bus_reset = true;
+        if translated {
+            let words = &mut inputs.requester.function.config().words;
+            words[0x44 / 4] = 0;
+            words[0x84 / 4] = 8;
+        }
+        let candidate = check_candidate(
+            &mut inputs.requester.function,
+            &PhysicalTimer(state.clone()),
+            translated,
+            true,
+        );
+        let mut cold = Cold::new(inputs);
+        if translated {
+            assert_eq!(candidate, Ok(None));
+            // SAFETY: the symbolic domain stands for a translating one.
+            cold = unsafe { cold.translated() };
+        } else {
+            assert_eq!(
+                candidate,
+                Ok(Some(Reset::Function(ResetMethod::FunctionLevel)))
+            );
+        }
+        let ready = cold
+            .quiesce_and_bind()
+            .unwrap_or_else(|error| panic!("{:?}", error.error));
+        assert_ne!(ready.reset(), Some(Reset::SecondaryBus));
+        assert!(!state.borrow().events.contains(&"bus-reset"));
     }
 }
