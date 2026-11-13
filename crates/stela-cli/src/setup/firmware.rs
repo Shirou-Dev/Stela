@@ -39,8 +39,17 @@ fn read_cached(path: &Path, artifact: &Artifact) -> Result<Vec<u8>> {
 /// for a longer pause (a Retry-After of an hour, as GitLab's per-IP limit
 /// sends) is left for the next source at once.
 const WAIT_BUDGET: Duration = Duration::from_secs(30);
-/// Requests to one source for one file.
+/// Requests to one source for one file that bring nothing new.
 const ATTEMPTS: u32 = 3;
+/// Requests to one source for one file that go on from where a cut
+/// connection left the file: each brought more of it, so they wait only
+/// [`RESUME_PAUSE`] and leave the budget alone.
+const RESUMES: u32 = 8;
+const RESUME_PAUSE: Duration = Duration::from_secs(1);
+/// How long a download may go without a byte. There is no limit on the
+/// whole transfer: a GPU's 64 MB firmware takes many minutes on a slow
+/// network.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How one request to a source ended, when it brought no file.
 enum Answer {
@@ -49,6 +58,9 @@ enum Answer {
     Busy(Option<Duration>, String),
     /// A failure the same request may not meet again.
     Transient(String),
+    /// The connection ended inside the file; whether it brought bytes the
+    /// part kept so far lacked.
+    Cut(String, bool),
     /// An answer asking again would not change.
     Final(String),
 }
@@ -65,16 +77,50 @@ fn retry_after(response: &reqwest::blocking::Response) -> Option<Duration> {
     )
 }
 
-fn request(client: &Client, url: &str, artifact: &Artifact) -> Result<Vec<u8>, Answer> {
-    // A minute, and the file at 32 kB/s: a GPU's 64 MB firmware may take
-    // many minutes on a slow network.
-    let timeout = Duration::from_secs(60 + artifact.length as u64 / 32_000);
-    let mut response = match client
-        .get(url)
-        .header(header::ACCEPT_ENCODING, "identity")
-        .timeout(timeout)
-        .send()
-    {
+/// The first byte, last byte and length a `Content-Range: bytes a-b/n`
+/// header names.
+fn content_range(response: &reqwest::blocking::Response) -> Option<(u64, u64, u64)> {
+    let value = response
+        .headers()
+        .get(header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?;
+    let (range, total) = value.trim().strip_prefix("bytes ")?.split_once('/')?;
+    let (first, last) = range.split_once('-')?;
+    Some((first.parse().ok()?, last.parse().ok()?, total.parse().ok()?))
+}
+
+/// A broken transfer in words: the HTTP client's error with every cause
+/// under it, which says whether the server closed the connection or went
+/// quiet.
+fn transfer_error(error: &std::io::Error) -> String {
+    let timed_out = error.kind() == std::io::ErrorKind::TimedOut
+        || error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+            .is_some_and(reqwest::Error::is_timeout);
+    crate::net::explain_causes(error, timed_out)
+}
+
+fn mib(bytes: usize) -> String {
+    format!("{:.1}", bytes as f64 / MIB as f64)
+}
+
+/// Ask `url` for `artifact`, going on from the `part` of it earlier
+/// requests brought with a Range request. On success `part` holds the
+/// checked file; after a cut it holds what arrived, for the next request.
+fn request(
+    client: &Client,
+    url: &str,
+    artifact: &Artifact,
+    part: &mut Vec<u8>,
+) -> Result<(), Answer> {
+    let had = part.len();
+    let mut get = client.get(url).header(header::ACCEPT_ENCODING, "identity");
+    if had > 0 {
+        get = get.header(header::RANGE, format!("bytes={had}-"));
+    }
+    let mut response = match get.send() {
         Ok(response) => response,
         Err(error) if crate::net::transient(&error) => {
             return Err(Answer::Transient(crate::net::explain(&error)));
@@ -82,8 +128,23 @@ fn request(client: &Client, url: &str, artifact: &Artifact) -> Result<Vec<u8>, A
         Err(error) => return Err(Answer::Final(crate::net::explain(&error))),
     };
     let status = response.status();
-    match status.as_u16() {
-        200 => {}
+    let length = artifact.length as u64;
+    let start = match status.as_u16() {
+        // The whole file: a server without ranges sends it again.
+        200 => 0,
+        206 if had > 0 => {
+            if content_range(&response) != Some((had as u64, length - 1, length)) {
+                part.clear();
+                return Err(Answer::Transient(
+                    "sent a range other than the one asked for".into(),
+                ));
+            }
+            had
+        }
+        416 if had > 0 => {
+            part.clear();
+            return Err(Answer::Transient(format!("answered {status} to a resume")));
+        }
         429 | 503 => {
             let after = retry_after(&response);
             let asked = match after {
@@ -99,25 +160,39 @@ fn request(client: &Client, url: &str, artifact: &Artifact) -> Result<Vec<u8>, A
             return Err(Answer::Transient(format!("answered {status}")));
         }
         _ => return Err(Answer::Final(format!("answered {status}"))),
-    }
-    if response
-        .content_length()
-        .is_some_and(|n| n != artifact.length as u64)
-    {
+    };
+    part.truncate(start);
+    let remaining = length - start as u64;
+    if response.content_length().is_some_and(|n| n != remaining) {
+        part.clear();
         return Err(Answer::Final("sent a length other than the pin's".into()));
     }
-    let mut bytes = Vec::with_capacity(artifact.length);
-    if let Err(error) = response
+    let cut = response
         .by_ref()
-        .take(artifact.length as u64 + 1)
-        .read_to_end(&mut bytes)
-    {
-        return Err(Answer::Transient(format!("transfer failed: {error}")));
+        .take(remaining + 1)
+        .read_to_end(part)
+        .err();
+    if let Some(error) = cut.as_ref().map(transfer_error).or_else(|| {
+        (part.len() < artifact.length).then(|| "the server closed the connection".to_owned())
+    }) {
+        let what = format!(
+            "transfer cut at {} of {} MiB: {error}",
+            mib(part.len()),
+            mib(artifact.length)
+        );
+        return Err(Answer::Cut(what, part.len() > had));
     }
-    artifact.verify(&bytes).map_err(|_| {
-        Answer::Final("sent bytes whose length or SHA-256 differs from the pin".into())
-    })?;
-    Ok(bytes)
+    if artifact.verify(part).is_err() {
+        part.clear();
+        let what = "sent bytes whose length or SHA-256 differs from the pin";
+        // The ends of a resumed file may not join: fetch it whole once.
+        return Err(if start > 0 {
+            Answer::Transient(format!("{what} after a resume"))
+        } else {
+            Answer::Final(what.into())
+        });
+    }
+    Ok(())
 }
 
 fn host_of(url: &str) -> &str {
@@ -132,9 +207,11 @@ fn download(client: &Client, artifact: &Artifact) -> Result<Vec<u8>> {
 }
 
 /// Download `artifact` from the first of `urls` that sends its pinned
-/// bytes. A source that is busy waits only within [`WAIT_BUDGET`]; past it,
-/// or after [`ATTEMPTS`] requests, the next source is asked at once. The
-/// error names the file and what each source answered.
+/// bytes. A connection cut inside the file goes on from where it stopped,
+/// up to [`RESUMES`] times. A source that is busy waits only within
+/// [`WAIT_BUDGET`]; past it, or after [`ATTEMPTS`] requests that bring
+/// nothing, the next source is asked at once. The error names the file and
+/// what each source answered.
 fn download_from(
     client: &Client,
     artifact: &Artifact,
@@ -145,13 +222,27 @@ fn download_from(
     let mut answers = Vec::new();
     for url in urls {
         let host = host_of(url);
+        let mut part = Vec::with_capacity(artifact.length);
         let mut backoff = Duration::from_secs(1);
         let mut attempt = 1;
+        let mut resumes = 0;
         let last = loop {
-            let pause = match request(client, url, artifact) {
-                Ok(bytes) => return Ok(bytes),
+            let pause = match request(client, url, artifact, &mut part) {
+                Ok(()) => return Ok(part),
+                Err(Answer::Cut(what, true)) if resumes < RESUMES => {
+                    eprintln!(
+                        "note: {} from {host}: {what}; going on from there in {} s",
+                        artifact.member,
+                        RESUME_PAUSE.as_secs()
+                    );
+                    sleep(RESUME_PAUSE);
+                    resumes += 1;
+                    continue;
+                }
                 Err(Answer::Busy(Some(after), what)) => (Some(after), what),
-                Err(Answer::Busy(None, what) | Answer::Transient(what)) => (Some(backoff), what),
+                Err(Answer::Busy(None, what) | Answer::Transient(what) | Answer::Cut(what, _)) => {
+                    (Some(backoff), what)
+                }
                 Err(Answer::Final(what)) => (None, what),
             };
             match pause {
@@ -552,7 +643,8 @@ fn client() -> Result<Client> {
     Ok(Client::builder()
         .user_agent(concat!("stela/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(120))
+        // The blocking client applies this to each read, not the transfer.
+        .timeout(IDLE_TIMEOUT)
         .redirect(Policy::none())
         .build()?)
 }
@@ -1320,6 +1412,151 @@ mod tests {
             download_from(&client(), &ABC, &[first, second], &mut |_| {}).unwrap(),
             b"abc"
         );
+    }
+
+    /// A source on localhost that answers each request with the pieces of
+    /// one of `responses`, `pause` apart, then closes; its URL, and the
+    /// head of each request it served.
+    fn scripted(
+        responses: Vec<Vec<&'static str>>,
+        pause: Duration,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/one.bin", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut heads = Vec::new();
+            for pieces in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut head = [0; 4096];
+                let n = socket.read(&mut head).unwrap_or(0);
+                heads.push(String::from_utf8_lossy(&head[..n]).to_ascii_lowercase());
+                for (index, piece) in pieces.iter().enumerate() {
+                    if index > 0 {
+                        std::thread::sleep(pause);
+                    }
+                    let _ = socket.write_all(piece.as_bytes());
+                    let _ = socket.flush();
+                }
+            }
+            heads
+        });
+        (url, server)
+    }
+
+    const CUT: &str = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nab";
+    const REST: &str = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-2/3\r\nContent-Length: 1\r\nConnection: close\r\n\r\nc";
+
+    #[test]
+    fn a_cut_connection_goes_on_from_where_it_stopped() {
+        let (url, server) = scripted(vec![vec![CUT], vec![REST]], Duration::ZERO);
+        let mut slept = Vec::new();
+        let bytes = download_from(&client(), &ABC, &[url], &mut |d| slept.push(d)).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert_eq!(slept, [RESUME_PAUSE]);
+        let heads = server.join().unwrap();
+        assert!(!heads[0].contains("range:"), "{heads:?}");
+        assert!(heads[1].contains("range: bytes=2-\r\n"), "{heads:?}");
+    }
+
+    #[test]
+    fn a_server_without_ranges_sends_the_whole_file_again() {
+        let (url, server) = scripted(vec![vec![CUT], vec![OK]], Duration::ZERO);
+        let bytes = download_from(&client(), &ABC, &[url], &mut |_| {}).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert!(server.join().unwrap()[1].contains("range: bytes=2-\r\n"));
+        // A range other than the one asked for starts the file over.
+        let (url, server) = scripted(
+            vec![
+                vec![CUT],
+                vec![
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1-2/3\r\nContent-Length: 2\r\nConnection: close\r\n\r\nbc",
+                ],
+                vec![OK],
+            ],
+            Duration::ZERO,
+        );
+        let bytes = download_from(&client(), &ABC, &[url], &mut |_| {}).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert!(!server.join().unwrap()[2].contains("range:"));
+    }
+
+    #[test]
+    fn a_wrong_hash_is_refused_and_a_resumed_one_fetched_whole_again() {
+        let (url, server) = scripted(
+            vec![vec![
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabd",
+            ]],
+            Duration::ZERO,
+        );
+        let error = download_from(&client(), &ABC, &[url], &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("cannot download one.bin: 127.0.0.1:"),
+            "{error}"
+        );
+        assert!(error.contains("SHA-256 differs from the pin"), "{error}");
+        assert_eq!(server.join().unwrap().len(), 1);
+        // The resumed end does not join: the next request asks for the
+        // whole file.
+        let (url, server) = scripted(
+            vec![
+                vec![CUT],
+                vec![
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-2/3\r\nContent-Length: 1\r\nConnection: close\r\n\r\nd",
+                ],
+                vec![OK],
+            ],
+            Duration::ZERO,
+        );
+        let bytes = download_from(&client(), &ABC, &[url], &mut |_| {}).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert!(!server.join().unwrap()[2].contains("range:"));
+    }
+
+    #[test]
+    fn a_slow_transfer_outlasts_the_client_timeout_while_bytes_arrive() {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(500))
+            .redirect(Policy::none())
+            .build()
+            .unwrap();
+        let (url, server) = scripted(
+            vec![vec![
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\na",
+                "b",
+                "c",
+            ]],
+            Duration::from_millis(300),
+        );
+        let bytes = download_from(&client, &ABC, &[url], &mut |_| {}).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_transfer_that_never_progresses_says_why_it_failed() {
+        let empty = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\n";
+        let (url, server) = scripted(vec![vec![empty]; 3], Duration::ZERO);
+        let mut slept = Vec::new();
+        let error = download_from(&client(), &ABC, &[url], &mut |d| slept.push(d))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("cannot download one.bin: 127.0.0.1:"),
+            "{error}"
+        );
+        assert!(
+            error.contains("transfer cut at 0.0 of 0.0 MiB: request or response body error: "),
+            "{error}"
+        );
+        assert!(!error.contains('\n'), "{error}");
+        assert_eq!(slept, [Duration::from_secs(1), Duration::from_secs(2)]);
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 
     /// A boot log on `esp` whose boots print `lines`.

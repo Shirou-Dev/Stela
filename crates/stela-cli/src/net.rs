@@ -95,7 +95,7 @@ fn unreachable(cause: &(dyn Error + 'static)) -> bool {
 }
 
 /// [`explain`] for any error, one that ran out of time when `timed_out`.
-fn explain_causes(error: &(dyn Error + 'static), timed_out: bool) -> String {
+pub(crate) fn explain_causes(error: &(dyn Error + 'static), timed_out: bool) -> String {
     let mut text = error.to_string();
     let mut no_way = unreachable(error);
     let mut source = error.source();
