@@ -67,10 +67,10 @@ index aab5a73f467a1cc4a28ef1ef6000c929d1e0b43d..6e4f97c092267f830d43fb966bf7308c
  }
  
 diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
-index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..3956feb95fdb7dff2a3358ff3ec2c6d5dc5b4b4b 100644
+index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..fd6608b8ebc48fd69a04ca480be735da33374b9b 100644
 --- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
 +++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
-@@ -85,18 +85,27 @@
+@@ -85,19 +85,28 @@
  	u32 loc, sig, cnt;
  	int ret;
  
@@ -99,7 +99,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..3956feb95fdb7dff2a3358ff3ec2c6d5
  	if (ret)
  		goto done;
  
-@@ -114,6 +117,7 @@
+@@ -114,6 +123,7 @@
  	fw->dmem_size = lhdr->os_data_size;
  	fw->dmem_sign = loc - fw->dmem_base_img;
  	fw->boot_addr = lhdr->os_code_offset;
@@ -107,7 +107,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..3956feb95fdb7dff2a3358ff3ec2c6d5
  
  done:
  	if (ret)
-@@ -191,6 +195,8 @@
+@@ -191,6 +201,8 @@
  	u32 mbox0, mbox1;
  	int ret;
  
@@ -116,7 +116,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..3956feb95fdb7dff2a3358ff3ec2c6d5
  	if (!gsp->sr.meta.data) {
  		mbox0 = lower_32_bits(gsp->wpr_meta.addr);
  		mbox1 = upper_32_bits(gsp->wpr_meta.addr);
-@@ -202,11 +208,16 @@
+@@ -202,11 +214,16 @@
  	}
  
  	/* Execute booter to handle (eventually...) booting GSP-RM. */
@@ -134,7 +134,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..3956feb95fdb7dff2a3358ff3ec2c6d5
  }
  
  static int
-@@ -275,20 +286,9 @@
+@@ -275,20 +292,9 @@
  static u64
  tu102_gsp_vga_workspace_addr(struct nvkm_gsp *gsp, u64 fb_size)
  {
@@ -157,7 +157,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..3956feb95fdb7dff2a3358ff3ec2c6d5
  }
  
  /*
-@@ -333,19 +333,17 @@
+@@ -333,19 +339,17 @@
  	struct nvkm_device *device = gsp->subdev.device;
  	int ret;
  
@@ -182,7 +182,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..3956feb95fdb7dff2a3358ff3ec2c6d5
  	if (device->chipset == 0x170) {
  		u64 lock_lo = ga100_gsp_mmu_lock_lo(gsp);
  
-@@ -353,17 +351,24 @@
+@@ -353,17 +357,24 @@
  			gsp->fb.bios.addr = min(gsp->fb.bios.addr, lock_lo);
  	}
  
@@ -213,7 +213,7 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..3956feb95fdb7dff2a3358ff3ec2c6d5
  	if (ret)
  		return ret;
  
-@@ -393,24 +397,33 @@
+@@ -393,24 +404,33 @@
  	gsp->fb.heap.size = 0x100000;
  	gsp->fb.heap.addr = gsp->fb.wpr2.addr - gsp->fb.heap.size;
  
