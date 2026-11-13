@@ -83,9 +83,22 @@ struct State {
     /// can reset, and how many resets it ran.
     port_reset: bool,
     port_resets: usize,
+    /// Whether the model's timer keeps minimum intervals a caller polls.
+    intervals: bool,
 }
 #[derive(Clone)]
 struct Model(Rc<RefCell<State>>);
+/// A minimum interval of the model's timer, which proves the reset's
+/// settle as a waited minimum does once its time has passed.
+struct ModelInterval(Rc<RefCell<State>>, u64);
+impl crate::bus::pci::power::Interval for ModelInterval {
+    fn elapsed(&self) -> Result<bool, crate::bus::pci::power::Error> {
+        let mut state = self.0.borrow_mut();
+        let elapsed = state.now >= self.1;
+        state.reset_minimum |= elapsed;
+        Ok(elapsed)
+    }
+}
 impl Io for Model {
     type Buffer = DmaBuffer;
 
@@ -186,6 +199,16 @@ impl Io for Model {
             state.delays += 1;
         }
         Ok(())
+    }
+    fn begin_minimum(
+        &mut self,
+        micros: u64,
+    ) -> Result<Option<Box<dyn crate::bus::pci::power::Interval>>, BlockError> {
+        let state = self.0.borrow();
+        Ok(state.intervals.then(|| {
+            Box::new(ModelInterval(self.0.clone(), state.now + micros))
+                as Box<dyn crate::bus::pci::power::Interval>
+        }))
     }
     fn now_us(&self) -> u64 {
         self.0.borrow().now
@@ -518,6 +541,7 @@ fn model(start: u64, end: u64, units: Vec<Option<Unit>>) -> Model {
         order: Vec::new(),
         port_reset: false,
         port_resets: 0,
+        intervals: false,
     })))
 }
 /// The begun command's result, from calls of [`Bot::end`], each of which
@@ -1891,3 +1915,52 @@ fn a_failed_class_reset_resets_the_port_and_completes_on_the_same_disk() {
 }
 
 mod minimum;
+
+/// With a timer that keeps intervals, a reset settles by polling it: no
+/// look waits, and the halts clear only once the interval proves the time.
+#[test]
+fn a_reset_settles_by_the_timers_interval_without_a_wait() {
+    let mut memory = vec![0u64; 32 * 1024];
+    let start = memory.as_mut_ptr() as u64;
+    let mut dma = dma(&mut memory);
+    let io = model(start, start + memory.len() as u64 * 8, vec![unit(0)]);
+    let state = io.0.clone();
+    state.borrow_mut().intervals = true;
+    let mut bot = Bot::new(io, 3, endpoints(), &mut dma).unwrap();
+    state.borrow_mut().fault = Fault::Phase;
+    bot.begin(0, &[0; 6], Data::None).unwrap();
+    assert!(ended(&mut bot).is_err());
+    state.borrow_mut().fault = Fault::None;
+    state.borrow_mut().now += RESET_RECOVERY_US - 1;
+    assert!(bot.busy());
+    state.borrow_mut().now += 1;
+    assert!(!bot.busy());
+    assert_eq!(
+        state.borrow().order,
+        vec![
+            Order::Cbw(0),
+            Order::Reset,
+            Order::Clear(0x82),
+            Order::Clear(0x02)
+        ]
+    );
+}
+
+/// A stalled status stage is cleared and read again at once, as Linux's
+/// transport does: nothing waits, as no reset ran.
+#[test]
+fn a_stalled_status_is_cleared_without_a_wait() {
+    let mut memory = vec![0u64; 32 * 1024];
+    let start = memory.as_mut_ptr() as u64;
+    let mut dma = dma(&mut memory);
+    let io = model(start, start + memory.len() as u64 * 8, vec![unit(0)]);
+    let state = io.0.clone();
+    let mut bot = Bot::new(io, 3, endpoints(), &mut dma).unwrap();
+    state.borrow_mut().fault = Fault::CswStall;
+    bot.begin(0, &scsi::inquiry(), Data::In(36)).unwrap();
+    assert_eq!(ended(&mut bot).unwrap().len(), 36);
+    assert_eq!(
+        state.borrow().order,
+        vec![Order::Cbw(0), Order::Clear(0x82)]
+    );
+}

@@ -1048,6 +1048,23 @@ impl Controller {
         let result = self.minimum.wait_us(microseconds);
         self.minimum_status(result)
     }
+    /// Start a minimum interval the caller polls with
+    /// [`Self::minimum_elapsed`]; `None` where the timer keeps none.
+    pub(in crate::usb) fn begin_minimum(
+        &mut self,
+        microseconds: u64,
+    ) -> Result<Option<Box<dyn crate::bus::pci::power::Interval>>, BlockError> {
+        let result = self.minimum.begin_interval(microseconds);
+        self.minimum_status(result)
+    }
+    /// Whether a [`Self::begin_minimum`] interval has passed; never waits.
+    pub(in crate::usb) fn minimum_elapsed(
+        &mut self,
+        interval: &dyn crate::bus::pci::power::Interval,
+    ) -> Result<bool, BlockError> {
+        let result = self.minimum.interval_elapsed(interval);
+        self.minimum_status(result)
+    }
 
     /// Before any new command-dependent DMA mutation or doorbell. A late
     /// completion cannot establish a new command generation or undo poison.

@@ -23,7 +23,7 @@ fn nominal_reset_deadline_cannot_substitute_for_required_minimum() {
     state.borrow_mut().now += 100 * RESET_RECOVERY_US;
     assert!(!bot.busy());
     assert!(bot.poisoned());
-    assert!(matches!(bot.recovery, Some(Recovery::Settling(_))));
+    assert!(matches!(bot.recovery, Some(Recovery::Settling(..))));
     assert!(state.borrow().clears.is_empty());
     assert!(!state.borrow().reset_minimum);
     assert_eq!(
