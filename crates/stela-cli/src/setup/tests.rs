@@ -5354,7 +5354,8 @@ fn a_full_installer_with_every_signing_answer_says_the_install_needs_no_network(
 
 #[test]
 fn offline_is_made_on_a_usb_of_32_gb_or_more_from_an_image_with_all_of_macos() {
-    for capacity in [0, 31_000_000_000, 64 * GIB] {
+    // Sticks sold as 32 GB: 28.8 GB and 30.0 GB are common capacities.
+    for capacity in [0, 28_800_000_000, 30_015_488_000, 31_000_000_000, 64 * GIB] {
         assert_eq!(offline_unavailable(capacity, true), None, "{capacity}");
     }
     assert_eq!(

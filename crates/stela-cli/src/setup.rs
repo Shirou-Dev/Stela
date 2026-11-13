@@ -354,8 +354,12 @@ impl InstallImage {
 }
 
 /// The smallest USB, as the PC reports it, that an Offline installer is
-/// made on: a stick sold as 32 GB holds about 28.6 GiB.
-pub(super) const FULL_MIN: u64 = 28 * 1024 * 1024 * 1024;
+/// made on. Sticks sold as 32 GB report from about 28.8 GB (26.8 GiB) to
+/// 32 GB, and macOS 27.2 with its boot files and the firmware takes about
+/// 26.5 GB, so every one of them passes; the plan's own check of the free
+/// space against the image's size refuses the one that is too small after
+/// all, with the sizes.
+pub(super) const FULL_MIN: u64 = 26 * 1024 * 1024 * 1024;
 
 /// Why an Offline installer cannot be made on a USB of `capacity` bytes (0
 /// when unknown) from an image that holds all of macOS (`whole`) or only
