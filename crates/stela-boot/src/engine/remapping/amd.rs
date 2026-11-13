@@ -19,7 +19,8 @@ use stela_drivers::{
                 memory::TableVisibility,
                 unit::{
                     native::{
-                        ColdPlatform, DirectDelivery, Error, Limits, Mapping, Requester, Unit,
+                        ColdPlatform, Coverage, DirectDelivery, Error, Limits, Mapping, Requester,
+                        Unit, reads_off,
                     },
                     registers::{FunctionInspection, Inputs},
                 },
@@ -297,11 +298,22 @@ pub(super) struct Outcome {
     /// fabric is complete; none when they did not start blocked.
     pub(super) fabric: Option<bool>,
     /// Whether a unit was left in a state no proof covers: it went cold and
-    /// then did not stop.
+    /// then did not stop, or a unit left as found reads on.
     pub(super) uncertain: bool,
 }
 
-/// A unit brought up cold, whose coverage the policy now decides on.
+/// A unit read from the IVRS and inspected, not yet started, with the
+/// coverage the policy decides on.
+struct Found {
+    inspection: FunctionInspection<ObservedConfig>,
+    segment: u16,
+    base: u64,
+    own: Address,
+    decision: core::result::Result<Vec<u16>, remapping::Leave>,
+    reserved: Vec<(u16, Range<u64>)>,
+}
+
+/// A unit the policy kept, brought up cold.
 struct Cold {
     unit: Unit<Platform, ObservedConfig>,
     segment: u16,
@@ -311,26 +323,36 @@ struct Cold {
     reserved: Vec<(u16, Range<u64>)>,
 }
 
-/// Stop a cold unit the policy does not take and give back its function's
-/// configuration page and its register mapping: a unit dropped with them
-/// keeps both claimed, and the check that reopens the PCI bridges then
-/// cannot map the configuration space. False when it did not stop or a
-/// mapping did not retire.
+/// Give back a unit's function's configuration page and its register
+/// mapping: a unit dropped with them keeps both claimed, and the check
+/// that reopens the PCI bridges then cannot map the configuration space.
+/// False when one did not retire.
+fn give_back(mut inputs: Inputs<ObservedConfig>) -> bool {
+    let mut retired = true;
+    for mapping in &mut inputs.mappings {
+        // SAFETY: the unit, stopped or never started, was its only user.
+        retired &= unsafe { mapping.retire() }.is_ok();
+    }
+    retired & inputs.function.config().retire().is_ok()
+}
+
+/// Stop a cold unit the policy does not take and give its mappings back.
+/// False when it did not stop or a mapping did not retire.
 fn retire(mut unit: Unit<Platform, ObservedConfig>) -> bool {
     // SAFETY: no requester was attached and the unit blocks nothing it
     // translated; retiring stops it.
     if unsafe { unit.retire() }.is_err() {
         return false;
     }
-    let Some(mut inputs) = unit.into_inputs() else {
-        return false;
-    };
-    let mut retired = true;
-    for mapping in &mut inputs.mappings {
-        // SAFETY: the stopped unit was the mapping's only user.
-        retired &= unsafe { mapping.retire() }.is_ok();
-    }
-    retired & inputs.function.config().retire().is_ok()
+    unit.into_inputs().is_some_and(give_back)
+}
+
+/// Leave a unit that was never started as the boot found it: read that it
+/// is off, write nothing, and give its mappings back. False when it reads
+/// on or a mapping did not retire.
+fn release(inspection: FunctionInspection<ObservedConfig>) -> bool {
+    let off = reads_off(&inspection) == Ok(true);
+    give_back(inspection.into_inputs()) & off
 }
 
 /// Take every unit of `table` (an IVRS) the policy allows, each in the
@@ -379,9 +401,10 @@ pub(super) unsafe fn take(
             "HOST IOMMU AMD-Vi unit {base:#x} left untranslated: {why:?}\n"
         ));
     };
-    // Bring each unit up cold, which reads its coverage, before deciding
-    // how any starts.
-    let mut cold = Vec::new();
+    // Decide from the IVRS and the census before any unit starts: a unit
+    // the policy leaves is only read off and given back, so its start can
+    // neither fail nor leave a state no proof covers.
+    let mut found = Vec::new();
     for description in ivrs.units() {
         let id = description.id();
         let base = description.mmio_address();
@@ -420,6 +443,105 @@ pub(super) unsafe fn take(
                 continue;
             }
         };
+        let coverage = match Coverage::of(description) {
+            Ok(coverage) => coverage,
+            Err(error) => {
+                left(base, &error);
+                if !release(inspection) {
+                    outcome.uncertain = true;
+                    left(base, &"and it does not read off");
+                }
+                continue;
+            }
+        };
+        let covered: Vec<u16> = present
+            .iter()
+            .map(|function| function.rid)
+            .filter(|&rid| rid != id.device_id && coverage.covers(id.segment, rid))
+            .collect();
+        let reserved: Vec<(u16, Range<u64>)> = ivrs
+            .memory_definitions()
+            .flat_map(|region| {
+                named(region.scope(), id.segment, present)
+                    .into_iter()
+                    .map(move |rid| (rid, region.start()..region.end()))
+            })
+            .collect();
+        let held: Vec<u16> = reserved.iter().map(|(rid, _)| *rid).collect();
+        let decision = remapping::decide(&covered, &held, present, CLAIMED_DISPLAYS);
+        found.push(Found {
+            inspection,
+            segment: id.segment,
+            base,
+            own: address,
+            decision,
+            reserved,
+        });
+    }
+    // The units' own functions are not requesters any unit must cover.
+    let own: Vec<(u16, u16)> = ivrs
+        .units()
+        .map(|unit| (unit.id().segment, unit.id().device_id))
+        .collect();
+    let covering: Vec<initial::Requester> = requesters
+        .iter()
+        .filter(|requester| !own.contains(&(requester.segment, requester.rid)))
+        .copied()
+        .collect();
+    let candidate_of =
+        |segment: u16, decision: &core::result::Result<Vec<u16>, remapping::Leave>| Candidate {
+            segment,
+            decision: decision.clone(),
+            blockable,
+        };
+    let candidates: Vec<Candidate> = found
+        .iter()
+        .map(|unit| candidate_of(unit.segment, &unit.decision))
+        .collect();
+    // A unit refused before the policy is left like one the policy leaves.
+    // One in a state no proof covers keeps the machine from being treated
+    // as untranslated, so leaving every unit would then gain nothing.
+    let described = ivrs.units().count();
+    let decided = initial::modes(
+        &candidates,
+        &covering,
+        units_off && !outcome.uncertain,
+        found.len() < described,
+    );
+    // Start only the units the policy keeps. Those it leaves stay among the
+    // candidates, as the policy saw them; a unit that does not start drops
+    // out, and the policy decides again over the rest. That can only leave
+    // more units, never keep one it left, so no left unit is started then.
+    let mut kept: Vec<(Candidate, Option<Cold>)> = Vec::new();
+    for (found, mode) in found.into_iter().zip(decided) {
+        let Found {
+            inspection,
+            segment,
+            base,
+            own,
+            decision,
+            reserved,
+        } = found;
+        let candidate = candidate_of(segment, &decision);
+        if let Mode::Left(why) = mode {
+            match why {
+                Left::Native { segment, rid } => output::arguments(format_args!(
+                    "HOST IOMMU AMD-Vi unit {base:#x} left untranslated: {} attaches only natively, which a taken unit beside the drivers' window refuses\n",
+                    super::address(segment, rid)
+                )),
+                Left::Beside => left(
+                    base,
+                    &"another unit is left and every unit is off, so the machine runs untranslated",
+                ),
+                Left::Policy(why) => left(base, &why),
+            }
+            if !release(inspection) {
+                outcome.uncertain = true;
+                left(base, &"and it does not read off");
+            }
+            kept.push((candidate, None));
+            continue;
+        }
         let platform = Platform {
             tsc_hz,
             physical_bits,
@@ -432,75 +554,49 @@ pub(super) unsafe fn take(
         };
         // SAFETY: forwarded: the firmware's translation was turned off at
         // ExitBootServices and no driver has started.
-        let unit = match unsafe { Unit::cold(inspection, &ivrs, platform, limits) } {
-            Ok(unit) => unit,
+        match unsafe { Unit::cold(inspection, &ivrs, platform, limits) } {
+            Ok(unit) => kept.push((
+                candidate,
+                Some(Cold {
+                    unit,
+                    segment,
+                    base,
+                    own,
+                    decision,
+                    reserved,
+                }),
+            )),
             Err(error) => {
                 // A unit refused before any write, or turned off again and
                 // read off, is as off as the boot found it; any other
                 // failure leaves a state no proof covers.
                 outcome.uncertain |= !error.leaves_unit_off();
                 left(base, &error);
-                continue;
             }
-        };
-        let covered: Vec<u16> = present
-            .iter()
-            .map(|function| function.rid)
-            .filter(|&rid| rid != id.device_id && unit.covers(id.segment, rid))
-            .collect();
-        let reserved: Vec<(u16, Range<u64>)> = ivrs
-            .memory_definitions()
-            .flat_map(|region| {
-                named(region.scope(), id.segment, present)
-                    .into_iter()
-                    .map(move |rid| (rid, region.start()..region.end()))
-            })
-            .collect();
-        let held: Vec<u16> = reserved.iter().map(|(rid, _)| *rid).collect();
-        let decision = remapping::decide(&covered, &held, present, CLAIMED_DISPLAYS);
-        cold.push(Cold {
-            unit,
-            segment: id.segment,
-            base,
-            own: address,
-            decision,
-            reserved,
-        });
+        }
     }
-    let candidates: Vec<Candidate> = cold
+    let candidates: Vec<Candidate> = kept
         .iter()
-        .map(|unit| Candidate {
-            segment: unit.segment,
-            decision: unit.decision.clone(),
-            blockable,
-        })
+        .map(|(candidate, _)| candidate.clone())
         .collect();
-    // The units' own functions are not requesters any unit must cover.
-    let own: Vec<(u16, u16)> = ivrs
-        .units()
-        .map(|unit| (unit.id().segment, unit.id().device_id))
-        .collect();
-    let covering: Vec<initial::Requester> = requesters
-        .iter()
-        .filter(|requester| !own.contains(&(requester.segment, requester.rid)))
-        .copied()
-        .collect();
-    // A unit refused before the policy is left like one the policy leaves.
-    // One in a state no proof covers keeps the machine from being treated
-    // as untranslated, so leaving every unit would then gain nothing.
-    let refused = cold.len() < ivrs.units().count();
+    // A unit that did not start is refused like one refused before the
+    // policy.
+    let refused = kept.len() < described;
     let units_off = units_off && !outcome.uncertain;
     let modes = initial::modes(&candidates, &covering, units_off, refused);
     let fabric = modes.iter().all(|mode| *mode == Mode::Blocked);
-    for (cold, mode) in cold.into_iter().zip(modes) {
-        let Cold {
+    for ((_, cold), mode) in kept.into_iter().zip(modes) {
+        let Some(Cold {
             mut unit,
             segment,
             base,
             own,
             decision,
             reserved,
-        } = cold;
+        }) = cold
+        else {
+            continue;
+        };
         let requesters = match (decision, mode) {
             (Ok(requesters), Mode::Blocked | Mode::Window) => requesters,
             (_, Mode::Left(Left::Native { segment, rid })) => {

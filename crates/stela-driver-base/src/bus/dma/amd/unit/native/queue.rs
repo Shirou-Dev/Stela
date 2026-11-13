@@ -122,13 +122,21 @@ impl<P: ColdPlatform, C: UnitConfig> Engine<P, C> {
         self.write(COMMAND_TAIL, 0)?;
         self.write(EVENT_HEAD, 0)?;
         self.write(EVENT_TAIL, 0)?;
-        self.write(CONTROL, self.control)?;
+        let requested = self.control.get();
+        self.write(CONTROL, requested)?;
         let deadline = self.resources.platform.clock().deadline(self.wait_us);
         loop {
             self.resources.platform.relax();
-            if self.read(CONTROL)? != self.control {
+            // As Linux, which never reads it back, a unit may hard-wire the
+            // IVHD's optional flag bits (HtTunEn, PassPW, ResPassPW, Isoc)
+            // to zero. The enables and Coherent, on which the table and ring
+            // coherence rely, must hold, and no bit may appear that was not
+            // written. The value read is what the health check then holds.
+            let control = self.read(CONTROL)?;
+            if control & STARTED != STARTED || control & !requested != 0 {
                 return Err(Error::Fault);
             }
+            self.control.set(control);
             // An event bit beside the running bits stops nothing here; the
             // health check after the first command reads it.
             if self.read(STATUS)? & RUNNING == RUNNING {
@@ -145,7 +153,7 @@ impl<P: ColdPlatform, C: UnitConfig> Engine<P, C> {
         // An event is a fault even if its memory record has not reached RAM.
         // Preserve ring/status evidence rather than clear and retry. No PPR/GA/
         // completion IRQ or interrupt mode is enabled in this polled profile.
-        if self.read(CONTROL)? != self.control
+        if self.read(CONTROL)? != self.control.get()
             || self.read(STATUS)? != RUNNING
             || self.read(DEVICE_TABLE)? != self.table_base.get()
             || self.read(EVENT_HEAD)? != 0

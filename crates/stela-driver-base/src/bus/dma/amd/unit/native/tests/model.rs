@@ -20,7 +20,7 @@ use alloc::{
 };
 use std::{collections::BTreeMap, sync::Mutex};
 
-const ADDRESS: Address = Address {
+pub(super) const ADDRESS: Address = Address {
     segment: 0x1234,
     bus: 0,
     device: 0,
@@ -33,7 +33,7 @@ const SPACE: AddressSpace = AddressSpace {
     virtual_bits: 48,
 };
 const PHYSICAL: u64 = 0x000f_ffff_ffff_f000;
-const FEATURES: u64 = (1 << 6) | (1 << 8);
+pub(super) const FEATURES: u64 = (1 << 6) | (1 << 8);
 
 struct Registers {
     cpu: NonNull<u8>,
@@ -127,6 +127,10 @@ pub(super) enum Mode {
     HardwareError,
     AlterBase,
     StoreBeforeHead,
+    /// The IVHD's optional control flag bits read as zero.
+    HardwiredFlags,
+    /// A control bit no one wrote reads as set.
+    ForeignControl,
 }
 struct State {
     ram: BTreeMap<u64, (usize, usize)>,
@@ -399,7 +403,13 @@ impl DevicePeer {
             state.guards > 0,
             "MMIO/command progress requires original guard"
         );
-        let control = self.registers.read(CONTROL);
+        let mut control = self.registers.read(CONTROL);
+        match state.mode {
+            Mode::HardwiredFlags => control &= !(1 << 1 | 1 << 8 | 1 << 9 | 1 << 11),
+            Mode::ForeignControl if control != 0 => control |= 1 << 5,
+            _ => {}
+        }
+        self.registers.write(CONTROL, control);
         if control == 0 {
             self.registers.write(STATUS, 0);
             return;
@@ -685,6 +695,16 @@ pub(super) fn inputs_hardware(
     features: u64,
     miscellaneous: u32,
 ) -> (FunctionInspection, Platform, Peer, Vec<u8>) {
+    inputs_flagged(entries, info, features, miscellaneous, 0)
+}
+/// As [`inputs_hardware`], with the IVHD's `flags` byte.
+pub(super) fn inputs_flagged(
+    entries: &[u8],
+    info: u32,
+    features: u64,
+    miscellaneous: u32,
+    flags: u8,
+) -> (FunctionInspection, Platform, Peer, Vec<u8>) {
     let layout = Layout::from_size_align(16384, 4096).unwrap();
     // SAFETY: isolated, page-aligned zeroed model register RAM.
     let cpu = NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap();
@@ -738,6 +758,7 @@ pub(super) fn inputs_hardware(
     bytes[8] = 2;
     bytes[36..40].copy_from_slice(&info.to_le_bytes());
     bytes[48] = 0x11;
+    bytes[49] = flags;
     bytes[50..52].copy_from_slice(&(40u16 + entries.len() as u16).to_le_bytes());
     bytes[52..54].copy_from_slice(&2u16.to_le_bytes());
     bytes[54..56].copy_from_slice(&0x40u16.to_le_bytes());

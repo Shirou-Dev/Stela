@@ -395,6 +395,100 @@ fn a_retired_unit_gives_its_mappings_back() {
     assert!(unit.into_inputs().is_none());
 }
 
+/// A unit may hard-wire the IVHD's optional control flags to zero, as
+/// Linux, which never reads the register back, allows; the value read is
+/// then what the health check holds. A bit no one wrote is a fault.
+#[test]
+fn control_reads_back_what_the_unit_implements() {
+    let ordinary = 1u32 | (48 << 8) | (48 << 15);
+    let (inspection, platform, peer, bytes) = inputs_flagged(
+        &[1, 0, 0, 0],
+        ordinary,
+        FEATURES,
+        (48 << 8) | (48 << 15),
+        0x0f,
+    );
+    peer.mode(Mode::HardwiredFlags);
+    let ivrs = Ivrs::parse(&bytes, 8).unwrap();
+    // SAFETY: as in `cold_preflight_refusals`: an isolated register and RAM
+    // peer with its matching IVRS, and nothing running beside it.
+    let mut unit = unsafe { Unit::cold(inspection, &ivrs, platform, limits()) }.unwrap();
+    assert_eq!(peer.register(CONTROL), STARTED);
+    unit.check_health().unwrap();
+    unit.drain_posted_writes().unwrap();
+    // SAFETY: the peer has no requester, producer or other register user.
+    unsafe { unit.retire() }.unwrap();
+
+    let (inspection, platform, peer, bytes) = inputs();
+    peer.mode(Mode::ForeignControl);
+    let ivrs = Ivrs::parse(&bytes, 8).unwrap();
+    // SAFETY: as above.
+    let unit = unsafe { Unit::cold(inspection, &ivrs, platform, limits()) };
+    assert!(matches!(
+        unit,
+        Err(Error::DidNotStart {
+            timeout: false,
+            stopped: true
+        })
+    ));
+}
+
+/// The IVRS alone gives a unit's coverage, before anything starts it;
+/// reserved entry bytes are ignored as Linux ignores them.
+#[test]
+fn coverage_from_the_ivrs_alone() {
+    let entries = [
+        3, 0x10, 0, 0, // Range start.
+        4, 0x17, 0, 0x55, // Range end, with flags it does not carry.
+    ];
+    let (_inspection, _platform, peer, bytes) = inputs_with_entries(&entries);
+    let before = peer.registers();
+    let ivrs = Ivrs::parse(&bytes, 8).unwrap();
+    let coverage = Coverage::of(ivrs.units().next().unwrap()).unwrap();
+    assert!((0x10..=0x17).all(|rid| coverage.covers(ADDRESS.segment, rid)));
+    assert!(!coverage.covers(ADDRESS.segment, 0x18));
+    assert!(!coverage.covers(ADDRESS.segment + 1, 0x10));
+    assert_eq!(
+        peer.registers(),
+        before,
+        "reading the coverage touched no register"
+    );
+    drop(unit_with_entries(&entries));
+
+    let (_, _, _, bytes) = inputs_with_entries(&[1, 0x34, 0x12, 0]);
+    let ivrs = Ivrs::parse(&bytes, 8).unwrap();
+    let coverage = Coverage::of(ivrs.units().next().unwrap()).unwrap();
+    assert!(coverage.covers(ADDRESS.segment, 0xffff));
+
+    // A unit that routes nothing is refused.
+    let (_, _, _, bytes) = inputs_with_entries(&[0, 0, 0, 0]);
+    let ivrs = Ivrs::parse(&bytes, 8).unwrap();
+    assert!(matches!(
+        Coverage::of(ivrs.units().next().unwrap()),
+        Err(Error::Firmware)
+    ));
+}
+
+/// A unit left as found is only read: off when no enable is set and no
+/// ring runs, whatever else the firmware left in it.
+#[test]
+fn a_unit_left_as_found_is_read_off_or_on() {
+    for (control, status, off) in [
+        (0, 0, true),
+        (COHERENT | 1 << 8, 1 << 1, true),
+        (IOMMU_ENABLE, 0, false),
+        (COMMAND_ENABLE, 0, false),
+        (0, EVENT_RUNNING, false),
+    ] {
+        let (inspection, _platform, peer, _) = inputs();
+        peer.set(CONTROL, control);
+        peer.set(STATUS, status);
+        let before = peer.registers();
+        assert_eq!(reads_off(&inspection), Ok(off));
+        assert_eq!(peer.registers(), before);
+    }
+}
+
 fn unit_with_entries(entries: &[u8]) -> (Unit<Platform>, Peer) {
     let (inspection, platform, peer, bytes) = inputs_with_entries(entries);
     let ivrs = Ivrs::parse(&bytes, 8).unwrap();
@@ -782,15 +876,11 @@ fn failed_dte_attach_keeps_requester() {
 #[test]
 fn ivinfo_profile_admission() {
     let ordinary = 1u32 | (48 << 8) | (48 << 15);
-    for (info, features) in [
-        (ordinary | (1 << 23), 1 << 6), // Reserved IVinfo upper byte.
-        (1 | (31 << 8) | (48 << 15), 1 << 6),
-        (1 | (48 << 8) | (29 << 15), 1 << 6),
-        (ordinary, 0),                    // No invalidate-all support.
-        (ordinary, (1 << 6) | (3 << 10)), // Reserved HATS.
-        (ordinary, (1 << 6) | (1 << 63)), // SNP changes completion ownership.
+    for features in [
+        0,                    // No invalidate-all support.
+        (1 << 6) | (3 << 10), // HATS 3: host translation is off.
     ] {
-        let (inspection, platform, peer, bytes) = inputs_profile(&[1, 0, 0, 0], info, features);
+        let (inspection, platform, peer, bytes) = inputs_profile(&[1, 0, 0, 0], ordinary, features);
         let ivrs = Ivrs::parse(&bytes, 8).unwrap();
         assert!(matches!(
             // SAFETY: inputs constructs this isolated register/RAM peer and matching IVRS
@@ -801,40 +891,55 @@ fn ivinfo_profile_admission() {
         assert_eq!(peer.register(DEVICE_TABLE), 0);
         assert_eq!(peer.live_ram(), 0);
     }
-    // GVAsize occupies [7:5], not reserved upper bits. It grants no guest
-    // translation in this host-only subset and must not shift the PA/VA fields.
-    let (inspection, platform, peer, bytes) =
-        inputs_profile(&[1, 0, 0, 0], ordinary | (2 << 5), 1 << 6);
-    let ivrs = Ivrs::parse(&bytes, 8).unwrap();
-    // SAFETY: inputs constructs this isolated register/RAM peer and matching IVRS
-    // inspection. No firmware or requester runs concurrently; the peer keeps every backing allocation.
-    let mut unit = unsafe { Unit::cold(inspection, &ivrs, platform, limits()) }.unwrap();
-    // SAFETY: The peer has no external producers or concurrent register access.
-    // Unit quiescence/ownership checks run while its RAM remains held; failures preserve those pins.
-    unsafe { unit.retire() }.unwrap();
-    drop(unit);
-    assert_eq!(peer.live_ram(), 0);
+    // What Linux masks comes up: reserved IVinfo bits, a PA or VA size
+    // that names no width, GVAsize, and SNPSup, which is only a
+    // capability while nothing sets SYSCFG.SNPEn.
+    for (info, features) in [
+        (ordinary | (1 << 23), 1 << 6),
+        (1 | (31 << 8) | (48 << 15), 1 << 6),
+        (1 | (48 << 8) | (29 << 15), 1 << 6),
+        (ordinary | (2 << 5), 1 << 6),
+        (ordinary, (1 << 6) | (1 << 63)),
+    ] {
+        let (inspection, platform, peer, bytes) = inputs_profile(&[1, 0, 0, 0], info, features);
+        let ivrs = Ivrs::parse(&bytes, 8).unwrap();
+        // SAFETY: inputs constructs this isolated register/RAM peer and matching IVRS
+        // inspection. No firmware or requester runs concurrently; the peer keeps every backing allocation.
+        let unit = unsafe { Unit::cold(inspection, &ivrs, platform, limits()) };
+        let mut unit = unit.unwrap_or_else(|error| panic!("{info:#x} {features:#x}: {error:?}"));
+        assert_eq!(unit.physical_bits, 48);
+        // SAFETY: The peer has no external producers or concurrent register access.
+        // Unit quiescence/ownership checks run while its RAM remains held; failures preserve those pins.
+        unsafe { unit.retire() }.unwrap();
+        drop(unit);
+        assert_eq!(peer.live_ram(), 0);
+    }
 }
 
 #[test]
 fn hardware_width_bounds_payload() {
     let info = 1u32 | (48 << 8) | (48 << 15);
+    // A miscellaneous register with no PA width, a VA size Linux ignores,
+    // or its MSI and reserved upper bits set comes up at the IVRS width.
     for miscellaneous in [
         0,
         (31 << 8) | (48 << 15),
         (48 << 8) | (31 << 15),
         (48 << 8) | (48 << 15) | (1 << 23),
+        (48 << 8) | (48 << 15) | (0x1f << 27),
     ] {
         let (inspection, platform, peer, bytes) =
             inputs_hardware(&[1, 0, 0, 0], info, 1 << 6, miscellaneous);
         let ivrs = Ivrs::parse(&bytes, 8).unwrap();
-        assert!(matches!(
-            // SAFETY: inputs constructs this isolated register/RAM peer and matching IVRS
-            // inspection. No firmware or requester runs concurrently; the peer keeps every backing allocation.
-            unsafe { Unit::cold(inspection, &ivrs, platform, limits()) },
-            Err(Error::Profile)
-        ));
-        assert_eq!(peer.register(DEVICE_TABLE), 0);
+        // SAFETY: inputs constructs this isolated register/RAM peer and matching IVRS
+        // inspection. No firmware or requester runs concurrently; the peer keeps every backing allocation.
+        let unit = unsafe { Unit::cold(inspection, &ivrs, platform, limits()) };
+        let mut unit = unit.unwrap_or_else(|error| panic!("{miscellaneous:#x}: {error:?}"));
+        assert_eq!(unit.physical_bits, 48);
+        // SAFETY: The peer has no external producers or concurrent register access.
+        // Unit quiescence/ownership checks run while its RAM remains held; failures preserve those pins.
+        unsafe { unit.retire() }.unwrap();
+        drop(unit);
         assert_eq!(peer.live_ram(), 0);
     }
     let (inspection, platform, peer, bytes) =

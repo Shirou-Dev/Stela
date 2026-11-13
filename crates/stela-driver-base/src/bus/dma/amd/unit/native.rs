@@ -29,7 +29,7 @@ use crate::{
         amd::{
             device::{DeviceTable, DeviceTableError, DeviceTableHardware},
             format::{Command, DomainId, PhysicalAddress, TableLevel},
-            ivrs::Ivrs,
+            ivrs::{Ivhd, Ivrs},
             memory::TableVisibility,
             tables::{PageTables, TableHardware, TranslationError},
         },
@@ -69,6 +69,8 @@ const COMMAND_ENABLE: u64 = 1 << 12;
 const EVENT_RUNNING: u64 = 1 << 3;
 const COMMAND_RUNNING: u64 = 1 << 4;
 const RUNNING: u64 = EVENT_RUNNING | COMMAND_RUNNING;
+/// The control bits a started unit must read back.
+const STARTED: u64 = IOMMU_ENABLE | EVENT_ENABLE | COMMAND_ENABLE | COHERENT;
 const RING_BYTES: usize = 8192;
 const RING_LENGTH: u64 = 9 << 56;
 const COMMAND_BYTES: usize = 16;
@@ -214,7 +216,8 @@ struct Engine<P, C> {
     poisoned: Cell<bool>,
     exposed: Cell<bool>,
     retired: Cell<bool>,
-    control: u64,
+    /// The control register as the unit read it back once started.
+    control: Cell<u64>,
     hardware_errors: bool,
     wait_us: u64,
     table_base: Cell<u64>,
@@ -374,6 +377,37 @@ impl DirectDelivery {
     }
 }
 
+/// The requesters one IVHD routes to its unit, read from the IVRS alone,
+/// so that a policy can decide on the unit before anything starts it.
+pub struct Coverage {
+    segment: u16,
+    routes: Vec<bool>,
+}
+
+impl Coverage {
+    /// `unit`'s device entries, refused as [`Unit::cold`] refuses them.
+    pub fn of(unit: Ivhd<'_>) -> Result<Self, Error> {
+        Ok(Self {
+            segment: unit.id().segment,
+            routes: firmware::routes(unit)?.coverage,
+        })
+    }
+
+    /// Whether the IVHD routes requester `rid` on `segment` to the unit.
+    pub fn covers(&self, segment: u16, rid: u16) -> bool {
+        segment == self.segment && self.routes[usize::from(rid)]
+    }
+}
+
+/// Whether the unit `inspection` holds reads off: no translation, event
+/// or command enable set, and neither ring running. Only reads; for a unit
+/// that is left as found rather than started.
+pub fn reads_off<C: UnitConfig>(inspection: &FunctionInspection<C>) -> Result<bool, Error> {
+    let control = inspection.native_read(CONTROL).map_err(Error::Register)?;
+    let status = inspection.native_read(STATUS).map_err(Error::Register)?;
+    Ok(control & (IOMMU_ENABLE | EVENT_ENABLE | COMMAND_ENABLE) == 0 && status & RUNNING == 0)
+}
+
 /// Original cold unit plus complete blocked DTE table and bounded RID policy.
 /// Requesters and their page trees keep this exact engine independently.
 pub struct Unit<P: ColdPlatform, C: UnitConfig = OwnedConfig> {
@@ -435,7 +469,7 @@ impl<P: ColdPlatform, C: UnitConfig> Unit<P, C> {
             poisoned: Cell::new(false),
             exposed: Cell::new(false),
             retired: Cell::new(false),
-            control: admitted.control,
+            control: Cell::new(admitted.control),
             hardware_errors: admitted.hardware_errors,
             wait_us: limits.wait_us,
             table_base: Cell::new(0),
@@ -522,7 +556,7 @@ impl<P: ColdPlatform, C: UnitConfig> Unit<P, C> {
             valid: self.direct_delivery.clone(),
             base: base.as_ptr() as usize,
             table: self.engine.table_base.get(),
-            control: self.engine.control,
+            control: self.engine.control.get(),
         })
     }
 
