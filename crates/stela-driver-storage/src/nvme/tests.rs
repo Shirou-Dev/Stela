@@ -303,6 +303,22 @@ fn a_fatal_controller_is_reset_first_and_poisons_when_it_stays_fatal() {
     assert_eq!(c.registers.read32(DOORBELLS + 8).unwrap(), 0);
 }
 
+/// INTMS masks pin and MSI interrupts. A controller configured for MSI-X
+/// is never written there, at attach or at a reset.
+#[test]
+fn the_interrupt_mask_register_is_left_alone_under_msix() {
+    for (signalled, mask) in [(false, u32::MAX), (true, 0)] {
+        let fixture = Fixture::new();
+        let mut c = fixture.disk.controller.borrow_mut();
+        c.signalled = signalled;
+        c.configure_admin().unwrap();
+        assert_eq!(c.registers.read32(INTERRUPT_MASK_SET).unwrap(), mask);
+        assert_eq!(c.registers.read32(ADMIN_ATTRIBUTES).unwrap(), 15 << 16 | 15);
+        assert_ne!(c.registers.read64(ADMIN_SUBMISSION).unwrap(), 0);
+        assert_ne!(c.registers.read64(ADMIN_COMPLETION).unwrap(), 0);
+    }
+}
+
 fn namespace(blocks: u64, flbas: u8, formats: &[(usize, u32)], attributes: u8) -> Vec<u8> {
     let mut page = vec![0u8; PAGE];
     page[NAMESPACE_SIZE].copy_from_slice(&blocks.to_le_bytes());

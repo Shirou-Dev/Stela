@@ -6,8 +6,10 @@
 use super::*;
 
 impl Controller {
-    /// Point the controller at the admin queue, empty, with every interrupt
-    /// masked.
+    /// Point the controller at the admin queue, empty, with every pin or
+    /// MSI interrupt masked. Under MSI-X the mask registers are left alone:
+    /// NVMe leaves a host access to INTMS undefined then, and Linux never
+    /// writes it; the MSI-X table masks instead.
     pub(super) fn configure_admin(&mut self) -> Result<(), BlockError> {
         self.admin.restart();
         self.admin.completions.give()?;
@@ -22,6 +24,9 @@ impl Controller {
         self.admin.submissions.publish();
         self.registers
             .write64(ADMIN_COMPLETION, self.admin.completions.address()?)?;
+        if self.signalled {
+            return Ok(());
+        }
         self.registers.write32(INTERRUPT_MASK_SET, u32::MAX)
     }
 
