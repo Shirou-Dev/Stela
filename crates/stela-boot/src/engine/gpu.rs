@@ -118,6 +118,8 @@ const DMA_LIMIT: u64 = (1 << 47) - 1;
 const START_SECONDS: u64 = 60;
 /// The longest idle wait while they do, which the timeout above is checked at.
 const WAIT_MICROS: u64 = 10_000;
+/// How often a long wait in the start says where it is ([`wait_for_child`]).
+const WAIT_REPORT_SECONDS: u64 = 2;
 /// The longest one pump runs Linux between the boot PE's slices. What is
 /// still runnable stays pending for the next, so a busy driver shares the
 /// boot CPU with the guest and the host's devices instead of holding it.
@@ -1801,6 +1803,7 @@ fn mount_and_start(
         threads,
         time,
         deadline,
+        "Linux's first tasks",
         || matches!(srcu.status(), stela_linux::srcu::Status::Pending(status) if status.joined),
     )?;
     // SAFETY: the taskless dispatcher observed the original joined job.
@@ -1817,7 +1820,9 @@ fn mount_and_start(
     // SAFETY: the ready original task broker keeps the callback and all
     // original owners until its genuine managed child has joined.
     let pending = unsafe { threads.submit(job) }.map_err(|refusal| Error::Submit(refusal.error))?;
-    wait_for_child(runtime, threads, time, deadline, || pending.status().joined)?;
+    wait_for_child(runtime, threads, time, deadline, "the GPU's probe", || {
+        pending.status().joined
+    })?;
     // SAFETY: physical return on the same dispatcher with the joined status.
     let joined =
         unsafe { pending.try_join() }.map_err(|_| environment_error(WorkError::Pending))?;
@@ -1833,23 +1838,49 @@ fn mount_and_start(
     Ok((owner, threads, job))
 }
 
+/// Wait for `stage` of the start, which Linux's tasks run, until `finished`
+/// or `deadline` on `time`. A long wait says every
+/// [`WAIT_REPORT_SECONDS`] how long it has waited by the counter and by
+/// Linux's clock, and how many service steps it took, and stores the USB's
+/// log: a start that never returns then shows whether this loop still
+/// runs, whether Linux's clock moves, and which stage it waits for. The
+/// counter ends the wait after [`START_SECONDS`] even when the clock
+/// stands still.
 fn wait_for_child(
     runtime: Pin<&stela_drivers::platform::work::Runtime<SLOTS>>,
     threads: &LinuxThreads,
     time: &dyn Clock,
     deadline: u64,
+    stage: &str,
     finished: impl Fn() -> bool,
 ) -> Result<(), Error> {
+    let began = host::rdtsc();
+    let began_ns = time.now_ns().map_err(environment_error)?;
+    let mut steps = 0u64;
+    let mut reports = 0u64;
     loop {
         // SAFETY: runtime is on its dispatcher after real physical return.
         unsafe { threads.dispatcher_step() }.map_err(Error::Threads)?;
         if finished() {
             return Ok(());
         }
-        if time.now_ns().map_err(environment_error)? >= deadline {
+        let now = time.now_ns().map_err(environment_error)?;
+        let waited_ms = output::millis_since(began);
+        // The counter bounds the wait too, when Linux's clock stands still.
+        if now >= deadline || waited_ms >= START_SECONDS * 1000 {
             return Err(Error::Timeout);
         }
+        if waited_ms / 1000 / WAIT_REPORT_SECONDS > reports {
+            reports = waited_ms / 1000 / WAIT_REPORT_SECONDS;
+            output::arguments(format_args!(
+                "GPU START waiting for {stage}: {waited_ms} ms by the counter, {} ms by \
+                 Linux's clock, {steps} steps\n",
+                now.saturating_sub(began_ns) / 1_000_000,
+            ));
+            super::storage::store_usb_log_in_gpu_start();
+        }
         runtime.step_or_idle().map_err(environment_error)?;
+        steps += 1;
     }
 }
 

@@ -229,6 +229,21 @@ fn between_drivers<T>(between: impl FnOnce() -> T) -> T {
     result
 }
 
+/// Whether the USB's log is the one the device start resumed ([`HeldLog`]),
+/// which the holder of the host drivers' lock drives itself.
+static HELD_USB_LOG: AtomicBool = AtomicBool::new(false);
+
+/// Store the USB's log from a wait in the GPU's start, which holds the host
+/// drivers' lock outside every storage driver's call, so a start that never
+/// returns leaves its lines on the stick. Only the log the device start
+/// resumed is driven by the lock's holder; any other would wait for the
+/// lock, and its lines wait for the next store after the start.
+pub(super) fn store_usb_log_in_gpu_start() {
+    if HELD_USB_LOG.load(Ordering::Acquire) && host_drivers_held_here() {
+        between_drivers(output::store_usb_log);
+    }
+}
+
 /// Counter ticks cores waited for [`HOST_DRIVERS`] since the last report,
 /// and the longest wait.
 static HOST_DRIVERS_WAITED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -932,6 +947,7 @@ impl stela_drivers::probe::Observer for Observer {
             failures: 0,
         });
         self.resumed = between_drivers(|| crate::log_file::resume_quietly(Box::new(log)));
+        HELD_USB_LOG.store(self.resumed, Ordering::Release);
     }
     fn starting(
         &mut self,
