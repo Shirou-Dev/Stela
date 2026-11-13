@@ -845,10 +845,14 @@ fn load(
         asm!("cli", options(nomem, nostack));
         crate::paging::report_faults();
     }
+    // The log is closed from here to the engine's start, so a freeze in
+    // this step shows only on the screen: each part names itself there.
+    crate::status::progress("the firmware has left; its DMA remapping");
     // SAFETY: the firmware's identity map is still loaded, the APs idle in
     // firmware code, and no Stela driver or memory reuse has started.
     let inactive_firmware_units =
         unsafe { crate::native_dma::release_firmware_units(remapping, tsc_hz) };
+    crate::status::progress("the final memory map");
     let native_mmio_capture = match native_mmio {
         Ok(prepared) => match prepared.finish(&mut exit) {
             Ok(sealed) => crate::native_mmio::CaptureHandoff::new(sealed),
@@ -867,6 +871,7 @@ fn load(
     // runs on this processor, and every later APIC handle is made from the
     // base returned here (the handoff's) or read afresh. The APs take the
     // same mode as they enter Stela (`native_smp::executor`).
+    crate::status::progress("the local APIC");
     // SAFETY: CPL0, interrupts masked, no APIC handle of this processor made.
     let apic_base = unsafe { crate::apic::prefer_x2apic() };
     let sender = crate::apic::Apic::new(apic_base, apic_base & crate::apic::BASE_ADDRESS);
@@ -878,6 +883,7 @@ fn load(
             "xAPIC (no x2APIC offered)"
         }
     ));
+    crate::status::progress("stopping the firmware's processors");
     // SAFETY: interrupts are masked, the BSP alone sends ICR commands, and `capture` lists the
     // enabled firmware APs.
     let deliveries = match unsafe {

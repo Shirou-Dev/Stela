@@ -2347,6 +2347,10 @@ fn start_platform(
     // host it cannot check is reported, and those services refuse.
     // Its time is logged: it walks every mapping the firmware left, which
     // no step's time shows.
+    // A freeze here was a screen that stopped after the step before with
+    // nothing named (issue 36), so this is a step and names its parts.
+    crate::status::begin("Taking over the PC's devices from the firmware");
+    crate::status::progress("memory-mapped registers");
     let activating = host::rdtsc();
     // SAFETY: this boot's capture, on the installed boot processor before
     // the other host processors start.
@@ -2391,6 +2395,7 @@ fn start_platform(
             Err(error) => output::arguments(format_args!("NATIVE PCI HPET unavailable: {error}\n")),
         }
     }
+    crate::status::progress("interrupt vectors");
     match host_owner
         .root_identity()
         .map_err(|_| stela_drivers::bus::irq::IrqError::WrongCpu)
@@ -2410,6 +2415,7 @@ fn start_platform(
     }
     // Retire the configuration census and park the contained function owners
     // before either SCI publication or remapper takeover.
+    crate::status::progress("PCI functions");
     let contained_pci = native_mmio.and_then(|mmio| {
         // SAFETY: firmware is stopped, APs have not started, and native
         // probing has not published any PCI/controller owner yet.
@@ -2464,6 +2470,7 @@ fn start_platform(
             mmio.refuse_framebuffer(refusal);
         }
     }
+    crate::status::progress("DMA remapping and interrupt controllers");
     // The remapping units, taken before any host driver starts DMA.
     let mut remappers = match (&contained_pci, handoff.storage.handoff()) {
         // SAFETY: no host driver has started; the loader root maps the ACPI
@@ -2510,6 +2517,7 @@ fn start_platform(
         }
         _ => None,
     };
+    crate::status::progress("clocks");
     let clock = if options.boots_macos() {
         // SAFETY: this BSP owns the existing timer/IDT before any driver,
         // and the HPET only after its whole-controller handoff above.
@@ -2540,6 +2548,7 @@ fn start_platform(
             Err(error.reason())
         }
     };
+    crate::status::progress("ACPI tables");
     let host_acpi = aml::HostAcpi::start(
         handoff.rsdp,
         handoff.root,
@@ -2556,6 +2565,7 @@ fn start_platform(
     crate::native_idle::install(
         host_acpi.and_then(|acpi| acpi.processor_idle(crate::native_idle::capabilities())),
     );
+    crate::status::done("");
     Platform {
         acpi: host_acpi,
         mmio: native_mmio,
