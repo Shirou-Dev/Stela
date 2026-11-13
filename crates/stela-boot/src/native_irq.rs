@@ -43,7 +43,7 @@ fn check_irq_cpu() -> Result<(), IrqError> {
 
 /// # Safety
 /// The slice retains every original controller under exclusive ownership.
-/// The caller validated its complete MADT inventory, excludes IOAPIC NMIs
+/// The caller validated its complete MADT inventory, never routes MADT NMI sources
 /// and keeps old destinations/contributors through independent retirement.
 pub(crate) unsafe fn plan_firmware_lines<R: ioapic::Registers>(
     units: &[(madt::Unit, Arc<ioapic::Unit<R, NativePlatform>>)],
@@ -53,7 +53,7 @@ pub(crate) unsafe fn plan_firmware_lines<R: ioapic::Registers>(
         .try_reserve_exact(units.len())
         .map_err(|_| IrqError::Exhausted)?;
     for (_, unit) in units {
-        // SAFETY: complete original controller handoff, no IOAPIC NMI,
+        // SAFETY: complete original controller handoff, NMI sources unrouted,
         // and direct delivery, as required by the caller.
         routes.push(unsafe { unit.firmware_routes() }?);
     }

@@ -161,13 +161,15 @@ impl Routing {
                     }
                     routing.overrides.push(value);
                 }
+                // Linux's `acpi_parse_nmi_src` reads nothing from an NMI
+                // source; its pin stays masked like any unclaimed one. Here
+                // the GSI is kept only so that no line is ever routed to it,
+                // so its flags and repeats change nothing.
                 (3, 8) => {
-                    electrical(word(entry, 2), false)?;
                     let gsi = dword(entry, 4);
-                    if routing.nmis.contains(&gsi) {
-                        return Err(RouteError::Duplicate);
+                    if !routing.nmis.contains(&gsi) {
+                        routing.nmis.push(gsi);
                     }
-                    routing.nmis.push(gsi);
                 }
                 // Validate lengths, but never apply or elect processors here.
                 (0, 8) | (4, 6) | (9, 16) | (10, 12) => {}
@@ -248,8 +250,9 @@ impl Routing {
         self.legacy_pic
     }
 
-    pub fn has_ioapic_nmis(&self) -> bool {
-        !self.nmis.is_empty()
+    /// The GSIs MADT NMI sources name, each once. No line is routed to them.
+    pub fn ioapic_nmis(&self) -> &[u32] {
+        &self.nmis
     }
 
     /// Bind IOAPIC version-reported pin counts, never a guessed 24-pin
@@ -433,12 +436,32 @@ mod tests {
         ));
         let r = Routing::parse(&madt(&[3, 8, 15, 0, 9, 0, 0, 0]), 48).unwrap();
         assert_eq!(r.sci(&fadt(9)), Err(RouteError::NmiConflict));
+        assert_eq!(r.ioapic_nmis(), [9]);
+        let line = LineRoute {
+            gsi: 9,
+            polarity: Polarity::Low,
+            trigger: Trigger::Level,
+        };
+        assert_eq!(
+            r.owner(line, &[(r.units[0], 24)]),
+            Err(RouteError::NmiConflict)
+        );
+        assert_eq!(r.isa(4).unwrap().gsi, 4);
         let mut bad = madt(&[]);
         bad[9] ^= 1;
         assert!(matches!(
             Routing::parse(&bad, 48),
             Err(RouteError::InvalidTable)
         ));
+    }
+    #[test]
+    fn nmi_sources_with_odd_flags_or_repeats_only_withhold_their_pin() {
+        // Reserved flag bits, a reserved polarity, and the same GSI twice.
+        let extra = [3, 8, 0xf2, 0xff, 9, 0, 0, 0, 3, 8, 0, 0, 9, 0, 0, 0];
+        let r = Routing::parse(&madt(&extra), 48).unwrap();
+        assert_eq!(r.ioapic_nmis(), [9]);
+        assert_eq!(r.sci(&fadt(9)), Err(RouteError::NmiConflict));
+        assert_eq!(r.isa(4).unwrap().gsi, 4);
     }
     #[test]
     fn ownership_uses_live_pin_counts_and_refuses_missing_duplicate_or_overlapping_units() {

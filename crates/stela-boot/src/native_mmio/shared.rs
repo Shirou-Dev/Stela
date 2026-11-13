@@ -956,7 +956,10 @@ impl Source {
             }
         }
         let routing = self.routing()?;
-        if modes.is_empty() || routing.units.is_empty() || routing.has_ioapic_nmis() {
+        // An NMI source pin is contained like any other: masked when
+        // firmware left it masked, refused when left delivering NMIs
+        // (`maskable_firmware_mode`), and never routed (`Routing::owner`).
+        if modes.is_empty() || routing.units.is_empty() {
             return Err(Error::Unavailable);
         }
         let domain: Arc<dyn NotificationDomain> = Arc::new(MountedNotification {
@@ -1006,7 +1009,7 @@ impl Source {
             units.push((descriptor, unit));
         }
         routing.validate_units(&spans).map_err(failed)?;
-        // SAFETY: exact complete inventory with no IOAPIC NMI, original
+        // SAFETY: exact complete inventory with NMI source pins unrouted, original
         // mode pins, and the caller's exclusive controller handoff.
         let routes = unsafe { crate::native_irq::plan_firmware_lines(&units) }.map_err(failed)?;
         let count = units.len();

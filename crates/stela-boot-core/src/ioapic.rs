@@ -372,7 +372,7 @@ impl<R: Registers, P: Platform> Unit<R, P> {
     /// # Safety
     /// This is the exclusive initial controller handoff, with no driver
     /// claims or competing CPU, firmware or SMM route writers. The caller has
-    /// excluded MADT IOAPIC NMI sources and verified the legacy RTE format.
+    /// kept MADT NMI sources unrouted and verified the legacy RTE format.
     pub unsafe fn firmware_routes(self: &Arc<Self>) -> Result<FirmwareRoutes<R, P>, IrqError> {
         self.platform.check_process()?;
         self.domain.check().map_err(IrqError::Delivery)?;
