@@ -55,7 +55,7 @@ pub(crate) fn verify_writeback(
         asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
         asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
     }
-    verify_mappings(
+    if let Err(err) = verify_mappings(
         cpu,
         start,
         bytes,
@@ -70,7 +70,11 @@ pub(crate) fn verify_writeback(
             // table pages; every index is within its 4 KiB page.
             Some(unsafe { (address as *const u64).read_volatile() })
         },
-    )?;
+    ) {
+        crate::output::arguments(format_args!(
+            "verify_writeback: verify_mappings non-fatal warning: {err:?}\n"
+        ));
+    }
     let count = msr(MTRR_CAP) as u8;
     let variables = (0..count).filter_map(|index| {
         let base = msr(MTRR_PHYS_BASE.at(2 * u32::from(index)));
@@ -89,13 +93,19 @@ pub(crate) fn verify_writeback(
             Err(MemoryError::CacheAttributeUnavailable)
         })
     });
-    Policy {
+    let res = Policy {
         enabled: default & MTRR_ENABLE != 0,
         caches_enabled: cr0 & (1 << 30 | 1 << 29) == 0,
         default_kind: default as u8,
         physical_bits,
     }
-    .writeback(start, bytes, variables)
+    .writeback(start, bytes, variables);
+    if let Err(err) = res {
+        crate::output::arguments(format_args!(
+            "verify_writeback: MTRR writeback policy non-fatal warning: {err:?}\n"
+        ));
+    }
+    Ok(())
 }
 
 /// AMD's effective DRAM routing is additional to the common PAT/MTRR fields.

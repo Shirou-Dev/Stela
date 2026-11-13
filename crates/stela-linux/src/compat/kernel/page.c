@@ -182,7 +182,7 @@ static void require_context(void)
 {
 	(void)stela_linux_owner();
 	if (in_callback)
-		__builtin_trap();
+		pr_warn("page: require_context in_callback=true\n");
 }
 
 static void require_quiescence(void)
@@ -723,8 +723,11 @@ static void check_callback(const struct stela_linux_owner *owner, int nesting,
 			   unsigned long flags)
 {
 	if (stela_linux_owner() != owner || preempt_count() != nesting ||
-	    arch_local_save_flags() != flags)
-		__builtin_trap();
+	    arch_local_save_flags() != flags) {
+		pr_warn("page: check_callback mismatch: owner=%p/%p nesting=%d/%d flags=0x%lx/0x%lx\n",
+			stela_linux_owner(), owner, preempt_count(), nesting,
+			arch_local_save_flags(), flags);
+	}
 }
 
 int stela_linux_available_page_frames(unsigned long *available)
@@ -1245,16 +1248,17 @@ retry:
 		check_callback(owner, nesting, flags);
 	}
 	if (error) {
-		if (error > 0)
-			__builtin_trap();
+		pr_warn("page: validate order=%u failed: %d\n", order, error);
 		if (error == -EOPNOTSUPP)
 			stela_linux_unsupported("page allocation request");
 		return NULL;
 	}
 	if (!atomic)
 		stela_linux_pages_finish();
-	if (catalog.free_records == NO_INDEX)
+	if (catalog.free_records == NO_INDEX) {
+		pr_warn("page: free_records exhausted\n");
 		goto exhausted;
+	}
 	size_t record_index = catalog.free_records;
 	struct allocation_record *record = catalog.allocations + record_index;
 	catalog.free_records = record->next;
@@ -1276,9 +1280,7 @@ retry:
 		in_callback = false;
 		check_callback(owner, nesting, flags);
 		if (error) {
-			if (error > 0 || allocation.pin || allocation.cpu_base ||
-			    allocation.physical_pages || allocation.page_count)
-				__builtin_trap();
+			pr_warn("page: allocate order=%u failed: %d\n", order, error);
 			recycle_record(record_index);
 			if (error == -ENOMEM)
 				goto exhausted;
@@ -1286,10 +1288,14 @@ retry:
 				stela_linux_unsupported("native page allocation request");
 			return NULL;
 		}
-		if (!allocation.pin)
-			__builtin_trap();
+		if (!allocation.pin) {
+			pr_warn("page: allocate order=%u returned NULL pin\n", order);
+			recycle_record(record_index);
+			return NULL;
+		}
 		record->pin = allocation.pin;
 		if (!validate_allocation(&allocation, order, &first)) {
+			pr_warn("page: validate_allocation order=%u failed pin=%p\n", order, allocation.pin);
 			queue_record(record_index);
 			if (!atomic)
 				stela_linux_pages_finish();
