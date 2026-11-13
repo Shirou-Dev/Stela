@@ -455,8 +455,8 @@ pub(crate) struct Source {
     pci_slots: config_space::PciSlots,
     pci_clock: core::cell::OnceCell<crate::native_clock::Prepared>,
     /// The firmware framebuffer's PCI function, checked before and after
-    /// firmware exit, or why it could not be.
-    framebuffer: core::cell::OnceCell<Result<crate::pci_io::FramebufferSource, String>>,
+    /// firmware exit, or unknown, or why it could not be checked.
+    framebuffer: core::cell::OnceCell<Result<crate::pci_io::ScreenOwner, String>>,
     ioapics: core::cell::RefCell<MountedIoapics>,
 }
 
@@ -608,8 +608,9 @@ impl Source {
         })
     }
 
-    /// The checked framebuffer source, or a sentence saying why there is none.
-    pub(crate) fn verified_framebuffer(&self) -> Result<crate::pci_io::FramebufferSource, String> {
+    /// The checked owner of the firmware screen, or a sentence saying why it
+    /// could not be checked.
+    pub(crate) fn verified_framebuffer(&self) -> Result<crate::pci_io::ScreenOwner, String> {
         match self.framebuffer.get() {
             Some(result) => result.clone(),
             None => Err(String::from(
@@ -622,6 +623,14 @@ impl Source {
     /// first outcome stays.
     pub(crate) fn refuse_framebuffer(&self, why: String) {
         let _ = self.framebuffer.set(Err(why));
+    }
+
+    /// Keep that no PCI function was found for the firmware screen. The
+    /// first outcome stays.
+    pub(crate) fn framebuffer_owner_unknown(&self) {
+        let _ = self
+            .framebuffer
+            .set(Ok(crate::pci_io::ScreenOwner::Unknown));
     }
 
     pub(crate) fn authority(&self) -> &Authority {

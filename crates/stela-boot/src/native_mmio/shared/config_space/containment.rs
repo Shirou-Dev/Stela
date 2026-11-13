@@ -95,7 +95,7 @@ impl<'a> ContainedPci<'a> {
         }?;
         self.source
             .framebuffer
-            .set(Ok(source))
+            .set(Ok(crate::pci_io::ScreenOwner::Function(source)))
             .map_err(|_| Error::Busy)
     }
 

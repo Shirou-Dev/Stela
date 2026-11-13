@@ -1342,9 +1342,9 @@ fn open_gpus(
     let heap_bytes = heap.end - heap.start;
     crate::status::begin("Starting the GPU");
     let gop = if handoff.screen.is_some() {
-        mmio.verified_framebuffer().map(Some)
+        mmio.verified_framebuffer()
     } else {
-        Ok(None)
+        Ok(crate::pci_io::ScreenOwner::NoScreen)
     };
     let firmware = firmware.clone();
     // Named on the screen when no GPU starts; the claim takes `adapters`.
@@ -2462,9 +2462,15 @@ fn start_platform(
                     )),
                 }
             }
-            (Some(_), None) => Some(String::from(
-                "the firmware named no PCI function for its framebuffer",
-            )),
+            (Some(_), None) => {
+                output::arguments(format_args!(
+                    "HOST GOP PCI source unknown: no GOP device path or display function's \
+                     BAR holds the firmware framebuffer; the firmware screen stops before a \
+                     GPU starts\n"
+                ));
+                mmio.framebuffer_owner_unknown();
+                None
+            }
             // The containment failure is kept and logged above.
             (None, _) => None,
         };

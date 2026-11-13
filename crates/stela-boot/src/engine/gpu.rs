@@ -941,9 +941,10 @@ fn claim(
     services: &dyn NativeServices,
     adapter: &gpu::Adapter,
     line: u32,
-    gop: Option<crate::pci_io::FramebufferSource>,
+    gop: crate::pci_io::ScreenOwner,
     catalog: Arc<Catalog>,
 ) -> Result<Claimed, ServiceError> {
+    use crate::pci_io::ScreenOwner;
     let address = adapter.address;
     let timer = services.minimum_delay()?;
     let mut requester = services.prepare_requester(address)?;
@@ -954,31 +955,36 @@ fn claim(
     }
     gpu::cold::check_candidate(function, timer.as_ref())
         .map_err(|error| cold_refusal(address, error))?;
-    if let Some(source) = gop.filter(|source| source.address == address) {
-        let checked = source.bar.words().try_for_each(|(offset, expected)| {
-            let observed = function
-                .config()
-                .read32(offset)
-                .map_err(ServiceError::Config)?;
-            if observed != expected {
-                return Err(ServiceError::Config(ConfigError::before_effect(
-                    ConfigFailure::Readback {
-                        offset,
-                        width: 4,
-                        expected,
-                        observed,
-                    },
-                )));
-            }
-            Ok(())
-        });
-        // BAR sizing below temporarily turns off memory decode.
-        checked?;
-        if !crate::console::retire_firmware() {
-            return Err(ServiceError::Refused(
-                "a firmware framebuffer writer is still active",
-            ));
+    let owns_screen = match gop {
+        ScreenOwner::Function(source) if source.address == address => {
+            source.bar.words().try_for_each(|(offset, expected)| {
+                let observed = function
+                    .config()
+                    .read32(offset)
+                    .map_err(ServiceError::Config)?;
+                if observed != expected {
+                    return Err(ServiceError::Config(ConfigError::before_effect(
+                        ConfigFailure::Readback {
+                            offset,
+                            width: 4,
+                            expected,
+                            observed,
+                        },
+                    )));
+                }
+                Ok(())
+            })?;
+            true
         }
+        // Any GPU may show the screen, so none starts beside its writer.
+        ScreenOwner::Unknown => true,
+        ScreenOwner::Function(_) | ScreenOwner::NoScreen => false,
+    };
+    // BAR sizing below temporarily turns off memory decode.
+    if owns_screen && !crate::console::retire_firmware() {
+        return Err(ServiceError::Refused(
+            "a firmware framebuffer writer is still active",
+        ));
     }
     let mut placement = Placement {
         bus: address.bus,
@@ -1280,7 +1286,7 @@ pub(super) struct Refused {
 pub(super) fn claim_all(
     services: &dyn NativeServices,
     adapters: &[gpu::Adapter],
-    gop: Result<Option<crate::pci_io::FramebufferSource>, String>,
+    gop: Result<crate::pci_io::ScreenOwner, String>,
     catalog: Option<&Arc<Catalog>>,
 ) -> (Vec<Claimed>, Vec<Refused>) {
     use stela_boot_core::gpu_status::Reason;

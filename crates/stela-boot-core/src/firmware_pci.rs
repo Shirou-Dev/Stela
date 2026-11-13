@@ -117,6 +117,34 @@ impl FramebufferBar {
     }
 }
 
+/// UEFI device path node type and subtype of a PCI node (Hardware, PCI;
+/// UEFI 2.11 section 10.3.2.1).
+pub const PCI_NODE: (u8, u8) = (1, 1);
+
+/// Whether a device path of `nodes` (type, subtype; end nodes excluded)
+/// names a PCI function: firmware's PCI_IO handle for its longest prefix
+/// took every node through the last PCI node, leaving `unconsumed` nodes
+/// below that function, as for a GOP on a child output handle. A leftover
+/// PCI node means the handle found is only a bridge above the function.
+pub fn names_pci_function(nodes: impl IntoIterator<Item = (u8, u8)>, unconsumed: usize) -> bool {
+    let (mut count, mut through) = (0, None);
+    for node in nodes {
+        count += 1;
+        if node == PCI_NODE {
+            through = Some(count);
+        }
+    }
+    through.is_some_and(|through| count - through == unconsumed)
+}
+
+/// The only item, or `None` when there are none or several: two display
+/// functions whose BARs both hold the screen leave its owner unknown.
+pub fn sole<T>(items: impl IntoIterator<Item = T>) -> Option<T> {
+    let mut items = items.into_iter();
+    let first = items.next()?;
+    items.next().is_none().then_some(first)
+}
+
 fn qword(bytes: &[u8; QWORD_BYTES], offset: usize) -> u64 {
     let mut value = [0; 8];
     value.copy_from_slice(&bytes[offset..offset + 8]);
@@ -212,7 +240,38 @@ mod tests {
         assert!(FramebufferBar::observe(&header, [(2, &translated)], screen.clone()).is_none());
         assert!(FramebufferBar::observe(&header, [(2, &region)], base..base + 0x2001).is_none());
         header[0x0e] = 1;
+        assert!(FramebufferBar::observe(&header, [(2, &region)], screen.clone()).is_none());
+        header[0x0e] = 0;
+        header[0x0b] = 2;
         assert!(FramebufferBar::observe(&header, [(2, &region)], screen).is_none());
+    }
+
+    #[test]
+    fn device_path_names_the_function_of_its_last_pci_node() {
+        let root = (2, 1);
+        let output = (2, 3);
+        let controller = (1, 5);
+        // The GOP on the function itself, or on a child output below it.
+        assert!(names_pci_function([root, PCI_NODE], 0));
+        assert!(names_pci_function([root, PCI_NODE, PCI_NODE, output], 1));
+        assert!(names_pci_function(
+            [root, PCI_NODE, controller, (4, 7), output],
+            3
+        ));
+        // Firmware's handle is a bridge above the function, or took nodes
+        // past it.
+        assert!(!names_pci_function([root, PCI_NODE, PCI_NODE, output], 2));
+        assert!(!names_pci_function([root, PCI_NODE, output], 0));
+        // No PCI node at all, as on a console splitter's virtual handle.
+        assert!(!names_pci_function([root, output], 1));
+        assert!(!names_pci_function([], 0));
+    }
+
+    #[test]
+    fn only_a_single_matching_function_owns_the_screen() {
+        assert_eq!(sole([7]), Some(7));
+        assert_eq!(sole::<u8>([]), None);
+        assert_eq!(sole([7, 8]), None);
     }
     #[test]
     fn host_to_pci_translation_and_full_width_are_preserved() {
