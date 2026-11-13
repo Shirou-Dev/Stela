@@ -46,7 +46,8 @@ impl<'a> ContainedPci<'a> {
         }
     }
 
-    /// Original populated bridge routes in upstream-first order.
+    /// Original bridges with an assigned secondary bus, in upstream-first
+    /// order, whether or not functions sit below them.
     pub(crate) fn bridges(&self) -> Result<Vec<Address>, Error> {
         let cohort = self
             .source
@@ -59,20 +60,12 @@ impl<'a> ContainedPci<'a> {
         };
         let mut bridges = Vec::new();
         for slot in &fabric.slots {
-            let Some(buses) = slot.header.bridge else {
-                continue;
-            };
-            if slot.refusal.is_some() {
-                continue;
-            }
-            let secondary = buses.to_le_bytes()[1];
-            if secondary > slot.address.bus
-                && fabric
-                    .slots
-                    .binary_search_by_key(&(slot.address.segment, secondary), |slot| {
-                        (slot.address.segment, slot.address.bus)
-                    })
-                    .is_ok()
+            if slot.refusal.is_none()
+                && slot
+                    .header
+                    .bridge
+                    .and_then(|buses| topology::secondary_bus(slot.address, buses))
+                    .is_some()
             {
                 bridges.try_reserve(1).map_err(|_| Error::Exhausted)?;
                 bridges.push(slot.address);
@@ -131,10 +124,12 @@ impl<'a> ContainedPci<'a> {
         Ok(())
     }
 
-    /// Observe every parked function through the same read-only census.
+    /// Observe the parked functions in `scope` through the same read-only
+    /// census.
     pub(crate) fn check_stopped(
         &self,
         reader: &mut ConfigInventory<'_>,
+        scope: PciScope,
     ) -> Result<(), ContainmentError> {
         if !core::ptr::eq(self.source, reader.source) {
             return Err(Error::InvalidPlatformReply.into());
@@ -143,7 +138,7 @@ impl<'a> ContainedPci<'a> {
         let Cohort::Parked(fabric) = &*cohort else {
             return Err(Error::Unavailable.into());
         };
-        for slot in &fabric.slots {
+        for slot in fabric.scoped(scope)? {
             slot.check_stopped(|offset, width| {
                 reader
                     .read(slot.address, offset, width)
@@ -153,21 +148,23 @@ impl<'a> ContainedPci<'a> {
         Ok(())
     }
 
-    /// Recheck one parked page at a time, borrowing any already kept
-    /// remapper configuration through its own original read-only owner.
+    /// Recheck the parked functions in `scope` one page at a time,
+    /// borrowing any already kept remapper configuration through its own
+    /// original read-only owner.
     ///
     /// # Safety
     /// Caller keeps the original writer exclusion. `kept` returns a reader
     /// only for the exact original remapper function; other pages are disjoint.
     pub(crate) unsafe fn recheck_stopped_scoped(
         &self,
+        scope: PciScope,
         mut kept: impl FnMut(Address, u16, u8) -> Option<Result<u32, ConfigError>>,
     ) -> Result<(), ContainmentError> {
         let cohort = self.source.pci_slots.0.borrow();
         let Cohort::Parked(fabric) = &*cohort else {
             return Err(Error::Unavailable.into());
         };
-        for slot in &fabric.slots {
+        for slot in fabric.scoped(scope)? {
             let mut map = None;
             let checked = slot.check_stopped(|offset, width| {
                 if let Some(value) = kept(slot.address, offset, width) {
@@ -199,17 +196,30 @@ impl<'a> ContainedPci<'a> {
         Ok(())
     }
 
-    /// Reopen a read-only view after the remapping units have drained.
+    /// Reopen a read-only view of the parked functions in `scope`, after
+    /// the remapping units have drained or before a bridge forwards.
     ///
     /// # Safety
     /// The original source still excludes every configuration and topology writer.
-    pub(crate) unsafe fn recheck_stopped(&self) -> Result<(), ContainmentError> {
+    pub(crate) unsafe fn recheck_stopped(&self, scope: PciScope) -> Result<(), ContainmentError> {
         // SAFETY: the caller retains the original exclusive census ownership.
         unsafe {
             self.source
-                .with_config_inventory(|_, reader| self.check_stopped(reader))
+                .with_config_inventory(|_, reader| self.check_stopped(reader, scope))
         }
     }
+}
+
+/// The parked functions a recheck reads.
+#[derive(Clone, Copy)]
+pub(crate) enum PciScope {
+    /// Every function of the fabric.
+    Fabric,
+    /// One bridge and the functions on its secondary bus: what turning on
+    /// its forwarding exposes. A bridge on that bus stays closed until its
+    /// own forwarding is restored with its own bus rechecked, so a function
+    /// that changed below it withholds only that branch.
+    Bridge(Address),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -460,6 +470,29 @@ struct Fabric {
 }
 
 impl Fabric {
+    fn scoped(&self, scope: PciScope) -> Result<impl Iterator<Item = &Slot>, ContainmentError> {
+        let exposed = match scope {
+            PciScope::Fabric => None,
+            PciScope::Bridge(address) => {
+                let index = self
+                    .slots
+                    .binary_search_by_key(&address, |slot| slot.address)
+                    .map_err(|_| ContainmentError::from(Error::OutsideResource).at(address))?;
+                let secondary = self.slots[index]
+                    .header
+                    .bridge
+                    .and_then(|buses| topology::secondary_bus(address, buses))
+                    .ok_or_else(|| ContainmentError::from(Error::OutsideResource).at(address))?;
+                Some((address, secondary))
+            }
+        };
+        Ok(self.slots.iter().filter(move |slot| {
+            exposed.is_none_or(|(bridge, secondary)| {
+                topology::exposed_by(bridge, secondary, slot.address)
+            })
+        }))
+    }
+
     /// Refuse a function whose DMA crosses a bridge that may forward it
     /// under the bridge's own requester ID: a remapping context attached
     /// for the function's own ID would not see that DMA.
@@ -990,8 +1023,9 @@ impl Source {
     /// routing seal, configuration owner and its original blocked context.
     ///
     /// # Safety
-    /// Same proof as promote_cold_config, plus the complete original cohort
-    /// was rechecked before any forwarding and all leaf owners remain parked
+    /// Same proof as promote_cold_config, plus the bridge and the functions
+    /// on its secondary bus ([`PciScope::Bridge`]) were rechecked stopped
+    /// just before this forwarding and all leaf owners remain parked
     /// with their master seals and new DMA roots blocked. The checker owns
     /// this port's original blocked context for as long as the port is kept.
     pub(crate) unsafe fn forward_cold_bridge(

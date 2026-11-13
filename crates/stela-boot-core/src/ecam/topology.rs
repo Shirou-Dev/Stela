@@ -57,6 +57,22 @@ fn root(roots: &[RootWindow], address: Address) -> Result<usize, Error> {
     Ok(root)
 }
 
+/// The secondary bus a bridge at `address` forwards to, from its Type 1 bus
+/// dword, or None when firmware assigned it no buses. Whether functions
+/// sit there does not matter: an empty port forwards as well.
+pub fn secondary_bus(address: Address, buses: u32) -> Option<u8> {
+    let [_, secondary, subordinate, _] = buses.to_le_bytes();
+    (secondary > address.bus && subordinate >= secondary).then_some(secondary)
+}
+
+/// Whether turning on forwarding through `bridge`, which forwards to
+/// `secondary`, lets DMA from `address` through: the bridge itself and each
+/// function on its secondary bus. A bridge on that bus whose own forwarding
+/// is off still holds back the buses below it.
+pub fn exposed_by(bridge: Address, secondary: u8, address: Address) -> bool {
+    address == bridge || (address.segment == bridge.segment && address.bus == secondary)
+}
+
 /// Return the direct parent of every function in BDF order. An occupied
 /// subordinate bus must be the exact secondary bus of its immediate bridge.
 /// The rest of a subordinate range can be unpopulated.
@@ -173,6 +189,36 @@ mod tests {
                 u32::from_le_bytes([bus, secondary, subordinate, 0])
             }),
         }
+    }
+
+    #[test]
+    fn empty_ports_forward_and_unassigned_bridges_do_not() {
+        let port = node(4, 8, Some((6, 6)));
+        assert_eq!(
+            secondary_bus(port.address, port.bridge_buses.unwrap()),
+            Some(6)
+        );
+        let unassigned = node(4, 9, Some((0, 0)));
+        assert_eq!(
+            secondary_bus(unassigned.address, unassigned.bridge_buses.unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_bridge_exposes_itself_and_its_secondary_bus_only() {
+        let bridge = node(2, 1, Some((5, 7))).address;
+        assert!(exposed_by(bridge, 5, bridge));
+        assert!(exposed_by(bridge, 5, node(5, 3, None).address));
+        // Below a closed bridge on bus 5, beside it, and its parent bus.
+        assert!(!exposed_by(bridge, 5, node(6, 0, None).address));
+        assert!(!exposed_by(bridge, 5, node(2, 2, None).address));
+        assert!(!exposed_by(bridge, 5, node(0, 1, None).address));
+        let other_segment = Address {
+            segment: 1,
+            ..node(5, 3, None).address
+        };
+        assert!(!exposed_by(bridge, 5, other_segment));
     }
 
     #[test]

@@ -243,7 +243,7 @@ impl Plan {
     /// is judged by this, whatever else it left running.
     pub fn master_stopped(&self, command: u16) -> bool {
         command & regs::COMMAND_MASTER == 0
-            || self.0.iter().any(|control| {
+            || self.controls.iter().any(|control| {
                 control.offset == regs::COMMAND && control.hardwired & regs::COMMAND_MASTER != 0
             })
     }

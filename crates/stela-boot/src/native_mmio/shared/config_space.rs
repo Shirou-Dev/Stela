@@ -7,7 +7,7 @@ use stela_boot_core::ecam::census;
 use stela_drivers::bus::{mmio::owned::Mapping, pci::Address};
 mod containment;
 pub(super) use containment::PciSlots;
-pub(crate) use containment::{ContainedPci, ContainmentError};
+pub(crate) use containment::{ContainedPci, ContainmentError, PciScope};
 
 /// Log the first memory map conflict that keeps a bus's configuration
 /// space unmapped, once per boot: the census error itself names no bus.

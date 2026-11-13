@@ -302,7 +302,7 @@ impl Remappers {
                         .map(Some)
                         .map_err(|error| ConfigError::before_effect(ConfigFailure::Mapping(error)))
                 });
-                pci.check_stopped(reader)
+                pci.check_stopped(reader, native_mmio::PciScope::Fabric)
                     .map(|()| (inventories, identities, roles))
             })
         };
@@ -373,7 +373,7 @@ impl Remappers {
             if blocked == Some(true) {
                 // SAFETY: no driver, AP or competing configuration writer
                 // can change the original stopped PCI cohort during takeover.
-                match unsafe { remappers.recheck_amd_stopped(pci) } {
+                match unsafe { remappers.recheck_amd_stopped(pci, native_mmio::PciScope::Fabric) } {
                     Ok(()) => {
                         remappers.amd_fabric = Some(mmio);
                         output::arguments(format_args!(
@@ -566,7 +566,7 @@ impl Remappers {
         {
             // SAFETY: no PCI driver, controller or AP can write configuration
             // between the original census and this post-drain readback.
-            if let Err(error) = unsafe { pci.recheck_stopped() } {
+            if let Err(error) = unsafe { pci.recheck_stopped(native_mmio::PciScope::Fabric) } {
                 output::arguments(format_args!(
                     "HOST IOMMU VT-d blocked PCI fabric changed after drain: {error}\n"
                 ));

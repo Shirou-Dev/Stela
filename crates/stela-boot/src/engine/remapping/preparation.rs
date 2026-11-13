@@ -119,15 +119,17 @@ unsafe impl stela_drivers::bus::pci::requester::preparation::AttachmentBackend f
 impl Remappers {
     /// # Safety
     /// The original AMD units and the parked PCI fabric exclude all other
-    /// configuration and topology writers. No ports have resumed forwarding.
+    /// configuration and topology writers. No bridge in `scope` has resumed
+    /// forwarding; one outside it did so only after its own recheck.
     pub(super) unsafe fn recheck_amd_stopped(
         &self,
         pci: &native_mmio::ContainedPci<'_>,
+        scope: native_mmio::PciScope,
     ) -> Result<(), native_mmio::ContainmentError> {
         // SAFETY: kept unit configuration reads match the original addresses
         // and the caller keeps the rest of the stopped fabric exclusive.
         unsafe {
-            pci.recheck_stopped_scoped(|address, offset, width| {
+            pci.recheck_stopped_scoped(scope, |address, offset, width| {
                 self.amd
                     .iter()
                     .find_map(|unit| unit.read_original_config(address, offset, width))
@@ -186,24 +188,30 @@ impl Remappers {
         let amd = self
             .amd_fabric
             .is_some_and(|original| core::ptr::eq(original, source));
-        // SAFETY: this startup step precedes every driver and competing PCI
-        // writer. The same complete blocked remappers and line owners are kept.
-        // A unit kept in any mode holds its own function's configuration
-        // page, which the whole-space view cannot map beside it.
-        let stopped = unsafe {
-            if self.amd.is_empty() {
-                pci.recheck_stopped()
-            } else {
-                self.recheck_amd_stopped(pci)
-            }
-        };
-        if let Err(error) = stopped {
-            output::arguments(format_args!(
-                "HOST PCI bridge forwarding withheld: {error}\n"
-            ));
-            return;
-        }
+        // Upstream bridges come first, so each bridge's own bus is rechecked
+        // just before it forwards, while the bridges on that bus are still
+        // closed. A function that changed withholds only the bridge above it
+        // and the bridges below that one.
         for address in bridges {
+            let scope = native_mmio::PciScope::Bridge(address);
+            // SAFETY: this startup step precedes every driver and competing
+            // PCI writer. The same complete blocked remappers and line owners
+            // are kept, and no bridge in this scope forwards yet. A unit kept
+            // in any mode holds its own function's configuration page, which
+            // the whole-space view cannot map beside it.
+            let stopped = unsafe {
+                if self.amd.is_empty() {
+                    pci.recheck_stopped(scope)
+                } else {
+                    self.recheck_amd_stopped(pci, scope)
+                }
+            };
+            if let Err(error) = stopped {
+                output::arguments(format_args!(
+                    "HOST PCI bridge {address} forwarding withheld: {error}\n"
+                ));
+                continue;
+            }
             let blocked = match self.initial_bridge(source, address, lines, amd) {
                 Ok(blocked) => blocked,
                 Err(error) => {

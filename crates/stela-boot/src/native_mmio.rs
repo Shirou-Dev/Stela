@@ -13,7 +13,7 @@ use ecam::RootWindow;
 pub(crate) use capture::{CaptureHandoff, Prepared, Wire};
 pub(crate) use shared::{
     ContainedPci, ContainmentError, InitialPciLines, IoapicRegisters, ModePin, NativeExclusiveHpet,
-    NativeHpetMapping, PROCESSORS, Source,
+    NativeHpetMapping, PROCESSORS, PciScope, Source,
 };
 pub(crate) use window::Window;
 
