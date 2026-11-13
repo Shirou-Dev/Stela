@@ -937,13 +937,13 @@ fn stopped(message: &str, next: &dyn Fn() -> &'static str) {
 /// to read it on another computer.
 pub const STOPPED: &str = "Stela stopped. Its log is on this USB: on another computer, plug in \
     this USB and run `stela log`, which saves it to log.txt; include that file in a report. Turn \
-    the PC off to try again.";
+    the PC off to try again; Ctrl+Alt+Delete on a laptop's own keyboard restarts it.";
 
 /// What a stop before the engine writes the USB's log again tells the
 /// user: the screen is all that is kept of this part of the run.
 pub const STOPPED_UNLOGGED: &str = "Stela stopped before it could write this part of its log \
     to the USB: this screen is the only record of it. Take a photo of it for a report. Turn the \
-    PC off to try again.";
+    PC off to try again; Ctrl+Alt+Delete on a laptop's own keyboard restarts it.";
 
 /// Whether the USB's log is open and none of its stores failed this boot.
 /// Never waits: a stop raised inside a log store finds the logs held, and

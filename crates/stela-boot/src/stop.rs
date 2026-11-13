@@ -3,16 +3,29 @@
 //! system, so nothing would answer a press: the PC then turns off only
 //! through the chipset's or the embedded controller's forced power-off, a
 //! long hold, which some laptops do not perform for a halted system. The
-//! stop therefore reads the button itself and turns the PC off at a press.
+//! stop therefore reads the button itself and turns the PC off at a press,
+//! and reads the 8042 keyboard controller, where there is one, for
+//! Ctrl+Alt+Delete, which restarts the PC: a laptop's button may reach only
+//! its embedded controller, and its own keyboard is an 8042's.
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use stela_boot_core::stop_keys::Keys;
 use stela_runtime::pc::power::{HostPower, Ports, ResetRegister};
 
 const PCI_ADDRESS: u16 = 0xcf8;
 const PCI_DATA: u16 = 0xcfc;
 const KEYBOARD_STATUS: u16 = 0x64;
+const KEYBOARD_DATA: u16 = 0x60;
+const KEYBOARD_OUTPUT_FULL: u8 = 1 << 0;
+/// The output byte is the auxiliary device's, a mouse's.
+const KEYBOARD_AUXILIARY: u8 = 1 << 5;
+/// The most bytes taken from the controller at one look.
+const KEYBOARD_BURST: usize = 32;
+/// The counter's assumed rate before the boot measured it, for the waits
+/// of a stop that early: a wait may then be shorter or longer than named.
+const ASSUMED_TSC_HZ: u64 = 2_000_000_000;
 const KEYBOARD_INPUT_FULL: u8 = 1 << 1;
 const KEYBOARD_PULSE_RESET: u8 = 0xfe;
 
@@ -84,7 +97,11 @@ pub(crate) fn arm(power: &HostPower, tsc_hz: u64) {
 }
 
 fn spin(milliseconds: u64) {
-    let ticks = TSC_HZ.load(Ordering::Relaxed) / 1000 * milliseconds;
+    let hz = match TSC_HZ.load(Ordering::Relaxed) {
+        0 => ASSUMED_TSC_HZ,
+        hz => hz,
+    };
+    let ticks = hz / 1000 * milliseconds;
     // SAFETY: RDTSC is unprivileged on every x86-64 processor.
     let start = unsafe { core::arch::x86_64::_rdtsc() };
     // SAFETY: as above.
@@ -93,11 +110,28 @@ fn spin(milliseconds: u64) {
     }
 }
 
+/// Whether Ctrl+Alt+Delete was pressed among the bytes the 8042 holds.
+fn restart_keys(keys: &mut Keys) -> bool {
+    for _ in 0..KEYBOARD_BURST {
+        let status = Io.in8(KEYBOARD_STATUS);
+        if status == 0xff || status & KEYBOARD_OUTPUT_FULL == 0 {
+            break;
+        }
+        let byte = Io.in8(KEYBOARD_DATA);
+        if status & KEYBOARD_AUXILIARY == 0 && keys.feed(byte) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Stay stopped for good with interrupts masked. Where the firmware runs
 /// in ACPI mode, a press of the power button turns the PC off at S5 with
 /// the sleep types the DSDT states; a PC that stays on, or states none, is
 /// restarted, which hands it back to its firmware. In legacy mode the
-/// firmware keeps the button and this only halts.
+/// firmware keeps the button. Ctrl+Alt+Delete on an 8042 keyboard restarts
+/// the PC in either mode. With neither a button to read nor an 8042 this
+/// only halts.
 pub(crate) fn wait() -> ! {
     // SAFETY: no task resumes after a stop; interrupts stay masked.
     unsafe { asm!("cli", options(nomem, nostack)) };
@@ -105,27 +139,36 @@ pub(crate) fn wait() -> ! {
         .load(Ordering::Acquire)
         // SAFETY: `ARMED` follows the only write.
         .then(|| unsafe { (*HARDWARE.0.get()).as_ref() })
-        .flatten()
-        .filter(|power| power.acpi_mode(&mut Io));
-    let Some(power) = power else {
+        .flatten();
+    let button = power.filter(|power| power.acpi_mode(&mut Io));
+    let keyboard = Io.in8(KEYBOARD_STATUS) != 0xff;
+    if button.is_none() && !keyboard {
         loop {
             // SAFETY: as above.
             unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
         }
-    };
+    }
     // A press from before the stop is not a request to turn off.
-    power.take_power_button(&mut Io);
+    if let Some(power) = button {
+        power.take_power_button(&mut Io);
+    }
+    let mut keys = Keys::new();
+    let reset = power.and_then(|power| power.reset);
     loop {
         spin(BUTTON_MILLIS);
-        if power.take_power_button(&mut Io) {
-            break;
+        if keyboard && restart_keys(&mut keys) {
+            restart(reset);
+        }
+        if let Some(power) = button
+            && power.take_power_button(&mut Io)
+        {
+            if let Some(sleep_types) = power.soft_off {
+                power.enter_soft_off(&mut Io, sleep_types);
+                spin(1000);
+            }
+            restart(reset);
         }
     }
-    if let Some(sleep_types) = power.soft_off {
-        power.enter_soft_off(&mut Io, sleep_types);
-        spin(1000);
-    }
-    restart(power.reset)
 }
 
 /// Restart the PC: the FADT's reset register, then the 8042 keyboard
