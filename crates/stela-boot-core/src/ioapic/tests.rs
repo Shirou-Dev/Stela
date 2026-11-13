@@ -10,9 +10,13 @@ struct Hardware {
     fail_read: bool,
     refuse_mask: bool,
     broken_eoi: bool,
+    /// Reserved bits every redirection entry reads back set.
+    reserved_low: u32,
+    reserved_high: u32,
     tmr: Trigger,
     events: alloc::vec::Vec<&'static str>,
 }
+const EXT_INT: u32 = 7 << 8;
 impl Hardware {
     fn service(&mut self) {
         let low = self.regs[0x22]; // GSI9, true level state, one pending vector.
@@ -65,6 +69,8 @@ impl Board {
                 fail_read: false,
                 refuse_mask: false,
                 broken_eoi: false,
+                reserved_low: 0,
+                reserved_high: 0,
                 tmr: Trigger::Edge,
                 events: alloc::vec::Vec::new(),
             }),
@@ -86,8 +92,12 @@ unsafe impl Registers for Io {
         let h = self.0.hw.lock().unwrap();
         if h.fail_read {
             u32::MAX
-        } else {
+        } else if i < 0x10 {
             h.regs[usize::from(i)]
+        } else if i.is_multiple_of(2) {
+            h.regs[usize::from(i)] | h.reserved_low
+        } else {
+            h.regs[usize::from(i)] | h.reserved_high
         }
     }
     fn write(&self, i: u8, v: u32) {
@@ -111,13 +121,16 @@ unsafe impl Registers for Io {
             if h.refuse_mask && v & MASK != 0 {
                 return;
             }
-            if old & CONFIG != v & CONFIG && (old ^ v) & !MASK != 0 {
+            let changed = (old ^ v) & CONFIG & !MASK;
+            if changed != 0 {
                 assert_ne!(old & MASK, 0, "electrical/vector changed before mask");
-                if old & (1 << 15) != 0 && v & (1 << 15) == 0 {
-                    assert_eq!((old ^ v) & (CONFIG & !(1 << 15)), 0);
-                } else {
-                    assert_eq!(old & (REMOTE_IRR | DELIVERY), 0);
-                }
+                // While Remote IRR is set only the trigger may change: the
+                // switch to level before an EOI, or a level-to-edge write,
+                // which releases Remote IRR.
+                assert!(
+                    old & REMOTE_IRR == 0 || changed == LEVEL || old & LEVEL != 0 && v & LEVEL == 0,
+                    "pending route reprogrammed: {old:#x} -> {v:#x}"
+                );
             }
             // Hardware does not allow software to clear RO RemoteIRR.
             h.regs[i] = (v & !(REMOTE_IRR | DELIVERY)) | old & (REMOTE_IRR | DELIVERY);
@@ -131,11 +144,20 @@ unsafe impl Registers for Io {
     }
     fn write_eoi(&self, vector: u8) {
         let mut h = self.0.hw.lock().unwrap();
-        assert_eq!(h.regs[0x22] as u8, vector);
         assert!(h.regs[1] as u8 >= 0x20);
+        // The EOI register releases Remote IRR on each level entry holding
+        // the vector.
+        let pins = ((h.regs[1] >> 16) & 255) as usize + 1;
+        let entries: alloc::vec::Vec<usize> = (0..pins)
+            .map(|pin| 0x10 + pin * 2)
+            .filter(|&i| h.regs[i] as u8 == vector && h.regs[i] & LEVEL != 0)
+            .collect();
+        assert!(!entries.is_empty(), "EOI for a vector no level entry holds");
         h.events.push("direct-eoi");
         if !h.broken_eoi {
-            h.regs[0x22] &= !REMOTE_IRR;
+            for i in entries {
+                h.regs[i] &= !REMOTE_IRR;
+            }
             h.service();
         }
     }
@@ -286,7 +308,7 @@ fn fixture_version(version: u8) -> Fixture {
 }
 
 #[test]
-fn firmware_containment_masks_only_original_ordinary_routes() {
+fn firmware_containment_clears_every_pin_to_a_masked_edge_entry() {
     let (board, unit, _, _) = fixture();
     {
         let mut hardware = board.hw.lock().unwrap();
@@ -294,6 +316,7 @@ fn firmware_containment_masks_only_original_ordinary_routes() {
         hardware.regs[0x13] = 2 << 24;
         hardware.regs[0x16] = LOWEST_PRIORITY | 0x42;
         hardware.regs[0x17] = 3 << 24;
+        hardware.regs[0x18] = MASK | LEVEL | 1 << 13 | 0x45;
     }
     // SAFETY: sole controller, CPU and original firmware route model.
     let plan = unsafe { unit.firmware_routes() }.unwrap();
@@ -301,42 +324,138 @@ fn firmware_containment_masks_only_original_ordinary_routes() {
     // SAFETY: the fixture retains the exact original controller and its sources.
     unsafe { plan.contain() }.unwrap();
     plan.verify_contained().unwrap();
-    plan.verify_line(unit.gsi_base() + 1).unwrap();
-    plan.verify_line(unit.gsi_base() + 3).unwrap();
+    assert_eq!(plan.withheld().count(), 0);
+    for gsi in [1, 3, 4, 5] {
+        plan.verify_line(unit.gsi_base() + gsi).unwrap();
+    }
     {
         let mut hardware = board.hw.lock().unwrap();
-        assert_eq!(&hardware.regs[0x12..0x14], &[MASK | 0x38, 2 << 24]);
-        assert_eq!(
-            &hardware.regs[0x16..0x18],
-            &[MASK | LOWEST_PRIORITY | 0x42, 3 << 24]
-        );
-        assert_eq!(hardware.events, ["mask", "mask"]);
+        for pin in [1, 3, 4] {
+            assert_eq!(&hardware.regs[0x10 + pin * 2..0x12 + pin * 2], &[MASK, 0]);
+        }
         hardware.regs[0x13] = 4 << 24;
     }
     assert_eq!(plan.verify_line(unit.gsi_base() + 1), Err(IrqError::Route));
     plan.verify_line(unit.gsi_base() + 3).unwrap();
-    assert_eq!(board.hw.lock().unwrap().events, ["mask", "mask"]);
 }
 
+/// Linux clear_IO_APIC_pin: a stuck Remote IRR is released by switching the
+/// masked pin to level and issuing an EOI, through the direct EOI register
+/// from version 0x20 and by the edge/level flip before it.
 #[test]
-fn firmware_containment_refuses_pending_and_unowned_modes_before_writes() {
-    for (last, cpu_pending, expected) in [
-        (REMOTE_IRR | 0x42, false, IrqError::Drain),
-        (DELIVERY | 0x42, false, IrqError::Drain),
-        (0x42, true, IrqError::Drain),
-        (4 << 8 | 0x42, false, IrqError::Unsupported),
-    ] {
-        let (board, unit, _, _) = fixture();
+fn firmware_containment_releases_a_stuck_remote_irr() {
+    for version in [0x11, 0x20] {
+        for low in [LEVEL | 0x41, MASK | LEVEL | 0x41, 0x41, MASK | 0x41] {
+            let (board, unit, _, _) = fixture_version(version);
+            {
+                let mut hardware = board.hw.lock().unwrap();
+                hardware.regs[0x14] = low | REMOTE_IRR;
+                hardware.regs[0x15] = 2 << 24;
+                hardware.regs[0x16] = 0x38;
+            }
+            // SAFETY: sole controller, CPU and original firmware route model.
+            let plan = unsafe { unit.firmware_routes() }.unwrap();
+            // SAFETY: the fixture retains the exact original controller.
+            unsafe { plan.contain() }.unwrap();
+            assert_eq!(plan.withheld().count(), 0, "{version:#x} {low:#x}");
+            plan.verify_line(2).unwrap();
+            plan.verify_line(3).unwrap();
+            plan.verify_contained().unwrap();
+            let hardware = board.hw.lock().unwrap();
+            assert_eq!(&hardware.regs[0x14..0x16], &[MASK, 0]);
+            let kind = if version < 0x20 {
+                "edge-eoi"
+            } else {
+                "direct-eoi"
+            };
+            assert!(hardware.events.contains(&kind), "{:?}", hardware.events);
+        }
+    }
+}
+
+/// A Remote IRR that no EOI releases leaves that one pin masked and
+/// withheld after a bounded number of tries; every other pin is contained.
+#[test]
+fn a_remote_irr_that_stays_set_withholds_only_its_pin() {
+    for version in [0x11, 0x20] {
+        let (board, unit, _, line) = fixture_version(version);
         {
             let mut hardware = board.hw.lock().unwrap();
-            hardware.regs[0x12] = 0x38;
-            hardware.regs[0x3e] = last;
+            hardware.regs[0x14] = MASK | LEVEL | 0x41 | REMOTE_IRR;
+            hardware.regs[0x15] = 2 << 24;
+            hardware.regs[0x16] = 0x38;
+            hardware.regs[0x17] = 2 << 24;
+            hardware.broken_eoi = true;
+        }
+        // SAFETY: sole controller, CPU and original firmware route model.
+        let plan = unsafe { unit.firmware_routes() }.unwrap();
+        // SAFETY: the fixture retains the exact original controller.
+        unsafe { plan.contain() }.unwrap();
+        assert_eq!(
+            plan.withheld().collect::<alloc::vec::Vec<_>>(),
+            [(2, IrqError::Drain)]
+        );
+        assert_eq!(plan.verify_line(2), Err(IrqError::Drain));
+        plan.verify_line(3).unwrap();
+        plan.verify_contained().unwrap();
+        {
+            let hardware = board.hw.lock().unwrap();
+            assert_ne!(hardware.regs[0x14] & MASK, 0);
+            assert_eq!(&hardware.regs[0x16..0x18], &[MASK, 0]);
+            if version >= 0x20 {
+                let eois = hardware
+                    .events
+                    .iter()
+                    .filter(|event| **event == "direct-eoi")
+                    .count();
+                assert_eq!(eois, CLEAR_TRIES);
+            }
+            assert!(hardware.events.len() <= 6 * CLEAR_TRIES);
+        }
+        let stuck = LineRoute { gsi: 2, ..line };
+        assert!(matches!(
+            // SAFETY: the fixture owns this line and its only contributor.
+            unsafe { unit.claim(stuck, Box::new(Contributors(board.clone()))) },
+            Err(IrqError::Drain)
+        ));
+        // SAFETY: the fixture owns this line and its only contributor.
+        let pin = unsafe { unit.claim(line, Box::new(Contributors(board.clone()))) }.unwrap();
+        drop(pin);
+    }
+}
+
+/// A Delivery Status that stays set, or the old vector still pending at the
+/// CPU, withholds that pin alone.
+#[test]
+fn a_pending_delivery_or_cpu_vector_withholds_only_its_pin() {
+    for (low, cpu_pending, cleared) in [
+        (DELIVERY | 0x05, false, MASK | DELIVERY),
+        (MASK | DELIVERY | LEVEL | 0x05, false, MASK | DELIVERY),
+        (0x42, true, MASK),
+        (LOWEST_PRIORITY | 0x42, true, MASK),
+    ] {
+        let (board, unit) = cohort_unit(24, 0, 0);
+        {
+            let mut hardware = board.hw.lock().unwrap();
+            hardware.regs[0x14] = low;
+            hardware.regs[0x16] = 0x06;
             hardware.pending = cpu_pending;
         }
         // SAFETY: sole controller, CPU and original firmware route model.
-        let plan = unsafe { unit.firmware_routes() };
-        assert!(matches!(plan, Err(error) if error == expected));
-        assert!(board.hw.lock().unwrap().events.is_empty());
+        let plan = unsafe { unit.firmware_routes() }.unwrap();
+        // SAFETY: the fixture retains the exact original controller.
+        unsafe { plan.contain() }.unwrap();
+        assert_eq!(
+            plan.withheld().collect::<alloc::vec::Vec<_>>(),
+            [(2, IrqError::Drain)],
+            "{low:#x}"
+        );
+        assert_eq!(plan.verify_line(2), Err(IrqError::Drain));
+        plan.verify_line(3).unwrap();
+        plan.verify_contained().unwrap();
+        assert_eq!(board.hw.lock().unwrap().regs[0x14], cleared);
+        // SAFETY: the fixture hands off this unclaimed line.
+        assert_eq!(unsafe { unit.mask_unclaimed(2) }, Err(IrqError::Drain));
     }
 }
 
@@ -1086,11 +1205,8 @@ fn amd_two_ioapic_cohort_masks_firmware_unmasked_legacy_pins_and_verifies_i8042_
             assert_ne!(hardware.regs[0x10 + pin * 2] & MASK, 0, "pin {pin} masked");
         }
     }
-    assert_eq!(fch.hw.lock().unwrap().regs[0x10], EXT_INT | MASK);
-    assert_eq!(
-        fch.hw.lock().unwrap().regs[0x28],
-        LOWEST_PRIORITY | 0x0c | MASK
-    );
+    assert_eq!(fch.hw.lock().unwrap().regs[0x10], MASK);
+    assert_eq!(&fch.hw.lock().unwrap().regs[0x28..0x2a], &[MASK, 0]);
     // A GSI past both units, or plans out of cohort order, verify nothing.
     let outside = LineRoute {
         gsi: 56,
@@ -1112,54 +1228,101 @@ fn amd_two_ioapic_cohort_masks_firmware_unmasked_legacy_pins_and_verifies_i8042_
     );
 }
 
-/// An Intel PCH's IOAPIC has an Extended Destination ID in bits 55:48 of a
-/// redirection entry, and firmware (ASUS B660, AMI) leaves one in masked
-/// entries. A masked entry with one is kept; an unmasked one, and the bits
-/// below it, are refused.
+/// Reserved bits are compared nowhere, as in Linux: chips read some back
+/// set, and an Intel PCH keeps an Extended Destination ID in bits 55:48
+/// that firmware (ASUS B660, AMI) leaves behind, which containment clears.
 #[test]
-fn firmware_containment_keeps_a_masked_entry_with_an_extended_destination_id() {
+fn firmware_containment_compares_only_defined_bits() {
     let (board, unit) = cohort_unit(24, 0, 0);
     {
         let mut hw = board.hw.lock().unwrap();
         hw.regs[0x12] = MASK | 0x31;
         hw.regs[0x13] = 0x00ab_0000;
+        hw.regs[0x14] = 0x31;
+        hw.regs[0x15] = 0x01ab_0000;
+        hw.reserved_low = 0xfffe_0000;
+        hw.reserved_high = 0x0000_ffff;
     }
     // SAFETY: sole controller, CPU and original firmware route model.
-    assert!(unsafe { unit.firmware_routes() }.is_ok());
-    for (low, high) in [(0x31, 0x00ab_0000), (MASK | 0x31, 0x0000_0001)] {
-        let (board, unit) = cohort_unit(24, 0, 0);
-        {
-            let mut hw = board.hw.lock().unwrap();
-            hw.regs[0x12] = low;
-            hw.regs[0x13] = high;
-        }
-        // SAFETY: sole controller, CPU and original firmware route model.
-        let plan = unsafe { unit.firmware_routes() };
-        assert!(
-            matches!(plan, Err(IrqError::Unsupported)),
-            "{low:#x} {high:#x}"
-        );
+    let plan = unsafe { unit.firmware_routes() }.unwrap();
+    // SAFETY: the fixture retains the exact original controller.
+    unsafe { plan.contain() }.unwrap();
+    assert_eq!(plan.withheld().count(), 0);
+    plan.verify_contained().unwrap();
+    plan.verify_line(1).unwrap();
+    plan.verify_line(2).unwrap();
+    {
+        let mut hw = board.hw.lock().unwrap();
+        assert_eq!(&hw.regs[0x12..0x16], &[MASK, 0, MASK, 0]);
+        // A defined bit still counts.
+        hw.regs[0x13] = 0x0001_0000;
     }
+    assert_eq!(plan.verify_line(1), Err(IrqError::Route));
 }
 
+/// Linux clear_IO_APIC_pin leaves an SMI pin alone, masked or not, and
+/// masks and clears a pin in every other mode. The SMI pin is kept out of
+/// the lines handed to devices; the rest proceed.
 #[test]
-fn firmware_containment_refuses_unmasked_smi_nmi_init_and_reserved_modes() {
-    for mode in [2 << 8, 3 << 8, 4 << 8, 5 << 8, 6 << 8] {
+fn firmware_containment_leaves_smi_pins_alone_and_clears_every_other_mode() {
+    for masked in [0, MASK] {
         let (board, unit) = cohort_unit(24, 0, 0);
-        board.hw.lock().unwrap().regs[0x12] = mode | 0x31;
-        // SAFETY: sole controller, CPU and original firmware route model.
-        let plan = unsafe { unit.firmware_routes() };
-        assert!(matches!(plan, Err(IrqError::Unsupported)), "mode {mode:#x}");
-        assert!(board.hw.lock().unwrap().events.is_empty());
-    }
-    for mode in [0, LOWEST_PRIORITY, EXT_INT] {
-        let (board, unit) = cohort_unit(24, 0, 0);
-        board.hw.lock().unwrap().regs[0x12] = mode | 0x01;
+        let others = [
+            (2, 0),
+            (3, LOWEST_PRIORITY),
+            (4, 3 << 8),
+            (5, 4 << 8),
+            (6, 5 << 8),
+            (7, 6 << 8),
+            (8, EXT_INT),
+        ];
+        {
+            let mut hw = board.hw.lock().unwrap();
+            hw.regs[0x12] = masked | SMI | 0x31;
+            hw.regs[0x13] = 1 << 24;
+            for (pin, mode) in others {
+                hw.regs[0x10 + pin * 2] = mode | 0x01;
+            }
+        }
         // SAFETY: sole controller, CPU and original firmware route model.
         let plan = unsafe { unit.firmware_routes() }.unwrap();
         // SAFETY: the fixture retains the exact original controller.
         unsafe { plan.contain() }.unwrap();
-        assert_eq!(board.hw.lock().unwrap().regs[0x12], mode | 0x01 | MASK);
-        plan.verify_line(1).unwrap();
+        {
+            let hw = board.hw.lock().unwrap();
+            assert_eq!(&hw.regs[0x12..0x14], &[masked | SMI | 0x31, 1 << 24]);
+            for (pin, mode) in others {
+                let entry = &hw.regs[0x10 + pin * 2..0x12 + pin * 2];
+                assert_eq!(entry, &[MASK, 0], "mode {mode:#x}");
+            }
+        }
+        assert_eq!(
+            plan.withheld().collect::<alloc::vec::Vec<_>>(),
+            [(1, IrqError::Unsupported)]
+        );
+        assert_eq!(plan.verify_line(1), Err(IrqError::Unsupported));
+        for (pin, _) in others {
+            plan.verify_line(pin as u32).unwrap();
+        }
+        plan.verify_contained().unwrap();
+        let smi = LineRoute {
+            gsi: 1,
+            polarity: Polarity::High,
+            trigger: Trigger::Edge,
+        };
+        assert!(matches!(
+            // SAFETY: the fixture owns this line and its only contributor.
+            unsafe { unit.claim(smi, Box::new(Contributors(board.clone()))) },
+            Err(IrqError::Unsupported)
+        ));
+        assert_eq!(
+            // SAFETY: the fixture hands off this unclaimed line.
+            unsafe { unit.mask_unclaimed(1) },
+            Err(IrqError::Unsupported)
+        );
+        assert_eq!(board.hw.lock().unwrap().regs[0x12], masked | SMI | 0x31);
+        // Another writer turning the SMI pin into a device route is caught.
+        board.hw.lock().unwrap().regs[0x12] = MASK | 0x31;
+        assert_eq!(plan.verify_contained(), Err(IrqError::Route));
     }
 }

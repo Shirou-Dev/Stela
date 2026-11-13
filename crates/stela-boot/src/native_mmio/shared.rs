@@ -1024,6 +1024,19 @@ impl Source {
             controllers.failure.set(Some(error));
             return Err(failed(error));
         }
+        // Containment withholds an SMI pin as Unsupported, a pin whose
+        // Remote IRR, Delivery Status or old vector stayed pending as Drain,
+        // and a pin that would not read back cleared as Route.
+        for (gsi, error) in controllers.routes.iter().flat_map(|plan| plan.withheld()) {
+            match error {
+                irq::IrqError::Unsupported => crate::output::arguments(format_args!(
+                    "HOST IOAPIC GSI {gsi} left to firmware: SMI pin\n"
+                )),
+                error => crate::output::arguments(format_args!(
+                    "HOST IOAPIC GSI {gsi} withheld from devices: {error}\n"
+                )),
+            }
+        }
         *self.ioapics.borrow_mut() = MountedIoapics::Ready(controllers);
         Ok(count)
     }
@@ -1059,7 +1072,7 @@ impl Source {
     }
 
     /// Reuse the original controller after checking this unclaimed route
-    /// against its retained masked firmware entry.
+    /// against the masked entry its containment left.
     pub(crate) fn original_line(
         &self,
         line: irq::LineRoute,

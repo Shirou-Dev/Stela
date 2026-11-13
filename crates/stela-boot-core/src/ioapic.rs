@@ -20,22 +20,22 @@ use stela_drivers::bus::irq::{
 };
 
 const MASK: u32 = 1 << 16;
+const LEVEL: u32 = 1 << 15;
 const REMOTE_IRR: u32 = 1 << 14;
 const DELIVERY: u32 = 1 << 12;
 const DELIVERY_MODE: u32 = 7 << 8;
 const LOWEST_PRIORITY: u32 = 1 << 8;
-const CONFIG: u32 = 0xff | 7 << 8 | 1 << 11 | 1 << 13 | 1 << 15 | MASK;
-const EXT_INT: u32 = 7 << 8;
-
-/// Whether firmware may have left this redirection entry unmasked for the
-/// initial containment to mask, as Linux's clear_IO_APIC masks every pin at
-/// boot: fixed and lowest-priority routes with any vector (firmware leaves
-/// ISA lines such as the i8042's at low vectors), and the 8259 virtual-wire
-/// ExtINT route. SMI, NMI, INIT and reserved modes stay refused: they are
-/// not ordinary device routes this containment may take over.
-fn maskable_firmware_mode(low: u32) -> bool {
-    matches!(low & DELIVERY_MODE, 0 | LOWEST_PRIORITY | EXT_INT)
-}
+const SMI: u32 = 2 << 8;
+const CONFIG: u32 = 0xff | 7 << 8 | 1 << 11 | 1 << 13 | LEVEL | MASK;
+/// The bits a redirection entry defines. The rest are reserved; Linux
+/// compares none of them, and chips need not read them back as written.
+const DEFINED_LOW: u32 = CONFIG | REMOTE_IRR | DELIVERY;
+/// Destination (bits 63:56) and an Intel PCH's Extended Destination ID
+/// (bits 55:48).
+const DEFINED_HIGH: u32 = 0xffff_0000;
+/// Attempts to release a Remote IRR or Delivery Status left set before the
+/// pin is withheld.
+const CLEAR_TRIES: usize = 8;
 
 /// Verify `line` against the firmware plan of the cohort unit whose
 /// version-reported pins hold it, and return that unit's index. `spans`
@@ -154,7 +154,14 @@ enum FirmwarePhase {
 }
 
 impl<R: Registers, P: Platform> FirmwareRoutes<R, P> {
-    /// Mask the firmware routes on this same original controller.
+    /// Contain every pin of this same original controller as Linux
+    /// clear_IO_APIC does: a pin in SMI delivery mode stays the firmware's,
+    /// every other pin is masked, has a Remote IRR left set released, and
+    /// is left as a masked edge entry with no vector or destination. A pin
+    /// whose Remote IRR, Delivery Status or old CPU vector stays pending is
+    /// withheld from devices by itself; only a pin that will not mask, a
+    /// failed read or another writer fails the whole controller, since an
+    /// unmasked pin could deliver interrupts nothing accounts for.
     ///
     /// # Safety
     /// The original controller and firmware route exclusion used for the
@@ -168,30 +175,47 @@ impl<R: Registers, P: Platform> FirmwareRoutes<R, P> {
         unit.platform.check_process()?;
         unit.domain.check().map_err(IrqError::Delivery)?;
         let _guard = unit.lock();
-        for (pin, &entry) in (0..unit.pins as u8).zip(&self.entries) {
-            if unit.firmware_entry(pin)? != entry {
+        for (pin, &(low, high)) in (0..unit.pins as u8).zip(&self.entries) {
+            // Remote IRR and Delivery Status follow the line; a change in
+            // any written bit means another writer.
+            let (now, now_high) = unit.firmware_entry(pin)?;
+            if now & CONFIG != low & CONFIG || now_high != high {
                 return Err(IrqError::Route);
             }
         }
         self.phase.set(FirmwarePhase::Uncertain);
-        for (pin, &(low, high)) in (0..unit.pins as u8).zip(&self.entries) {
-            if low & MASK != 0 {
-                continue;
-            }
-            let masked = low | MASK;
-            unit.registers.write(0x10 + pin * 2, masked);
-            let actual = unit.firmware_entry(pin)?;
-            if actual != (masked, high) {
-                return Err(IrqError::Mask);
-            }
+        for (pin, &(low, _)) in (0..unit.pins as u8).zip(&self.entries) {
+            let withheld = if low & DELIVERY_MODE == SMI {
+                // An SMI enters SMM, never this boot's vectors.
+                Some(IrqError::Unsupported)
+            } else {
+                match unit.clear_pin(pin, low) {
+                    Ok(()) => None,
+                    Err(error @ (IrqError::Mask | IrqError::FailedRead)) => return Err(error),
+                    Err(error) => Some(error),
+                }
+            };
+            let vector = low as u8;
+            let withheld = match withheld {
+                None if matches!(low & DELIVERY_MODE, 0 | LOWEST_PRIORITY)
+                    && vector >= 16
+                    && unit.platform.pending(vector)? =>
+                {
+                    Some(IrqError::Drain)
+                }
+                withheld => withheld,
+            };
+            // SAFETY: the unit lock held above serializes the withheld table.
+            unsafe { (*unit.withheld.get())[usize::from(pin)] = withheld };
         }
         self.check_masked()?;
         self.phase.set(FirmwarePhase::Contained);
         Ok(())
     }
 
-    /// Check that every original entry is still masked and has no delivery
-    /// pending at either the controller or the admitted receiving CPU.
+    /// Check that every contained pin still reads as the cleared masked
+    /// entry, every withheld pin stays masked and every SMI pin keeps the
+    /// firmware's entry.
     pub fn verify_contained(&self) -> Result<(), IrqError> {
         if self.phase.get() != FirmwarePhase::Contained {
             return Err(IrqError::Unavailable);
@@ -206,8 +230,9 @@ impl<R: Registers, P: Platform> FirmwareRoutes<R, P> {
         Ok(())
     }
 
-    /// Verify the exact original masked route before giving this line to a
-    /// new contributor. Other lines may already have independent owners.
+    /// Verify the cleared masked route before giving this line to a new
+    /// contributor. A withheld pin refuses with its reason. Other lines may
+    /// already have independent owners.
     pub fn verify_line(&self, gsi: u32) -> Result<(), IrqError> {
         if self.phase.get() != FirmwarePhase::Contained {
             return Err(IrqError::Unavailable);
@@ -215,19 +240,40 @@ impl<R: Registers, P: Platform> FirmwareRoutes<R, P> {
         let unit = &self.unit;
         unit.platform.check_process()?;
         unit.domain.check().map_err(IrqError::Delivery)?;
-        let pin = gsi.checked_sub(unit.gsi_base).ok_or(IrqError::Route)?;
-        let &(low, high) = self.entries.get(pin as usize).ok_or(IrqError::Route)?;
+        let pin = gsi
+            .checked_sub(unit.gsi_base)
+            .filter(|pin| (*pin as usize) < self.entries.len())
+            .ok_or(IrqError::Route)? as u8;
         let _guard = unit.lock();
-        if unit.firmware_entry(pin as u8)? != (low | MASK, high) {
+        if let Some(error) = unit.withheld(pin) {
+            return Err(error);
+        }
+        if unit.firmware_entry(pin)? != (MASK, 0) {
             return Err(IrqError::Route);
         }
         Ok(())
     }
 
+    /// The GSIs `contain` withheld from devices, each with its reason.
+    pub fn withheld(&self) -> impl Iterator<Item = (u32, IrqError)> + '_ {
+        let unit = &self.unit;
+        (0..unit.pins as u8).filter_map(move |pin| {
+            let _guard = unit.lock();
+            unit.withheld(pin)
+                .map(|error| (unit.gsi_base + u32::from(pin), error))
+        })
+    }
+
     fn check_masked(&self) -> Result<(), IrqError> {
         let unit = &self.unit;
-        for (pin, &(low, high)) in (0..unit.pins as u8).zip(&self.entries) {
-            if unit.firmware_entry(pin)? != (low | MASK, high) {
+        for (pin, &(low, _)) in (0..unit.pins as u8).zip(&self.entries) {
+            let (now, high) = unit.firmware_entry(pin)?;
+            let kept = match unit.withheld(pin) {
+                Some(_) if low & DELIVERY_MODE == SMI => now & CONFIG == low & CONFIG,
+                Some(_) => now & MASK != 0,
+                None => (now, high) == (MASK, 0),
+            };
+            if !kept {
                 return Err(IrqError::Route);
             }
         }
@@ -246,6 +292,8 @@ pub struct Unit<R: Registers, P: Platform> {
     pins: u16,
     held: AtomicBool,
     claims: UnsafeCell<[bool; MAX_PINS]>,
+    /// Pins the firmware containment left unusable, with the reason.
+    withheld: UnsafeCell<[Option<IrqError>; MAX_PINS]>,
     epochs: UnsafeCell<[u64; MAX_PINS]>,
     next_epoch: UnsafeCell<u64>,
     quarantined: AtomicU64,
@@ -300,6 +348,7 @@ impl<R: Registers, P: Platform> Unit<R, P> {
             pins,
             held: AtomicBool::new(false),
             claims: UnsafeCell::new([false; MAX_PINS]),
+            withheld: UnsafeCell::new([None; MAX_PINS]),
             epochs: UnsafeCell::new([0; MAX_PINS]),
             next_epoch: UnsafeCell::new(1),
             quarantined: AtomicU64::new(0),
@@ -333,11 +382,7 @@ impl<R: Registers, P: Platform> Unit<R, P> {
             .map_err(|_| IrqError::Exhausted)?;
         let _guard = self.lock();
         for pin in 0..self.pins as u8 {
-            let (low, high) = self.firmware_entry(pin)?;
-            if low & MASK == 0 && !maskable_firmware_mode(low) {
-                return Err(IrqError::Unsupported);
-            }
-            entries.push((low, high));
+            entries.push(self.firmware_entry(pin)?);
         }
         Ok(FirmwareRoutes {
             unit: self.clone(),
@@ -346,38 +391,80 @@ impl<R: Registers, P: Platform> Unit<R, P> {
         })
     }
 
+    /// The defined bits of an unclaimed pin's entry.
     fn firmware_entry(&self, pin: u8) -> Result<(u32, u32), IrqError> {
         // SAFETY: the caller holds the selector and claims lock.
         if unsafe { (*self.claims.get())[usize::from(pin)] } {
             return Err(IrqError::Route);
         }
         let low = self.low(pin)?;
-        let high = self.registers.read(0x11 + pin * 2);
-        if high == u32::MAX {
-            return Err(IrqError::FailedRead);
+        let high = self.high(pin)?;
+        Ok((low & DEFINED_LOW, high & DEFINED_HIGH))
+    }
+
+    fn withheld(&self, pin: u8) -> Option<IrqError> {
+        // SAFETY: the caller holds the selector and claims lock.
+        unsafe { (*self.withheld.get())[usize::from(pin)] }
+    }
+
+    /// Clear one non-SMI pin as Linux clear_IO_APIC_pin does: mask it,
+    /// release a Remote IRR with an EOI on a level entry (the direct EOI
+    /// register from version 0x20, else a masked edge/level flip), then
+    /// write a masked edge entry with no vector or destination. `Mask` and
+    /// `FailedRead` mean the controller cannot be contained; any other
+    /// error concerns this pin alone. The caller holds the unit lock.
+    fn clear_pin(&self, pin: u8, low: u32) -> Result<(), IrqError> {
+        let index = 0x10 + pin * 2;
+        if low & MASK == 0 {
+            self.registers.write(index, low & CONFIG | MASK);
         }
-        if low & (REMOTE_IRR | DELIVERY) != 0 {
-            return Err(IrqError::Drain);
+        let mut last = 0;
+        for _ in 0..CLEAR_TRIES {
+            let now = self.low(pin)?;
+            if now & MASK == 0 {
+                return Err(IrqError::Mask);
+            }
+            if now & REMOTE_IRR != 0 {
+                // An EOI releases Remote IRR only on a level entry.
+                let level = now & CONFIG | LEVEL;
+                if now & LEVEL == 0 {
+                    self.registers.write(index, level);
+                }
+                if self.version >= 0x20 {
+                    self.registers.write_eoi(now as u8);
+                } else {
+                    self.registers.write(index, level & !LEVEL);
+                    self.registers.write(index, level);
+                }
+            }
+            if now & (CONFIG | REMOTE_IRR) != MASK {
+                self.registers.write(index, MASK);
+            }
+            last = self.low(pin)?;
+            if last & MASK == 0 {
+                return Err(IrqError::Mask);
+            }
+            if last & DEFINED_LOW == MASK {
+                return self.clear_destination(pin);
+            }
         }
-        // An Intel PCH keeps an Extended Destination ID in bits 55:48, and
-        // firmware leaves one in entries it masked. Such an entry delivers
-        // nothing, and a claim writes the whole high word.
-        let reserved = if low & MASK != 0 {
-            0x0000_ffff
+        Err(if last & (REMOTE_IRR | DELIVERY) != 0 {
+            IrqError::Drain
         } else {
-            0x00ff_ffff
-        };
-        if low & !CONFIG != 0 || high & reserved != 0 {
-            return Err(IrqError::Unsupported);
+            IrqError::Route
+        })
+    }
+
+    /// Zero a masked idle pin's destination. The caller holds the unit lock.
+    fn clear_destination(&self, pin: u8) -> Result<(), IrqError> {
+        if self.high(pin)? & DEFINED_HIGH == 0 {
+            return Ok(());
         }
-        let vector = low as u8;
-        if matches!(low & DELIVERY_MODE, 0 | LOWEST_PRIORITY)
-            && vector >= 16
-            && self.platform.pending(vector)?
-        {
-            return Err(IrqError::Drain);
+        self.registers.write(0x11 + pin * 2, 0);
+        if self.high(pin)? & DEFINED_HIGH != 0 {
+            return Err(IrqError::Route);
         }
-        Ok((low, high))
+        Ok(())
     }
     pub fn state(&self, gsi: u32) -> Result<State, IrqError> {
         self.platform.check_cpu()?;
@@ -409,6 +496,9 @@ impl<R: Registers, P: Platform> Unit<R, P> {
         if unsafe { (*self.claims.get())[usize::from(pin)] } {
             return Err(IrqError::Route);
         }
+        if let Some(error) = self.withheld(pin) {
+            return Err(error);
+        }
         let low = self.low(pin)?;
         self.registers.write(0x10 + pin * 2, low | MASK);
         if self.low(pin)? & MASK == 0 {
@@ -429,6 +519,14 @@ impl<R: Registers, P: Platform> Unit<R, P> {
     }
     fn low(&self, pin: u8) -> Result<u32, IrqError> {
         let raw = self.registers.read(0x10 + pin * 2);
+        if raw == u32::MAX {
+            Err(IrqError::FailedRead)
+        } else {
+            Ok(raw)
+        }
+    }
+    fn high(&self, pin: u8) -> Result<u32, IrqError> {
+        let raw = self.registers.read(0x11 + pin * 2);
         if raw == u32::MAX {
             Err(IrqError::FailedRead)
         } else {
@@ -458,6 +556,9 @@ impl<R: Registers, P: Platform> Unit<R, P> {
             .filter(|p| *p < u32::from(self.pins))
             .ok_or(IrqError::Route)? as u8;
         let _guard = self.lock();
+        if let Some(error) = self.withheld(pin) {
+            return Err(error);
+        }
         let low = self.low(pin)?;
         if low & MASK == 0 || low & (REMOTE_IRR | DELIVERY) != 0 {
             return Err(IrqError::Drain);
