@@ -86,6 +86,18 @@ impl OwnedConfig {
         unsafe { self.storage.region_mut().release_bus_forwarding_seal() }
     }
 
+    /// Assert or release Secondary Bus Reset on this routing-sealed bridge,
+    /// the sealed Bridge Control word otherwise unchanged.
+    ///
+    /// # Safety
+    /// The caller owns every function below the bridge, each stopped or
+    /// contained, restores or keeps refusing each after the reset, and
+    /// releases the reset it asserted.
+    pub unsafe fn set_secondary_bus_reset(&mut self, asserted: bool) -> Result<(), ConfigError> {
+        // SAFETY: forwarded.
+        unsafe { self.storage.region_mut().set_secondary_bus_reset(asserted) }
+    }
+
     pub fn prepare(grant: DriverGrant) -> PreparedConfig<DriverGrant> {
         envelope::prepare(grant)
     }

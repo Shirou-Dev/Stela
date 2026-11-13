@@ -21,6 +21,7 @@ pub use inventory::{
 };
 mod aspm;
 pub mod assignment;
+pub mod bus_reset;
 pub mod capability;
 pub mod hotplug;
 pub mod msi;
@@ -126,6 +127,85 @@ impl Method {
             Self::PowerManagement { .. } => ResetMethod::PowerManagement,
         }
     }
+}
+
+/// What Linux's `pci_dev_save_and_disable` keeps of a function before a
+/// reset and `pci_dev_restore` writes back after it: the header after its
+/// command register, the command register, and the PCI Express device and
+/// link controls.
+struct Saved {
+    header: [u32; HEADER_REST_WORDS],
+    command: u16,
+    controls: Option<[(u16, u16); 4]>,
+}
+impl Saved {
+    /// Save the function's state, then leave only INTx disabled in its
+    /// command register.
+    fn save_and_disable<C: ConfigSpace>(
+        config: &mut C,
+        express: Option<u16>,
+    ) -> Result<Self, ConfigError> {
+        let mut header = [0; HEADER_REST_WORDS];
+        for (word, value) in header.iter_mut().enumerate() {
+            *value = config.read32(HEADER_REST + word as u16 * 4)?;
+        }
+        let command = config.read16(regs::COMMAND)?;
+        let controls = match express {
+            Some(express) => {
+                let mut controls = [(0, 0); 4];
+                for (index, control) in [
+                    EXPRESS_DEVICE_CONTROL,
+                    EXPRESS_LINK_CONTROL,
+                    EXPRESS_DEVICE_CONTROL_2,
+                    EXPRESS_LINK_CONTROL_2,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    controls[index] = (express + control, config.read16(express + control)?);
+                }
+                Some(controls)
+            }
+            None => None,
+        };
+        config.write16(regs::COMMAND, regs::COMMAND_INTX_DISABLE)?;
+        Ok(Self {
+            header,
+            command,
+            controls,
+        })
+    }
+    /// Write the saved state back, the command register last.
+    fn restore<C: ConfigSpace>(&self, config: &mut C) -> Result<(), ConfigError> {
+        for (word, value) in self.header.into_iter().enumerate() {
+            config.write32(HEADER_REST + word as u16 * 4, value)?;
+        }
+        for (control, value) in self.controls.into_iter().flatten() {
+            config.write16(control, value)?;
+        }
+        config.write16(regs::COMMAND, self.command)
+    }
+}
+
+/// Linux `pci_dev_wait`: poll the Vendor ID, waits doubling from 1 ms, until
+/// the function answers with neither all-ones nor the Configuration RRS
+/// value. False once `limit` microseconds have passed without an answer.
+fn wait_ready<C: ConfigSpace>(
+    config: &C,
+    delay: &mut impl FnMut(u64) -> Result<(), BlockError>,
+    limit: u64,
+) -> Result<bool, BlockError> {
+    let mut poll = FLR_READY_POLL_US;
+    let mut waited = 0;
+    while matches!(config.read16(regs::VENDOR_ID)?, 0xffff | VENDOR_NOT_READY) {
+        if waited >= limit {
+            return Ok(false);
+        }
+        delay(poll)?;
+        waited += poll;
+        poll *= 2;
+    }
+    Ok(true)
 }
 
 /// One ECAM window of the ACPI MCFG table.
@@ -755,32 +835,9 @@ impl<C: ConfigSpace> Function<C> {
         method: Method,
         mut delay: impl FnMut(u64) -> Result<(), BlockError>,
     ) -> Result<(), BlockError> {
-        let express = self
-            .capabilities()?
-            .into_iter()
-            .find(|&(_, id)| id == CAPABILITY_EXPRESS)
-            .map(|(offset, _)| u16::from(offset));
+        let express = self.express_offset()?;
         let mut config = transaction::Transaction::new(&mut self.config);
-        let mut header = [0; HEADER_REST_WORDS];
-        for (word, value) in header.iter_mut().enumerate() {
-            *value = config.read32(HEADER_REST + word as u16 * 4)?;
-        }
-        let command = config.read16(regs::COMMAND)?;
-        let mut controls = [(0, 0); 4];
-        if let Some(express) = express {
-            for (index, control) in [
-                EXPRESS_DEVICE_CONTROL,
-                EXPRESS_LINK_CONTROL,
-                EXPRESS_DEVICE_CONTROL_2,
-                EXPRESS_LINK_CONTROL_2,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                controls[index] = (express + control, config.read16(express + control)?);
-            }
-        }
-        config.write16(regs::COMMAND, regs::COMMAND_INTX_DISABLE)?;
+        let saved = Saved::save_and_disable(&mut config, express)?;
         match method {
             Method::FunctionLevel { express } => {
                 for attempt in 0..3 {
@@ -806,33 +863,26 @@ impl<C: ConfigSpace> Function<C> {
                 delay(D3HOT_DELAY_US)?;
             }
         }
-        let mut poll = FLR_READY_POLL_US;
-        let mut waited = 0;
-        while matches!(config.read16(regs::VENDOR_ID)?, 0xffff | VENDOR_NOT_READY) {
-            if waited >= FLR_READY_US {
-                return Err(BlockError::Unsupported(
-                    "PCI function did not return from its reset",
-                ));
-            }
-            delay(poll)?;
-            waited += poll;
-            poll *= 2;
+        if !wait_ready(&config, &mut delay, FLR_READY_US)? {
+            return Err(BlockError::Unsupported(
+                "PCI function did not return from its reset",
+            ));
         }
         if let Method::PowerManagement { power } = method
             && config.read16(power + PM_CONTROL)? & PM_STATE != 0
         {
             return Err(BlockError::Unsupported("PCI function did not enter D0"));
         }
-        for (word, value) in header.into_iter().enumerate() {
-            config.write32(HEADER_REST + word as u16 * 4, value)?;
-        }
-        if express.is_some() {
-            for (control, value) in controls {
-                config.write16(control, value)?;
-            }
-        }
-        config.write16(regs::COMMAND, command)?;
+        saved.restore(&mut config)?;
         Ok(())
+    }
+    /// The PCI Express capability's offset, from the complete checked list.
+    fn express_offset(&self) -> Result<Option<u16>, CapabilityError> {
+        Ok(self
+            .capabilities()?
+            .into_iter()
+            .find(|&(_, id)| id == CAPABILITY_EXPRESS)
+            .map(|(offset, _)| u16::from(offset)))
     }
     /// Complete checked conventional capability inventory; malformed/access
     /// failures are distinct from an absent capability.

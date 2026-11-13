@@ -187,6 +187,69 @@ fn parked_bridge_retains_the_original_route_through_promotion() {
 }
 
 #[test]
+fn a_routing_sealed_bridge_pulses_only_secondary_bus_reset() {
+    let address = test_support::ADDRESS;
+    let span = PhysicalSpan::new(test_support::physical(address), 4096).unwrap();
+    let (source, authority, _counters) = test_support::unmapped(
+        address,
+        test_support::window(address),
+        span,
+        CacheAttribute::Uncached,
+    );
+    let base = source.fixture_base().as_ptr();
+    // SAFETY: this is a private model page, kept through every access below.
+    let at = |offset: u16| unsafe { base.add(usize::from(offset)) };
+    // SAFETY: model a Type 1 header with ISA routing and a stale Discard
+    // Timer Status before attachment.
+    unsafe {
+        at(0x0e).write_volatile(1);
+        at(0x3e).cast::<u16>().write_volatile(1 << 10 | 1 << 2);
+    }
+    let prepared = UnpublishedConfig::prepare(source.into_prepublication());
+    let mapping = authority
+        .map(
+            prepared.configuration_resource().clone(),
+            0,
+            4096,
+            CacheAttribute::Uncached,
+            Protection::ReadWrite,
+        )
+        .unwrap();
+    let mut config = prepared
+        .attach(mapping)
+        .unwrap_or_else(|_| panic!("attach"));
+    config.seal_bus_master().unwrap();
+    // SAFETY: the same fixture owns the original resource and completed all
+    // old accesses.
+    let mut config = unsafe { config.promote(test_support::FixtureCustody::finish_promotion) }
+        .unwrap_or_else(|_| panic!("promotion"));
+    // Without a routing seal there is no sealed word to pulse from.
+    // SAFETY: refused before any effect.
+    let unsealed = unsafe { config.set_secondary_bus_reset(true) };
+    assert_eq!(
+        unsealed,
+        Err(ConfigError::before_effect(ConfigFailure::Address))
+    );
+    config.seal_bus_routing().unwrap();
+    assert_eq!(
+        config.try_write16(0x3e, 1 << 6 | 1 << 2),
+        Err(ConfigError::before_effect(ConfigFailure::RoutingSealed))
+    );
+    // SAFETY: this isolated model has nothing below the bridge.
+    unsafe { config.set_secondary_bus_reset(true) }.unwrap();
+    // The write left the write-one-to-clear status out.
+    assert_eq!(config.try_read16(0x3e), Ok(1 << 6 | 1 << 2));
+    // SAFETY: as above.
+    unsafe { config.set_secondary_bus_reset(false) }.unwrap();
+    assert_eq!(config.try_read16(0x3e), Ok(1 << 2));
+    // SAFETY: model hardware keeping the status bit.
+    unsafe { at(0x3e).cast::<u16>().write_volatile(1 << 10 | 1 << 2) };
+    assert_eq!(config.seal_bus_routing(), Ok(()));
+    // SAFETY: all synchronous isolated access ended.
+    unsafe { test_support::retire_owned(config) }.unwrap();
+}
+
+#[test]
 fn promotion_keeps_the_original_mapping_and_command_seal() {
     let (source, mapping, counters) = mapped();
     let retention = source.retention();
