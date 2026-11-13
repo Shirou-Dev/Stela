@@ -13,7 +13,7 @@ diff --git a/drivers/gpu/drm/nouveau/nvkm/core/subdev.c b/drivers/gpu/drm/nouvea
 index aab5a73f467a1cc4a28ef1ef6000c929d1e0b43d..6e4f97c092267f830d43fb966bf7308cace08cc5 100644
 --- a/drivers/gpu/drm/nouveau/nvkm/core/subdev.c
 +++ b/drivers/gpu/drm/nouveau/nvkm/core/subdev.c
-@@ -69,7 +69,7 @@
+@@ -69,7 +69,11 @@
  		action = "runtime";
  		break;
  	}
@@ -22,6 +22,10 @@ index aab5a73f467a1cc4a28ef1ef6000c929d1e0b43d..6e4f97c092267f830d43fb966bf7308c
  	time = ktime_to_us(ktime_get());
  
  	if (subdev->func->fini) {
++		if (subdev->name && !strcmp(subdev->name, "disp")) {
++			nvkm_info(subdev, "disp: preserving UEFI GOP display, skipping reset\n");
++			return 0;
++		}
 @@ -119,7 +119,7 @@
  	if (!subdev->func->oneinit || subdev->oneinit)
  		return 0;

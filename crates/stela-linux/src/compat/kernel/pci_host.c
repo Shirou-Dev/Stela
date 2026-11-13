@@ -142,10 +142,13 @@ static struct page *alloc_pages_op(struct device *dev, size_t size, dma_addr_t *
 {
 	unsigned int order = (unsigned int)get_order(size);
 	dev_info(dev, "alloc_pages_op: enter size=%zu order=%u dir=%d gfp=0x%x\n", size, order, (int)dir, (unsigned int)gfp);
+	dev_info(dev, "alloc_pages_op: calling alloc_pages(0x%x, %u)...\n", (unsigned int)(gfp | __GFP_ZERO), order);
 	struct page *page = alloc_pages(gfp | __GFP_ZERO, order);
+	dev_info(dev, "alloc_pages_op: alloc_pages attempt 1 finished, page=%p\n", page);
 	if (!page) {
 		dev_warn(dev, "alloc_pages_op: first attempt failed, retrying with GFP_KERNEL\n");
 		page = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+		dev_info(dev, "alloc_pages_op: alloc_pages attempt 2 finished, page=%p\n", page);
 	}
 	dev_info(dev, "alloc_pages_op: alloc_pages done, page=%p\n", page);
 

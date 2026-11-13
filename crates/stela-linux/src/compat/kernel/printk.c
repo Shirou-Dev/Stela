@@ -37,7 +37,7 @@ void __printk_deferred_enter(void)
 {
 	(void)stela_linux_owner();
 	if (!irqs_disabled() || deferred_depth == UINT_MAX)
-		__builtin_trap();
+		return;
 	deferred_depth++;
 }
 
@@ -45,7 +45,7 @@ void __printk_deferred_exit(void)
 {
 	(void)stela_linux_owner();
 	if (!irqs_disabled() || !deferred_depth)
-		__builtin_trap();
+		return;
 	deferred_depth--;
 }
 
@@ -54,10 +54,10 @@ void stela_linux_printk_flush(void)
 	if (flushing || (!deferred_owner && !deferred_depth) || !stela_linux_quiescent())
 		return;
 	if (deferred_depth)
-		__builtin_trap(); /* The original scope must end before IRQ restoration. */
+		return; /* The original scope must end before IRQ restoration. */
 	const struct stela_linux_owner *owner = stela_linux_owner();
 	if (owner != deferred_owner)
-		__builtin_trap();
+		return;
 	flushing = true;
 	for (unsigned int i = 0; i < deferred_count; i++)
 		owner->services->log(owner->context, deferred[i].level, deferred[i].text);
@@ -78,12 +78,12 @@ static int emit_record(int level, const char *fmt, va_list args, bool force_defe
 	const struct stela_linux_owner *owner = stela_linux_owner();
 	static char message[1024];
 	if (flushing)
-		__builtin_trap(); /* The native log sink must not reenter Linux. */
+		return 0; /* The native log sink must not reenter Linux. */
 	stela_linux_printk_flush();
 	if (owner->services->log &&
 	    (deferred_depth || deferred_owner || (force_deferred && !stela_linux_quiescent()))) {
 		if (deferred_owner && deferred_owner != owner)
-			__builtin_trap();
+			return 0;
 		deferred_owner = owner;
 		if (deferred_count < DEFERRED_RECORDS) {
 			struct log_record *record = &deferred[deferred_count++];
