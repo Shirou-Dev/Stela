@@ -8,11 +8,8 @@
 //! test kernel.
 //!
 //! `--payload` runs install mode on a synthetic IPSW (no Apple bytes) split
-//! onto the boot volume: `verify` checks every Erase member,
-//! `verify-archive` does so from the whole IPSW instead, `stage` and
-//! `stage-path`
-//! also partitions a blank second disk and copies them into staging, which
-//! the run then reads back on the host.
+//! onto the boot volume: `verify` checks every Erase member, and
+//! `verify-archive` does so from the whole IPSW instead.
 //!
 //! `--preboot-disk IMAGE` attaches a disk image holding an installed
 //! system's APFS Preboot volume; the mount builds the boot bundle from it at
@@ -24,17 +21,12 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Subcommand, ValueEnum};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command as Process, ExitCode, Stdio},
     time::{Duration, Instant},
-};
-use {
-    stela_formats::payload::PayloadError, stela_formats::payload::PayloadSource,
-    stela_formats::payload::ReadAt, stela_formats::payload::copy_verified,
-    stela_formats::payload::gpt, stela_formats::payload::staging::StagedSource,
 };
 
 mod audio_check;
@@ -66,12 +58,6 @@ const PACKAGED_FIRMWARE: [&str; 2] = [
     "/usr/share/OVMF/OVMF_VARS_4M.fd",
 ];
 
-/// The blank target disk of a staging run, sparse on the host.
-const TARGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-/// Its PCI slot, which fixes its UEFI device path.
-const TARGET_SLOT: u8 = 5;
-/// The serial the NVMe target reports, which `stela.cfg` names.
-const TARGET_SERIAL: &str = "STELA-TARGET-01";
 /// Small slices, so the synthetic members span several.
 const SYNTHETIC_SLICE_BYTES: u64 = 400_000;
 
@@ -385,11 +371,6 @@ enum PayloadMode {
     Verify,
     /// Verify them from the whole IPSW, read through its ZIP directory.
     VerifyArchive,
-    /// Also partition a blank NVMe disk, named by serial, and stage the
-    /// members on it.
-    Stage,
-    /// The same on a virtio disk named by device path and size.
-    StagePath,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -826,8 +807,6 @@ fn launch(arguments: Run) -> Result<ExitCode> {
     );
     machine::attach_exit(&arguments, &paths.output, &mut command);
     storage::attach_disks(
-        &arguments,
-        &paths,
         storage::DiskImages {
             disks: &disks,
             preboot: preboot.as_ref(),
@@ -1042,79 +1021,6 @@ fn verify_kernel(serial: &str) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// A byte range of a host disk image.
-struct Range {
-    file: fs::File,
-    start: u64,
-    bytes: u64,
-}
-
-impl ReadAt for Range {
-    type Error = std::io::Error;
-    fn len(&self) -> u64 {
-        self.bytes
-    }
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
-        use std::io::{Read, Seek, SeekFrom};
-        self.file.seek(SeekFrom::Start(self.start + offset))?;
-        self.file.read_exact(buffer)
-    }
-}
-
-/// Read a staging run's target disk back: its GPT, and every staged member
-/// checked against the staging header's SHA-256.
-fn staged(target: &Path) -> Result<Value> {
-    let disk = gpt::Disk {
-        block_bytes: 512,
-        blocks: fs::metadata(target)?.len() / 512,
-    };
-    let mut whole = Range {
-        file: fs::File::open(target)?,
-        start: 0,
-        bytes: disk.blocks * 512,
-    };
-    let mut header = vec![0u8; 512];
-    whole.read_at(512, &mut header)?;
-    let error = |e: PayloadError| anyhow::anyhow!("{e}");
-    let Some(info) = gpt::parse_header(disk, 1, &header).map_err(error)? else {
-        return Ok(json!({"gpt": false}));
-    };
-    let mut entries = vec![0u8; info.entry_array_bytes() as usize];
-    whole.read_at(info.entries_lba * 512, &mut entries)?;
-    let table = gpt::parse_entries(&info, &entries).map_err(error)?;
-    let partitions: Vec<Value> = table
-        .partitions
-        .iter()
-        .map(|p| {
-            json!({"role": format!("{:?}", p.role()), "first_lba": p.first_lba,
-            "last_lba": p.last_lba, "guid": p.unique_guid.to_string()})
-        })
-        .collect();
-    let staging = table
-        .partitions
-        .iter()
-        .find(|p| p.role() == Some(gpt::Role::Staging))
-        .context("no staging partition")?;
-    let mut source = StagedSource::open(Range {
-        file: fs::File::open(target)?,
-        start: staging.first_lba * 512,
-        bytes: staging.blocks() * 512,
-    })
-    .map_err(error)?;
-    let members = source.manifest().members.clone();
-    let mut buffer = vec![0u8; 1 << 20];
-    for member in &members {
-        copy_verified(&mut source, member, &mut buffer, |_| Ok::<(), ()>(()))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    Ok(json!({
-        "gpt": true,
-        "disk_guid": table.disk_guid.to_string(),
-        "partitions": partitions,
-        "members_verified": members.iter().map(|m| &m.name).collect::<Vec<_>>(),
-    }))
 }
 
 fn directory_bytes(path: &Path) -> Result<u64> {

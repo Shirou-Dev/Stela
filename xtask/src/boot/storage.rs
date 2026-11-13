@@ -1,8 +1,7 @@
 //! A run's storage: the boot volume it writes and every disk QEMU attaches.
 use super::{
-    PayloadMode, Run, SYNTHETIC_SLICE_BYTES, TARGET_BYTES, TARGET_SERIAL, TARGET_SLOT,
-    UsbDiskModel, VVFAT_BYTES, copy_bundle, directory_bytes, disks, fat_image, option_path,
-    preboot::Preboot, usb_serial,
+    PayloadMode, Run, SYNTHETIC_SLICE_BYTES, UsbDiskModel, VVFAT_BYTES, copy_bundle,
+    directory_bytes, disks, fat_image, option_path, preboot::Preboot, usb_serial,
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -20,8 +19,6 @@ pub(super) struct Paths {
     /// `\EFI\stela\source.bin`: the system-mode guest image, when the run
     /// has one.
     pub(super) source: PathBuf,
-    /// The blank disk `--payload stage` partitions and stages onto.
-    pub(super) target: PathBuf,
     /// The guest's UART log.
     pub(super) serial: PathBuf,
 }
@@ -31,7 +28,6 @@ impl Paths {
         let volume = output.join("volume");
         Self {
             source: volume.join("EFI/stela/source.bin"),
-            target: output.join("target.img"),
             serial: output.join("serial.txt"),
             volume,
             output,
@@ -78,7 +74,7 @@ pub(super) fn usb_options(arguments: &Run, options: &mut String) -> Result<()> {
 }
 
 /// `--payload`: a synthetic IPSW split onto the volume, and `options` with
-/// the install mode that reads it; staging also makes the blank target.
+/// the install mode that reads it.
 pub(super) fn payload(arguments: &Run, paths: &Paths, options: String) -> Result<String> {
     let Some(mode) = arguments.payload else {
         return Ok(options);
@@ -92,35 +88,15 @@ pub(super) fn payload(arguments: &Run, paths: &Paths, options: String) -> Result
         root: &paths.volume,
         layout: match mode {
             PayloadMode::VerifyArchive => efi::PayloadLayout::Archive,
-            _ => efi::PayloadLayout::Split,
+            PayloadMode::Verify => efi::PayloadLayout::Split,
         },
         slice_bytes: SYNTHETIC_SLICE_BYTES,
         fetch_keys: false,
     })?;
-    let mut install = format!(
-        "{options} --install-build {} --install-mode ",
+    Ok(format!(
+        "{options} --install-build {} --install-mode verify",
         efi::SYNTHETIC_BUILD
-    );
-    match mode {
-        PayloadMode::Verify | PayloadMode::VerifyArchive => install.push_str("verify"),
-        PayloadMode::Stage | PayloadMode::StagePath => {
-            fs::File::create_new(&paths.target)?.set_len(TARGET_BYTES)?;
-            let identity = match mode {
-                PayloadMode::Stage => format!("--install-target-serial {TARGET_SERIAL}"),
-                _ => format!(
-                    "--install-target-path PciRoot(0x0)/Pci({TARGET_SLOT:#x},0x0) \
-                     --install-target-bytes {TARGET_BYTES}"
-                ),
-            };
-            // A 4 GiB disk: 1 GiB cache, and an Apple region of at
-            // least 1 GiB instead of a real restore's 64 GiB.
-            install.push_str(&format!(
-                "stage {identity} \
-                 --install-cache-bytes 0x40000000 --install-min-apple-bytes 0x40000000"
-            ));
-        }
-    }
-    Ok(install)
+    ))
 }
 
 /// EFI loader, guest source bytes and boot options written to a volume.
@@ -235,34 +211,14 @@ pub(super) struct DiskImages<'a> {
     pub(super) preboot: Option<&'a Preboot>,
 }
 
-/// `--storage-check`'s disks, the Preboot disk and the staging target.
-pub(super) fn attach_disks(
-    arguments: &Run,
-    paths: &Paths,
-    images: DiskImages<'_>,
-    command: &mut Process,
-) {
+/// `--storage-check`'s disks and the Preboot disk.
+pub(super) fn attach_disks(images: DiskImages<'_>, command: &mut Process) {
     let DiskImages { disks, preboot } = images;
     for (index, disk) in disks.iter().enumerate() {
         disk.attach(index, command);
     }
     if let Some(preboot) = preboot {
         preboot.attach(command);
-    }
-    if paths.target.exists() {
-        command
-            .arg("-drive")
-            .arg(format!(
-                "if=none,id=target,format=raw,file={}",
-                option_path(&paths.target)
-            ))
-            .arg("-device")
-            .arg(match arguments.payload {
-                Some(PayloadMode::StagePath) => {
-                    format!("virtio-blk-pci,drive=target,addr={TARGET_SLOT:#x}")
-                }
-                _ => format!("nvme,drive=target,serial={TARGET_SERIAL},addr={TARGET_SLOT:#x}"),
-            });
     }
 }
 

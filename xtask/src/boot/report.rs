@@ -1,9 +1,9 @@
 //! A run's report: what the guest printed checked against what the run
 //! asked for, written to `run.json`, and the run's exit code.
 use super::{
-    FAILED_EXIT, IDLE_EXIT, PayloadMode, Run, TIMEOUT_EXIT, audio_check, binding, disks,
-    first_guest_panic, first_unsupported, host_firmware, network, preboot::Preboot,
-    qemu_accelerator, staged, storage::Paths, verify_kernel,
+    FAILED_EXIT, IDLE_EXIT, Run, TIMEOUT_EXIT, audio_check, binding, disks, first_guest_panic,
+    first_unsupported, host_firmware, network, preboot::Preboot, qemu_accelerator, storage::Paths,
+    verify_kernel,
 };
 use anyhow::{Result, bail, ensure};
 use serde_json::{Value, json};
@@ -160,10 +160,7 @@ pub(super) fn finish(arguments: &Run, outcome: Outcome) -> Result<ExitCode> {
         "first_guest_panic": first_guest_panic(&serial_text),
         "returncode": code,
         "qemu_returncode": qemu_returncode,
-        "payload": arguments.payload.map(|mode| {
-            matches!(mode, PayloadMode::Stage | PayloadMode::StagePath)
-        }),
-        "staging": paths.target.exists().then(|| staged(&paths.target)).transpose()?,
+        "payload": arguments.payload.is_some(),
         "timed_out": status.is_none(),
         "wall_seconds": started.elapsed().as_secs_f64(),
         "outputs": outputs,

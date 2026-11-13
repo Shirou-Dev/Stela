@@ -432,7 +432,8 @@ pub fn take_over(
     options: Vec<u8>,
     host_firmware: crate::host_firmware::Resources,
 ) -> Result<(Handoff, Tables)> {
-    // Install mode stages a payload and stops here; otherwise nothing changes.
+    // Install mode verifies a payload and stops here; otherwise nothing
+    // changes.
     let options = crate::payload::run(options)?;
     let text = core::str::from_utf8(&options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     if !crate::storage::split(text)?.2.is_empty() {

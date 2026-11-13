@@ -2,11 +2,10 @@
 //! stored on removable media, and verified reads of them.
 //!
 //! `stela-dev efi install --ipsw` writes a payload manifest beside the members,
-//! either as split slices for FAT32 or as the whole IPSW. `stela.efi` reads
-//! either form before boot services end, verifies every member's SHA-256
-//! and copies the Erase subset into the target disk's staging partition.
-//! The restore client reads the staged copy through the same
-//! [`PayloadSource`] trait afterwards.
+//! either as split slices for FAT32 or as the whole IPSW. `stela.efi`'s
+//! install mode reads either form before boot services end, through the
+//! [`PayloadSource`] trait, and verifies the SHA-256 of every member of the
+//! Erase subset.
 //!
 //! `stela setup` writes the install medium instead: the whole IPSW as
 //! numbered pieces below FAT32's file limit ([`Layout::Pieces`]), which
@@ -25,7 +24,6 @@ use stela_crypto::digest::Digest;
 
 pub mod gpt;
 pub mod pieces;
-pub mod staging;
 pub mod zip;
 
 pub const KIND: &str = "stela_restore_payload";
@@ -52,7 +50,7 @@ const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PayloadError {
-    /// The manifest or a staging header is malformed or inconsistent.
+    /// The manifest is malformed or inconsistent.
     Manifest(&'static str),
     Archive(&'static str),
     Unsupported(&'static str),
@@ -217,7 +215,8 @@ pub enum Layout {
     Split { slice_bytes: u64 },
     /// The whole IPSW at `path`, relative to the volume root.
     Archive { path: String },
-    /// Members in a staging partition.
+    /// A subset of another manifest's members, which names no place of
+    /// its own ([`PayloadManifest::erase_subset`]).
     Staged,
     /// The whole IPSW as `ipsw.NNN` pieces beside the manifest, each
     /// `piece_bytes` but the last; their concatenation is the IPSW.
@@ -553,7 +552,7 @@ impl PayloadManifest {
     }
 
     /// The members a full restore needs: the Erase identity's and the
-    /// global manifests, in manifest order, laid out for staging.
+    /// global manifests, in manifest order.
     pub fn erase_subset(&self) -> Result<Self, PayloadError> {
         let erase: Vec<&IdentitySet> = self
             .identities
