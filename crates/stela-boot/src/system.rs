@@ -24,7 +24,7 @@ use stela_boot_core::options::{DEFAULT_WIFI_KEY, System};
 use stela_contracts::refuse;
 use stela_engine::machine::mmu::placement::Placement;
 use stela_runtime::pc;
-use stela_runtime::pc::disk_plan::Plan;
+use stela_runtime::pc::disk_writes::Pending;
 use stela_runtime::pc::gpt::Guid;
 use uefi::{
     boot::{self, AllocateType, MemoryType},
@@ -560,8 +560,9 @@ fn log_stale(stale: stela_boot_core::chosen_disk::Stale) {
 }
 
 /// Why the default boot, `options`, can only wait for a restore, checked
-/// before the startup menu opens so that the menu starts there.
-pub fn held_at_start(options: &[u8]) -> Option<&'static str> {
+/// before the startup menu opens so that the menu starts there. `pending`
+/// is the disk work decided so far.
+pub fn held_at_start(options: &[u8], pending: &Pending) -> Option<&'static str> {
     if !options.starts_with(b"--system") {
         return None;
     }
@@ -569,7 +570,7 @@ pub fn held_at_start(options: &[u8]) -> Option<&'static str> {
         return Some("No disk is chosen for macOS yet: choose Install macOS first.");
     }
     crate::status::begin("Checking the internal SSD and NVRAM");
-    let (held, found) = match crate::selection::peek(options.to_vec()) {
+    let (held, found) = match crate::selection::peek(options.to_vec(), pending) {
         Err(refusal @ Refusal::BlankDisk) => (Some(held(refusal)), "no macOS installed yet"),
         Err(refusal @ Refusal::RecoveryMode) => (Some(held(refusal)), "an install did not finish"),
         Err(refusal @ Refusal::NoRecovery { .. }) => (Some(held(refusal)), "no recoveryOS to boot"),
@@ -584,13 +585,14 @@ pub fn held_at_start(options: &[u8]) -> Option<&'static str> {
 }
 
 /// Run the engine; never returns.
-/// `plan` is the change the disk picker planned for the disk `options`
-/// name, which the engine's drivers make (`pc::disk_plan`). `log` is the
-/// partition holding the USB's boot log, when the loader keeps one there
+/// `pending` is the disk work decided so far, which the engine's drivers
+/// do (`pc::disk_writes`): the change the disk picker planned for the disk
+/// `options` name, and the partition updates. `log` is the partition
+/// holding the USB's boot log, when the loader keeps one there
 /// (`log_file`).
 pub(crate) fn boot(
     mut options: Vec<u8>,
-    mut plan: Option<Plan>,
+    mut pending: Pending,
     mut volume: FileSystem,
     log: Option<Guid>,
     host_firmware: crate::host_firmware::Resources,
@@ -601,7 +603,7 @@ pub(crate) fn boot(
     // waits for a restore host, until one that boots is chosen.
     let options = loop {
         crate::status::begin("Reading the startup request in NVRAM");
-        let routed = crate::selection::route(options, plan.as_ref());
+        let routed = crate::selection::route(options, &mut pending);
         crate::status::done("");
         match routed {
             Ok(routed) => break routed,
@@ -611,14 +613,18 @@ pub(crate) fn boot(
                     log_stale(*stale);
                 }
                 // The new choice replaces the options and their plan: a
-                // plan dropped here wrote nothing.
-                crate::choice::Chosen { options, plan } =
-                    crate::choice::hold(&mut volume, held(refusal)).unwrap_or_else(|| {
+                // plan dropped here wrote nothing. The NVRAM consumed for
+                // the refused boot stays consumed, unless the new plan
+                // makes its partition afresh.
+                let chosen = crate::choice::hold(&mut volume, held(refusal), &pending)
+                    .unwrap_or_else(|| {
                         output::fatal(
                             "the machine can only be restored and this volume has no startup \
                              choices to restore it from",
                         )
                     });
+                options = chosen.options;
+                pending.replace_plan(chosen.plan);
                 if !options.starts_with(b"--system") {
                     output::fatal("the chosen startup option is not a system-mode boot");
                 }
@@ -632,7 +638,7 @@ pub(crate) fn boot(
     let result = inputs.and_then(|inputs| {
         load(
             options,
-            plan,
+            pending,
             inputs,
             log,
             host_firmware,
@@ -706,7 +712,7 @@ fn translation_store(
 
 fn load(
     options: Vec<u8>,
-    plan: Option<Plan>,
+    pending: Pending,
     inputs: Inputs,
     log: Option<Guid>,
     host_firmware: crate::host_firmware::Resources,
@@ -723,7 +729,7 @@ fn load(
     let system = System::parse(text).map_err(stela_boot_core::options::Error::message)?;
     // The engine's drivers apply the plan to the `--storage` partition's
     // disk and no other.
-    if let Some(plan) = &plan
+    if let Some(plan) = &pending.plan
         && !system
             .storage
             .as_ref()
@@ -734,7 +740,11 @@ fn load(
              nothing was written to it"
         ));
     }
-    let disk_plan = plan.map(|plan| plan.encode()).unwrap_or_default();
+    let disk_writes = if pending.is_empty() {
+        Vec::new()
+    } else {
+        pending.encode()
+    };
     let (native_processors, available_cores) = crate::native_smp::firmware::capture_inventory()
         .map_err(crate::native_smp::firmware::Error::message)?;
     let cores = system.assigned_native_cores(available_cores, bundle_pes)?;
@@ -813,8 +823,8 @@ fn load(
         source: source_region,
         files,
         file_count,
-        disk_plan,
-    } = handoff_phase::retain_files(options, source, bundle, disk_plan)?;
+        disk_writes,
+    } = handoff_phase::retain_files(options, source, bundle, disk_writes)?;
     let handoff = handoff_page.physical as *mut Handoff;
     let engine_entry =
         layout::image() + (crate::engine::entry as *const () as u64 - image.start as u64);
@@ -954,7 +964,7 @@ fn load(
         handoff.write(Handoff {
             magic: MAGIC,
             options: options_region,
-            disk_plan,
+            disk_writes,
             random_seed,
             source: source_region,
             files,

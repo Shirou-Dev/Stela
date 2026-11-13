@@ -5,8 +5,8 @@ use stela_contracts::refuse;
 
 pub(super) struct RetainedFiles {
     pub options: Region,
-    /// The encoded disk plan; empty without one.
-    pub disk_plan: Region,
+    /// The encoded pending disk work; empty without any.
+    pub disk_writes: Region,
     pub source: Region,
     pub files: [File; MAX_FILES],
     pub file_count: usize,
@@ -17,7 +17,7 @@ pub(super) fn retain_files(
     options: Vec<u8>,
     source: Vec<u8>,
     bundle: BundleFiles,
-    disk_plan: Vec<u8>,
+    disk_writes: Vec<u8>,
 ) -> Result<RetainedFiles> {
     let options_region = Region {
         physical: options.as_ptr() as u64,
@@ -27,9 +27,9 @@ pub(super) fn retain_files(
         physical: source.as_ptr() as u64,
         bytes: source.len() as u64,
     };
-    let disk_plan_region = Region {
-        physical: disk_plan.as_ptr() as u64,
-        bytes: disk_plan.len() as u64,
+    let disk_writes_region = Region {
+        physical: disk_writes.as_ptr() as u64,
+        bytes: disk_writes.len() as u64,
     };
     let mut files = [File::default(); MAX_FILES];
     for (slot, (name, contents)) in files.iter_mut().zip(&bundle) {
@@ -45,10 +45,10 @@ pub(super) fn retain_files(
     core::mem::forget(options);
     core::mem::forget(source);
     core::mem::forget(bundle);
-    core::mem::forget(disk_plan);
+    core::mem::forget(disk_writes);
     Ok(RetainedFiles {
         options: options_region,
-        disk_plan: disk_plan_region,
+        disk_writes: disk_writes_region,
         source: source_region,
         files,
         file_count,

@@ -41,6 +41,7 @@ use stela_drivers::{
 use stela_runtime::pc::{
     device_starts,
     disk_plan::{LocateError, Plan},
+    disk_writes::{Pending, Purpose, Update},
     failure_record,
     gpt::{Guid, PartitionDevice},
     machine_state,
@@ -1424,9 +1425,11 @@ impl HostDisks {
 pub struct Selection<'a> {
     /// The guest's disks, in order: one service each.
     pub targets: &'a [&'a Target],
-    /// The change Install macOS's disk picker planned for one target's
-    /// disk, made before the targets are looked up ([`prepare`]).
-    pub plan: Option<&'a Plan>,
+    /// The disk work decided before the firmware exited: the change Install
+    /// macOS's disk picker planned for one target's disk, made before the
+    /// targets are looked up ([`prepare`]), and the updates of the targets'
+    /// partitions, made once they are found ([`update`]).
+    pub pending: &'a Pending,
     /// The install medium, by its GUID.
     pub medium: Option<Guid>,
     /// The installed system `--preboot` names.
@@ -1461,7 +1464,7 @@ pub struct Selection<'a> {
 /// Open the explicitly selected partitions in the loader's identity root
 /// `root` ([`RestoreRoot`]), and bring up every host input device and
 /// network adapter. No guessed disk/partition, and no writes at open but
-/// the selection's disk plan ([`prepare`]). Ownership lasts
+/// the selection's pending disk work ([`prepare`], [`update`]). Ownership lasts
 /// with the returned services. Probe once for all consumers;
 /// do not reset a controller or reuse its DMA pages for a second probe.
 ///
@@ -1481,7 +1484,7 @@ pub unsafe fn open(
 ) -> Result<Opened, Refused> {
     let Selection {
         targets,
-        plan,
+        pending,
         medium,
         preboot,
         store,
@@ -1649,7 +1652,7 @@ pub unsafe fn open(
         let mut pause = |us| clock.delay(us);
         // The picker's plan first: the partition it makes is one the
         // search below looks for.
-        let prepared = match plan {
+        let prepared = match &pending.plan {
             Some(plan) => {
                 // Still the device start: its steps' lines are stored
                 // between two drivers' calls, as each device's are.
@@ -1669,14 +1672,24 @@ pub unsafe fn open(
             None => Ok(()),
         };
         let waited = prepared.map(|()| {
-            storage::wait_for_named(
+            let waited = storage::wait_for_named(
                 &mut devices.disks,
                 &required,
                 storage::PATIENCE,
                 &mut now_us,
                 &mut look,
                 &mut pause,
-            )
+            );
+            // The updates next, before any partition is opened for the
+            // engine to read: their partitions are found by now, or are
+            // missing, as the open below reports.
+            if !pending.updates.is_empty() {
+                STARTING_GS.store(this_gs(), Ordering::Release);
+                update(&pending.updates, targets, &mut devices.disks);
+                observer.store();
+                STARTING_GS.store(0, Ordering::Release);
+            }
+            waited
         });
         for found in late {
             devices.absorb_usb(None, found, firmware);
@@ -2112,6 +2125,58 @@ fn prepare(
             name,
             %error
         ))),
+    }
+}
+
+/// Make the partition updates decided before the firmware exited
+/// (`pc::disk_writes`), in their order, with each disk's driver: the NVRAM
+/// bank without the one-shot variables this boot consumed, and the clearing
+/// of a failure record the loader copied into the log. Called once a boot,
+/// after the plan's change and the wait for the boot's partitions, before
+/// any of them is opened; every wait in it is the driver's own bounded one
+/// for a single command.
+///
+/// An update that cannot be made is reported once and the boot goes on, as
+/// it does when the disk keeps none of the machine state's writes
+/// (`nor`): the disk then holds what it held. For the NVRAM bank that is
+/// the one-shot variables, which this boot has acted on and the next start
+/// acts on again; for the failure record, the record, which the next start
+/// copies into the log again. An update for a partition this boot does not
+/// use is not made: only the boot's targets are written.
+fn update(updates: &[Update], targets: &[&Target], disks: &mut [Box<dyn BlockDevice>]) {
+    for update in updates {
+        let Update {
+            target, purpose, ..
+        } = update;
+        let result = if targets.contains(&target) {
+            update.apply(disks).map_err(|error| format!("{error}"))
+        } else {
+            Err(String::from("this boot does not use the partition"))
+        };
+        let (serial, partition) = (target.serial.as_str(), target.partition);
+        match (purpose, result) {
+            (Purpose::NvramBank, Ok(())) => output::arguments(format_args!(
+                "NVRAM saved the bank without the consumed variables on {serial}:{partition}, \
+                 {} sectors\n",
+                update.pieces.len()
+            )),
+            (Purpose::NvramBank, Err(why)) => {
+                output::arguments(format_args!(
+                    "NVRAM bank not saved on {serial}:{partition}: {why}. The variables this \
+                     boot consumed stay, and the next start acts on them again\n"
+                ));
+                crate::status::info(
+                    "NVRAM's startup request could not be cleared: the next start repeats it",
+                );
+            }
+            (Purpose::FailureRecord, Ok(())) => output::arguments(format_args!(
+                "PREVIOUS BOOT record cleared on {serial}:{partition}\n"
+            )),
+            (Purpose::FailureRecord, Err(why)) => output::arguments(format_args!(
+                "PREVIOUS BOOT record not cleared on {serial}:{partition}: {why}. The next \
+                 start copies it again\n"
+            )),
+        }
     }
 }
 

@@ -31,7 +31,7 @@ use stela_contracts::refuse;
 use stela_loader::mount_interface::{
     CHOICES_FILE, CHOSEN_DISK, ChoiceKind, Choices, DISK_FILE, Opening, opening, with_disk,
 };
-use stela_runtime::pc::disk_plan::Plan;
+use stela_runtime::pc::{disk_plan::Plan, disk_writes::Pending};
 use uefi::{
     CString16,
     boot::{self, EventType, TimerTrigger, Tpl},
@@ -221,8 +221,18 @@ struct Menu<'a> {
 
 impl<'a> Menu<'a> {
     /// The menu of `choices`: those that can start now, then the firmware's
-    /// entries. `held` is why the machine can only be set up.
-    fn new(choices: &'a Choices, held: Option<&'a str>, disk: Option<String>) -> Self {
+    /// entries. An entry is checked on its disk as choosing it leaves the
+    /// `pending` work: the updates done and no plan, which a choice
+    /// replaces. `held` is why the machine can only be set up.
+    fn new(
+        choices: &'a Choices,
+        held: Option<&'a str>,
+        disk: Option<String>,
+        pending: &Pending,
+    ) -> Self {
+        let mut pending = pending.clone();
+        pending.replace_plan(None);
+        let pending = &pending;
         // A choice on a disk not chosen yet waits for Install macOS.
         let resolved: Vec<Option<String>> = choices
             .entries
@@ -234,7 +244,7 @@ impl<'a> Menu<'a> {
             .iter()
             .zip(&resolved)
             .map(|(entry, options)| match options {
-                Some(options) => selection::ready(options, entry.kind()),
+                Some(options) => selection::ready(options, entry.kind(), pending),
                 None => Readiness::Unprepared,
             })
             .collect();
@@ -523,10 +533,16 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
 
 /// What to boot: the chosen entry's options, or `options` (`stela.cfg`).
 /// `held` is why the default boot can only wait for the setup restore, when
-/// it can.
-pub fn choose(volume: &mut FileSystem, options: Vec<u8>, held: Option<&str>) -> Chosen {
+/// it can. `pending` is the disk work decided so far, which the entries'
+/// disks are read with (`selection::ready`).
+pub fn choose(
+    volume: &mut FileSystem,
+    options: Vec<u8>,
+    held: Option<&str>,
+    pending: &Pending,
+) -> Chosen {
     if let Some(reason) = held {
-        return hold(volume, reason).unwrap_or(options.into());
+        return hold(volume, reason, pending).unwrap_or(options.into());
     }
     let Some(choices) = read(volume) else {
         return options.into();
@@ -535,7 +551,7 @@ pub fn choose(volume: &mut FileSystem, options: Vec<u8>, held: Option<&str>) -> 
     if choices.timeout_seconds == 0 && pressed().is_none() {
         return chosen(&choices, 0, chosen_disk(volume).as_deref()).into();
     }
-    let opened = Menu::new(&choices, None, chosen_disk(volume));
+    let opened = Menu::new(&choices, None, chosen_disk(volume), pending);
     if opened.glance
         && !asked()
         && let Some(Item::Choice(n, _)) = opened.items.first()
@@ -551,9 +567,9 @@ pub fn choose(volume: &mut FileSystem, options: Vec<u8>, held: Option<&str>) -> 
 /// setup entry starts highlighted; any entry may be chosen, and one that
 /// cannot boot either returns here. Returns what the chosen entry boots;
 /// `None` when the volume has no choices or no console input to choose with.
-pub fn hold(volume: &mut FileSystem, reason: &str) -> Option<Chosen> {
+pub fn hold(volume: &mut FileSystem, reason: &str, pending: &Pending) -> Option<Chosen> {
     let choices = read(volume)?;
     output::arguments(format_args!("HOLD {reason}\n"));
-    let held = Menu::new(&choices, Some(reason), chosen_disk(volume));
+    let held = Menu::new(&choices, Some(reason), chosen_disk(volume), pending);
     menu(volume, &choices, held)
 }

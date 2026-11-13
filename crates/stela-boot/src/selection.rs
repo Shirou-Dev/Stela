@@ -2,8 +2,9 @@
 //! `stela.efi` reads the persistent NOR's current NVRAM bank (`--nor
 //! SERIAL:GUID`) through the firmware's block I/O, chooses macOS or
 //! recoveryOS as `stela_loader::boot_selection` does, removes the one-shot
-//! variables that boot consumes (saving the next bank, as LLB saves NVRAM
-//! before it boots) and hands the engine the options for that boot. A macOS
+//! variables that boot consumes (the next bank is saved before the engine
+//! reads the NOR, as LLB saves NVRAM before it boots) and hands the engine
+//! the options for that boot. A macOS
 //! boot whose Preboot disk holds no installed system boots System Recovery
 //! instead (missing boot media), as a Mac with an erased disk does. A
 //! recoveryOS boot takes the disk's own copy, the paired recoveryOS of the
@@ -22,12 +23,16 @@
 //! (`pc::machine_state`), and the Preboot disk is the rest, as the engine
 //! splits it.
 //!
-//! A partition Install macOS's disk picker has just planned
-//! (`pc::disk_plan`) is not on its disk yet, or not blank yet: Stela's
-//! drivers make it after the firmware has exited. Every search here takes
-//! the pending plan ([`Pending`]) and finds that partition as the plan
-//! leaves it: where the plan puts it, the blocks the plan zeroes reading as
-//! zero, and no write taken.
+//! Nothing here writes a disk: the firmware's block I/O only reads. What a
+//! boot changes on a PC disk before the firmware exits is pending work
+//! (`pc::disk_writes`), which Stela's drivers do after it: the partition
+//! Install macOS's disk picker has just planned, which is not on its disk
+//! yet, or not blank yet; the NVRAM bank saved without the consumed
+//! variables; a failure record cleared. Every search here takes the pending
+//! work and reads a partition as that work leaves it: where the plan puts
+//! it, the blocks the plan zeroes reading as zero, and the bytes of the
+//! pending updates in place. So a boot routed again after a refusal finds
+//! the variables it consumed gone, as it would on the disk.
 use crate::Result;
 use crate::{
     output,
@@ -54,14 +59,17 @@ use {
     stela_formats::payload::ReadAt, stela_formats::payload::gpt, stela_formats::payload::gpt::Disk,
     stela_formats::payload::gpt::Role, stela_formats::preboot,
     stela_formats::preboot::PrebootError, stela_runtime::pc::disk_plan::Plan,
+    stela_runtime::pc::disk_writes::Pending, stela_runtime::pc::disk_writes::Piece,
+    stela_runtime::pc::disk_writes::Purpose, stela_runtime::pc::disk_writes::Update,
     stela_runtime::pc::failure_record, stela_runtime::pc::machine_state,
     stela_runtime::pc::storage::Target, stela_soc_data::nor::CAPACITY, stela_soc_data::nor::Image,
     stela_soc_data::nor::SECTOR_SIZE, stela_soc_data::nor::nvram::Variables,
     stela_soc_data::nor::nvram::empty_bank,
 };
 
-/// One GPT partition, through its whole disk's block I/O.
-struct Partition {
+/// One GPT partition, or a part of it, read through its whole disk's block
+/// I/O.
+struct Partition<'a> {
     io: ScopedProtocol<BlockIO>,
     media: u32,
     block_bytes: u64,
@@ -70,11 +78,18 @@ struct Partition {
     /// The disk's blocks a pending plan zeroes, which read as zero already;
     /// empty for a partition found on its disk.
     zeroed: Vec<Extent>,
+    /// The partition this is, or is a part of, and the pending work whose
+    /// updates of it read as applied; `None` for a whole disk.
+    named: Option<Named<'a>>,
 }
 
-/// The change Install macOS's disk picker planned for this boot, which is
-/// not on the disk yet.
-pub type Pending<'a> = Option<&'a Plan>;
+/// A partition `stela.cfg` names, as a search found it.
+struct Named<'a> {
+    target: Target,
+    /// The whole partition's first block on its disk.
+    first_lba: u64,
+    pending: &'a Pending,
+}
 
 /// Which part of a partition that also holds the machine state in its tail.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -86,7 +101,7 @@ enum Part {
     State,
 }
 
-impl Partition {
+impl Partition<'_> {
     /// Confine the partition to `part`, as the engine splits it.
     fn confine(&mut self, part: Part) -> Result<()> {
         if part == Part::Whole {
@@ -124,34 +139,26 @@ impl Partition {
                 buffer[bytes(from)..to].fill(0);
             }
         }
+        if let Some(named) = &self.named {
+            let offset = (first - named.first_lba) * self.block_bytes;
+            named.pending.lay(&named.target, offset, buffer);
+        }
         Ok(())
     }
 
-    /// Whether the partition is on its disk, not only in a pending plan.
-    fn on_disk(&self) -> bool {
-        self.zeroed.is_empty()
-    }
-
-    fn write_sector(&mut self, offset: usize, sector: &[u8]) -> Result<()> {
-        if !self.on_disk() {
-            return Err(refuse!(
-                "the partition is not made yet: nothing is written to it before Stela's drivers \
-                 make it"
-            ));
-        }
-        let mut buffer = Aligned::new(SECTOR_SIZE);
-        buffer.bytes().copy_from_slice(sector);
-        let lba = self.first_lba + offset as u64 / self.block_bytes;
-        self.io
-            .write_blocks(self.media, lba, buffer.bytes())
-            .map_err(|_| refuse!("cannot write the NOR partition"))
+    /// Where this part starts, in bytes from the start of the partition
+    /// `stela.cfg` names.
+    fn offset(&self) -> u64 {
+        self.named.as_ref().map_or(0, |named| {
+            (self.first_lba - named.first_lba) * self.block_bytes
+        })
     }
 }
 
 /// The largest firmware read, so a large APFS read needs no huge buffer.
 const TRANSFER_BYTES: u64 = 1 << 20;
 
-impl ReadAt for Partition {
+impl ReadAt for Partition<'_> {
     type Error = stela_contracts::Refusal;
 
     fn len(&self) -> u64 {
@@ -180,11 +187,11 @@ impl ReadAt for Partition {
     }
 }
 
-/// Open `handle`'s block I/O for reading and, on the NOR partition only,
-/// writing. Not exclusive: the disk's other partitions, such as the ESP
-/// this image was loaded from, stay connected.
+/// Open `handle`'s block I/O for reading. Not exclusive: the disk's other
+/// partitions, such as the ESP this image was loaded from, stay connected.
 fn block_io(handle: Handle) -> Option<ScopedProtocol<BlockIO>> {
-    // SAFETY: Stela reads the named partitions and writes only the NOR's.
+    // SAFETY: Stela only reads through the protocol, and no driver's use of
+    // the disk is disturbed by a read.
     unsafe {
         boot::open_protocol::<BlockIO>(
             OpenProtocolParams {
@@ -247,7 +254,7 @@ pub(crate) fn disk_controllers(serials: &[&str]) -> Vec<stela_drivers::bus::pci:
 }
 
 /// The whole disk behind `io` and its GPT.
-fn table(io: ScopedProtocol<BlockIO>) -> Result<(Partition, gpt::Table)> {
+fn table<'a>(io: ScopedProtocol<BlockIO>) -> Result<(Partition<'a>, gpt::Table)> {
     let media = io.media();
     let disk = Disk {
         block_bytes: media.block_size() as u64,
@@ -261,10 +268,10 @@ fn table(io: ScopedProtocol<BlockIO>) -> Result<(Partition, gpt::Table)> {
         first_lba: 0,
         bytes: disk.blocks * disk.block_bytes,
         zeroed: Vec::new(),
+        named: None,
     };
     // The backup table stands in for a primary an interrupted write left
-    // damaged (`gpt::read`); selecting a boot only reads, so the repair is
-    // left to the next staging run.
+    // damaged (`gpt::read`); selecting a boot only reads.
     let found = gpt::read(disk, |lba, blocks| {
         let mut bytes = vec![0u8; (blocks * disk.block_bytes) as usize];
         whole
@@ -282,7 +289,7 @@ fn table(io: ScopedProtocol<BlockIO>) -> Result<(Partition, gpt::Table)> {
 /// The partition the pending `plan` makes, on the disk behind `io`: where
 /// the plan puts it, with the blocks the plan zeroes reading as zero. The
 /// disk must be as the picker saw it.
-fn planned(io: ScopedProtocol<BlockIO>, plan: &Plan) -> Result<Partition> {
+fn planned<'a>(io: ScopedProtocol<BlockIO>, plan: &Plan) -> Result<Partition<'a>> {
     let media = io.media();
     let disk = Disk {
         block_bytes: media.block_size() as u64,
@@ -301,17 +308,27 @@ fn planned(io: ScopedProtocol<BlockIO>, plan: &Plan) -> Result<Partition> {
         first_lba: plan.partition.first_lba,
         bytes: plan.partition.blocks * disk.block_bytes,
         zeroed: plan.zero.clone(),
+        named: None,
     })
 }
 
 /// The partition `target` names, as the engine finds it, or what was found
-/// instead (`chosen_disk::Search`); the partition a `pending` plan is for,
-/// as the engine finds it once the plan is applied ([`planned`]). Fails
-/// only when the disks cannot be listed or the plan's disk has changed.
-fn search(
+/// instead (`chosen_disk::Search`); the partition the `pending` plan is
+/// for, as the engine finds it once the plan is applied ([`planned`]).
+/// Either reads with its pending updates applied. Fails only when the disks
+/// cannot be listed or the plan's disk has changed.
+fn search<'a>(
     target: &Target,
-    pending: Pending<'_>,
-) -> Result<core::result::Result<Partition, Search>> {
+    pending: &'a Pending,
+) -> Result<core::result::Result<Partition<'a>, Search>> {
+    let named = |mut partition: Partition<'a>| {
+        partition.named = Some(Named {
+            target: target.clone(),
+            first_lba: partition.first_lba,
+            pending,
+        });
+        partition
+    };
     let mut disks: Vec<_> = whole_disks()?
         .into_iter()
         .filter(|(serial, _)| serial.as_deref() == Some(target.serial.as_str()))
@@ -321,8 +338,8 @@ fn search(
         1 => disks.remove(0).1,
         _ => return Ok(Err(Search::SeveralDisks)),
     };
-    if let Some(plan) = pending.filter(|plan| plan.is_for(target)) {
-        return planned(io, plan).map(Ok);
+    if let Some(plan) = pending.plan.as_ref().filter(|plan| plan.is_for(target)) {
+        return planned(io, plan).map(named).map(Ok);
     }
     // A table that cannot be read is a blank or wiped disk to a boot.
     let Ok((mut whole, table)) = table(io) else {
@@ -343,10 +360,10 @@ fn search(
     }
     whole.first_lba = partition.first_lba;
     whole.bytes = partition.blocks() * whole.block_bytes;
-    Ok(Ok(whole))
+    Ok(Ok(named(whole)))
 }
 
-fn find(target: &Target, pending: Pending<'_>) -> Result<Partition> {
+fn find<'a>(target: &Target, pending: &'a Pending) -> Result<Partition<'a>> {
     search(target, pending)?.map_err(|found| match found {
         Search::NoDisk | Search::SeveralDisks => refuse!("not exactly one disk has the serial"),
         Search::NoTable => refuse!("the disk has no valid GPT"),
@@ -358,39 +375,31 @@ fn find(target: &Target, pending: Pending<'_>) -> Result<Partition> {
     })
 }
 
-/// Copy into the log, once, the record a previous start left in the machine
-/// state of the partition `options` name for it (`--storage` and `--nor`
-/// alike) when the USB's own log was out of reach of Stela's drivers
-/// (`failure_record`), then clear it.
-pub fn carry_failure_record(options: &[u8]) {
-    let Ok(text) = core::str::from_utf8(options) else {
-        return;
-    };
+/// The bytes zeroed to clear a failure record: its header, in whole blocks
+/// of any disk (`failure_record::OFFSET`).
+const RECORD_CLEAR_BYTES: usize = 4096;
+
+/// Copy into the log the record a previous start left in the machine state
+/// of the partition `options` name for it (`--storage` and `--nor` alike)
+/// when the USB's own log was out of reach of Stela's drivers
+/// (`failure_record`). Returns the update that clears it, which Stela's
+/// drivers make when this boot starts them on that partition; a boot that
+/// does not leaves the record, and the next start copies it again.
+pub fn carry_failure_record(options: &[u8]) -> Option<Update> {
+    let text = core::str::from_utf8(options).ok()?;
     let storage = option(text, "--storage");
-    let Some(target) = storage
+    let target = storage
         .filter(|_| option(text, "--nor") == storage)
-        .and_then(|name| name.parse::<Target>().ok())
-    else {
-        return;
-    };
-    // Before the startup menu: no plan is pending, and the partition is
-    // written only as it is on the disk.
-    let Ok(Ok(mut partition)) = search(&target, None) else {
-        return;
-    };
-    if partition.confine(Part::State).is_err() {
-        return;
-    }
+        .and_then(|name| name.parse::<Target>().ok())?;
+    // Before the startup menu: nothing is pending yet.
+    let pending = Pending::default();
+    let mut partition = search(&target, &pending).ok()?.ok()?;
+    partition.confine(Part::State).ok()?;
     let mut region = vec![0u8; failure_record::BYTES as usize];
-    if partition
+    partition
         .read_at(failure_record::OFFSET, &mut region)
-        .is_err()
-    {
-        return;
-    }
-    let Some(record) = failure_record::decode(&region) else {
-        return;
-    };
+        .ok()?;
+    let record = failure_record::decode(&region)?;
     output::arguments(format_args!(
         "PREVIOUS BOOT failed where the USB's log was out of reach; the chosen disk kept:\n"
     ));
@@ -398,35 +407,28 @@ pub fn carry_failure_record(options: &[u8]) {
         output::arguments(format_args!("PREVIOUS BOOT {line}\n"));
     }
     // A zero header clears the record.
-    let block = partition.block_bytes;
-    let mut zeros = Aligned::new(block as usize);
-    let cleared = partition
-        .io
-        .write_blocks(
-            partition.media,
-            partition.first_lba + failure_record::OFFSET / block,
-            zeros.bytes(),
-        )
-        .and_then(|()| partition.io.flush_blocks());
-    if cleared.is_err() {
-        output::arguments(format_args!(
-            "PREVIOUS BOOT record not cleared: the chosen disk refused the write\n"
-        ));
-    }
+    Some(Update {
+        target,
+        purpose: Purpose::FailureRecord,
+        pieces: vec![Piece {
+            offset: partition.offset() + failure_record::OFFSET,
+            bytes: vec![0; RECORD_CLEAR_BYTES],
+        }],
+    })
 }
 
 /// Whether the partition Install macOS chose before (`SERIAL:GUID`) is on
 /// this PC: exactly one disk with its serial, and exactly one partition
-/// with its GUID that is no EFI system partition. The menu asks before any
-/// plan is made.
+/// with its GUID that is no EFI system partition. The menu asks about the
+/// disk as it is, whatever is pending.
 pub fn chosen_present(disk: &str) -> bool {
     disk.parse::<Target>()
-        .is_ok_and(|target| matches!(search(&target, None), Ok(Ok(_))))
+        .is_ok_and(|target| matches!(search(&target, &Pending::default()), Ok(Ok(_))))
 }
 
 /// Why the partition `target` names is no longer there to boot, when it is
 /// not (`chosen_disk::Stale::of`).
-fn stale(target: &Target, pending: Pending<'_>) -> Result<Option<Stale>> {
+fn stale(target: &Target, pending: &Pending) -> Result<Option<Stale>> {
     Ok(search(target, pending)?.err().and_then(Stale::of))
 }
 
@@ -469,11 +471,11 @@ fn external(volume: &BootVolume) -> Result<Option<Target>> {
 fn select_or_unprepared(
     target: &Target,
     part: Part,
-    consume: bool,
+    save: Option<&mut Option<Update>>,
     (preboot, preboot_part): &(Target, Part),
-    pending: Pending<'_>,
+    pending: &Pending,
 ) -> Result<Selection, Refusal> {
-    let error = match select(target, part, consume, pending) {
+    let error = match select(target, part, save, pending) {
         Ok(selection) => return Ok(selection),
         Err(error) => error,
     };
@@ -484,9 +486,15 @@ fn select_or_unprepared(
     }
 }
 
-/// The boot NVRAM chooses, with its one-shot variables consumed and saved
-/// when `consume` holds.
-fn select(target: &Target, part: Part, consume: bool, pending: Pending<'_>) -> Result<Selection> {
+/// The boot NVRAM chooses. With `save`, its one-shot variables are consumed
+/// and the bank without them is left there: the update of the NOR's next
+/// bank, which Stela's drivers write before the engine reads the NOR.
+fn select(
+    target: &Target,
+    part: Part,
+    save: Option<&mut Option<Update>>,
+    pending: &Pending,
+) -> Result<Selection> {
     let mut nor = find(target, pending).within(|| refuse!("NOR partition"))?;
     nor.confine(part).within(|| refuse!("NOR partition"))?;
     if nor.io.media().is_read_only()
@@ -507,18 +515,26 @@ fn select(target: &Target, part: Part, consume: bool, pending: Pending<'_>) -> R
     let (_, proxy) = image.boot_bank()?;
     let mut variables = Variables::parse(&proxy)?;
     let selection = select(&variables)?;
-    if consume && boot_selection::consume(&mut variables, &selection)? {
+    if let Some(save) = save
+        && boot_selection::consume(&mut variables, &selection)?
+    {
         let bank = variables.encode()?;
         let (written, sectors) = image.save_bank(&bank)?;
-        for offset in sectors {
-            let sector = image.bytes()[offset..offset + SECTOR_SIZE].to_vec();
-            nor.write_sector(offset, &sector)?;
-        }
-        nor.io
-            .flush_blocks()
-            .map_err(|_| refuse!("cannot flush the NOR partition"))?;
+        let base = nor.offset();
+        *save = Some(Update {
+            target: target.clone(),
+            purpose: Purpose::NvramBank,
+            pieces: sectors
+                .into_iter()
+                .map(|offset| Piece {
+                    offset: base + offset as u64,
+                    bytes: image.bytes()[offset..offset + SECTOR_SIZE].to_vec(),
+                })
+                .collect(),
+        });
         output::arguments(format_args!(
-            "NVRAM consumed {} into bank {written}\n",
+            "NVRAM consumed {} for bank {written}, which Stela's drivers save after the \
+             firmware has exited\n",
             selection
                 .consumed
                 .iter()
@@ -538,7 +554,7 @@ fn installed(
     target: &Target,
     part: Part,
     volume: Option<&BootVolume>,
-    pending: Pending<'_>,
+    pending: &Pending,
 ) -> Result<bool> {
     let mut disk = find(target, pending).within(|| refuse!("Preboot disk"))?;
     disk.confine(part).within(|| refuse!("Preboot disk"))?;
@@ -574,7 +590,7 @@ fn holds_recovery(
     part: Part,
     kind: recovery::Kind,
     volume: Option<&BootVolume>,
-    pending: Pending<'_>,
+    pending: &Pending,
 ) -> bool {
     let probe = || -> Result<bool> {
         let mut disk = find(target, pending).within(|| refuse!("Preboot disk"))?;
@@ -597,7 +613,7 @@ fn holds_recovery(
 
 /// Whether the internal SSD lacks the iBootSystemContainer every boot of a
 /// Mac reads (`apfs::require_system_container`), as a blank one does.
-fn blank(target: &Target, part: Part, pending: Pending<'_>) -> Result<bool> {
+fn blank(target: &Target, part: Part, pending: &Pending) -> Result<bool> {
     let mut disk = find(target, pending).within(|| refuse!("internal SSD"))?;
     disk.confine(part).within(|| refuse!("internal SSD"))?;
     match apfs::require_system_container(&mut disk) {
@@ -646,11 +662,12 @@ pub enum Readiness {
     Unknown,
 }
 
-/// Whether the startup choice `options` of `kind` can start now. Install
-/// and other choices are not checked ([`Readiness::Unknown`]).
-pub fn ready(options: &str, kind: ChoiceKind) -> Readiness {
+/// Whether the startup choice `options` of `kind` can start now, with the
+/// `pending` work done. Install and other choices are not checked
+/// ([`Readiness::Unknown`]).
+pub fn ready(options: &str, kind: ChoiceKind, pending: &Pending) -> Readiness {
     match kind {
-        ChoiceKind::Mac => match route_checked(options.as_bytes().into(), false, None) {
+        ChoiceKind::Mac => match route_checked(options.as_bytes().into(), None, pending) {
             Ok((_, true)) => Readiness::Ready,
             Ok((_, false)) | Err(Refusal::NoRecovery { installed: false }) => {
                 Readiness::NotInstalled
@@ -689,26 +706,34 @@ pub enum Refusal {
 }
 
 /// The engine's options for this boot (`boot_selection::route`), with
-/// NVRAM's one-shot choices consumed. `pending` is the plan the disk picker
-/// made for these options, when it made one.
-pub fn route(options: Vec<u8>, pending: Pending<'_>) -> Result<Vec<u8>, Refusal> {
-    route_checked(options, true, pending).map(|(routed, _)| routed)
+/// NVRAM's one-shot choices consumed. `pending` is the disk work decided so
+/// far, the disk picker's plan for these options with it; the save of the
+/// bank without the consumed variables joins it, whether or not the boot is
+/// then refused: the variables are consumed once they have been acted on.
+pub fn route(options: Vec<u8>, pending: &mut Pending) -> Result<Vec<u8>, Refusal> {
+    let mut save = None;
+    let routed = route_checked(options, Some(&mut save), pending);
+    pending.updates.extend(save);
+    routed.map(|(routed, _)| routed)
 }
 
 /// Where [`route`] would send `options`, leaving NVRAM unchanged: the
-/// check before the startup menu, which a chosen boot routes again. No plan
-/// is pending before the menu.
-pub fn peek(options: Vec<u8>) -> Result<Vec<u8>, Refusal> {
-    route_checked(options, false, None).map(|(routed, _)| routed)
+/// check before the startup menu, which a chosen boot routes again.
+pub fn peek(options: Vec<u8>, pending: &Pending) -> Result<Vec<u8>, Refusal> {
+    route_checked(options, None, pending).map(|(routed, _)| routed)
 }
 
-/// [`route`] or [`peek`], and whether the boot disk holds an installed
-/// system: false when a Mac boot falls back to recoveryOS for want of one.
+/// [`route`] with a place for the NVRAM `save`, or [`peek`] without one,
+/// and whether the boot disk holds an installed system: false when a Mac
+/// boot falls back to recoveryOS for want of one. Nothing reads the NOR
+/// after its choice is made, so the save need not be pending yet for the
+/// rest of the routing.
 fn route_checked(
     options: Vec<u8>,
-    consume: bool,
-    pending: Pending<'_>,
+    save: Option<&mut Option<Update>>,
+    pending: &Pending,
 ) -> Result<(Vec<u8>, bool), Refusal> {
+    let consume = save.is_some();
     let mut installed_system = true;
     let text =
         core::str::from_utf8(&options).map_err(|_| Refusal::Other("stela.cfg is not UTF-8"))?;
@@ -749,7 +774,7 @@ fn route_checked(
                         Part::Whole
                     };
                     let preboot = (parse(preboot)?, preboot_part);
-                    select_or_unprepared(&parse(nor)?, part, consume, &preboot, pending)?
+                    select_or_unprepared(&parse(nor)?, part, save, &preboot, pending)?
                 }
                 None => boot_selection::select(&Variables::parse(&empty_bank()).map_err(refuse)?)
                     .map_err(|error| refuse(error.into()))?,

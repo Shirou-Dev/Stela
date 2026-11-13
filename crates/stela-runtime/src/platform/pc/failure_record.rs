@@ -5,7 +5,9 @@
 //! partition is often found then, as it is on another bus, so the engine
 //! writes the step, its message and the disk account here, and the next
 //! boot's firmware-side code, which reads the stick through the firmware,
-//! copies it into the USB's log and clears it.
+//! copies it into the USB's log. That code only reads the partition:
+//! Stela's drivers clear the record once that boot has started them
+//! (`disk_writes`), and until one does, each start copies it again.
 //!
 //! The region starts at [`OFFSET`] of the machine state, after the RTC
 //! anchor, and is [`BYTES`] long. The installer zeroes the whole tail, so a

@@ -2626,31 +2626,30 @@ fn wifi_network(
     })
 }
 
-/// The change Install macOS's disk picker planned for the `--storage`
-/// partition's disk (`Handoff::disk_plan`), when the picker ran this boot.
-/// The host disks' start applies it, once, before it looks the partition up
-/// (`storage::prepare`).
-fn disk_plan(handoff: &Handoff) -> Option<stela_runtime::pc::disk_plan::Plan> {
-    let bytes = handoff.disk_plan.bytes as usize;
+/// The disk work the loader decided before the firmware exited
+/// (`Handoff::disk_writes`): the change Install macOS's disk picker planned
+/// for the `--storage` partition's disk, when the picker ran this boot, and
+/// the updates of the boot's partitions. The host disks' start does it,
+/// once (`storage::prepare`, `storage::update`).
+fn disk_writes(handoff: &Handoff) -> stela_runtime::pc::disk_writes::Pending {
+    let bytes = handoff.disk_writes.bytes as usize;
     if bytes == 0 {
-        return None;
+        return Default::default();
     }
-    // SAFETY: the loader left the plan's bytes allocated, and nothing
-    // writes them.
+    // SAFETY: the loader left the pending work's bytes allocated, and
+    // nothing writes them.
     let encoded = unsafe {
         core::slice::from_raw_parts(
-            layout::physical(handoff.disk_plan.physical) as *const u8,
+            layout::physical(handoff.disk_writes.physical) as *const u8,
             bytes,
         )
     };
-    Some(
-        stela_runtime::pc::disk_plan::Plan::decode(encoded).unwrap_or_else(|| {
-            output::fatal(
-                "the plan for the disk chosen for macOS did not reach Stela's drivers whole; \
-                 nothing was written to the disk. Start again and choose Install macOS",
-            )
-        }),
-    )
+    stela_runtime::pc::disk_writes::Pending::decode(encoded).unwrap_or_else(|| {
+        output::fatal(
+            "what this start was to write to the PC's disks did not reach Stela's drivers \
+             whole; nothing was written. Start again",
+        )
+    })
 }
 
 /// The whole disk and USB start's bound, which only a stall outside every
@@ -2774,7 +2773,7 @@ fn start_devices(
             let owned_preboot = options.preboot.clone();
             let owned_usb = options.usb_storage.clone();
             let owned_wifi = wifi_network(handoff, options);
-            let owned_plan = disk_plan(handoff);
+            let owned_writes = disk_writes(handoff);
             let external = options.external_disks.then(|| {
                 stela_soc::machine::UsbCables::disk_ports(options.guest_network, options.input)
                     .saturating_sub(owned_usb.len())
@@ -2821,7 +2820,7 @@ fn start_devices(
                             .map(|native| native as &dyn stela_drivers::probe::NativeServices),
                         &storage::Selection {
                             targets: &targets,
-                            plan: owned_plan.as_ref(),
+                            pending: &owned_writes,
                             medium: medium_partition,
                             preboot: owned_preboot.as_ref(),
                             store: translation_store,
