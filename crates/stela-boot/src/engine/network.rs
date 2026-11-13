@@ -19,7 +19,10 @@ use crate::Refusal;
 use crate::Result;
 use crate::output;
 use alloc::{format, rc::Rc, string::String, sync::Arc, vec::Vec};
-use core::{cell::RefCell, mem::ManuallyDrop};
+use core::{
+    cell::{Cell, RefCell},
+    mem::ManuallyDrop,
+};
 use stela_contracts::refuse;
 use stela_drivers::{
     Clock,
@@ -76,6 +79,22 @@ struct RootLink {
     /// Dropped only in the loader's root ([`in_loader_root`]).
     device: ManuallyDrop<Adapter>,
     root: u64,
+    frames: Rc<Frames>,
+}
+
+/// The frames an adapter took and gave, for the log line of an attempt that
+/// got no address: an adapter with a link that received nothing is told
+/// apart from a network that never answered.
+#[derive(Default)]
+struct Frames {
+    sent: Cell<u64>,
+    received: Cell<u64>,
+}
+
+impl Frames {
+    fn count(cell: &Cell<u64>) {
+        cell.set(cell.get().saturating_add(1));
+    }
 }
 
 impl RootLink {
@@ -83,6 +102,7 @@ impl RootLink {
         Self {
             device: ManuallyDrop::new(device),
             root,
+            frames: Rc::default(),
         }
     }
 }
@@ -108,17 +128,27 @@ impl Link for RootLink {
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.transmit(frame)
+        self.device
+            .transmit(frame)
+            .inspect(|()| Frames::count(&self.frames.sent))
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.receive()
+        self.device.receive().inspect(|frame| {
+            if frame.is_some() {
+                Frames::count(&self.frames.received);
+            }
+        })
     }
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.receive_reusing(frame)
+        self.device.receive_reusing(frame).inspect(|&received| {
+            if received {
+                Frames::count(&self.frames.received);
+            }
+        })
     }
     fn signals(&self) -> bool {
         self.device.signals()
@@ -188,6 +218,7 @@ impl HostNetwork {
             let driver = link.device.driver();
             let wireless = link.device.wireless();
             let location = String::from(link.device.location());
+            let frames = Rc::clone(&link.frames);
             output::arguments(format_args!(
                 "NETWORK candidate driver={driver} adapter={location} mac={}\n",
                 link.mac()
@@ -233,7 +264,11 @@ impl HostNetwork {
                     });
                 }
                 Err(error) => {
-                    output::arguments(format_args!("NETWORK adapter {location} failed: {error}\n"));
+                    output::arguments(format_args!(
+                        "NETWORK adapter {location} failed: {error}; frames sent={} received={}\n",
+                        frames.sent.get(),
+                        frames.received.get()
+                    ));
                     failures.push(match error {
                         stela_runtime::net::NetError::NoCarrier => {
                             stela_drivers::probe::no_link(&location, wireless)
