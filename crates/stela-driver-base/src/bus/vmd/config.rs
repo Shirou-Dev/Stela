@@ -62,10 +62,74 @@ impl<R: Registers> ChildConfig<'_, R> {
 }
 
 impl<R: Registers> Host<R> {
+    /// Stop `child` as firmware may have left it: Bus Master and the MSI and
+    /// MSI-X enables cleared, INTx Disable set, each read back. Firmware
+    /// commonly leaves the NVMe controller behind VMD mastering; Linux's vmd
+    /// driver scans it as found and its NVMe driver resets the controller.
+    /// Nothing behind VMD reaches memory while the parent's own Bus Master
+    /// is clear, so children are stopped only in that state. A child whose
+    /// bits stay set is refused and the host poisoned: it would master once
+    /// the parent's Bus Master is set.
+    pub(super) fn stop_child(&mut self, child: Address) -> Result<(), Error> {
+        self.check_live()?;
+        let parent = self.io().parent_read(regs::COMMAND, 2)?;
+        if parent == u32::from(u16::MAX) {
+            return Err(Error::ReadFailed);
+        }
+        if parent & u32::from(regs::COMMAND_MASTER) != 0 {
+            return Err(Error::ActiveChild);
+        }
+        let mut config = self.config(child.bus, child.device, child.function)?;
+        let word = |config: &mut ChildConfig<'_, R>, offset: u16| -> Result<u16, Error> {
+            let value = config.read(offset, 2)? as u16;
+            (value != u16::MAX)
+                .then_some(value)
+                .ok_or(Error::ReadFailed)
+        };
+        let unstopped = Error::UnstoppedChild(child.bus, child.device, child.function);
+        let result = (|| {
+            let command = word(&mut config, regs::COMMAND)?;
+            let stopped = command & !regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE;
+            if command != stopped {
+                config.write(regs::COMMAND, 2, u32::from(stopped))?;
+                if word(&mut config, regs::COMMAND)?
+                    & (regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE)
+                    != regs::COMMAND_INTX_DISABLE
+                {
+                    return Err(unstopped);
+                }
+            }
+            let entries = Capabilities::new(Transport(|offset, bytes| config.read(offset, bytes)))
+                .collect::<Result<Vec<_>, Error>>()?;
+            for entry in entries {
+                let enable = match entry.id {
+                    5 => 1,          // MSI Enable
+                    0x11 => 1 << 15, // MSI-X Enable; Function Mask is kept.
+                    _ => continue,
+                };
+                let control = word(&mut config, entry.offset + 2)?;
+                if control & enable != 0 {
+                    config.write(entry.offset + 2, 2, u32::from(control & !enable))?;
+                    if word(&mut config, entry.offset + 2)? & enable != 0 {
+                        return Err(unstopped);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result == Err(unstopped) {
+            self.poisoned = true;
+        }
+        result
+    }
+
     /// The bytes `child`'s memory BAR0 decodes, sized as Linux's
     /// `__pci_read_base` does: memory and I/O decode off while the BAR holds
-    /// all ones, then the BAR and command register restored.
+    /// all ones, then the BAR and command register restored. The child is
+    /// stopped first ([`Host::stop_child`]), so a Bus Master firmware left set
+    /// stays clear.
     pub fn memory_bar_bytes(&mut self, child: Address) -> Result<u64, Error> {
+        self.stop_child(child)?;
         let mut config = self.config(child.bus, child.device, child.function)?;
         let command = config.read(regs::COMMAND, 2)?;
         config.write(

@@ -71,6 +71,8 @@ pub struct State {
     pub pending: Option<(usize, u8, u32)>,
     pub events: Vec<Event>,
     pub ack_failure: Option<usize>,
+    /// Bits a child register keeps set whatever is written, by offset.
+    pub stuck: Option<(usize, u32)>,
     pub pm_failure: bool,
     pub pm_loses_bar: bool,
     pub release_failure: bool,
@@ -149,6 +151,7 @@ impl Default for Model {
             pending: None,
             events: Vec::new(),
             ack_failure: None,
+            stuck: None,
             pm_failure: false,
             pm_loses_bar: false,
             release_failure: false,
@@ -255,6 +258,11 @@ unsafe impl Registers for Model {
                 if state.pm_loses_bar {
                     state.set(NVME + 0x10, 4, 0);
                 }
+            }
+            if let Some((offset, bits)) = state.stuck
+                && offset == posted
+            {
+                value |= bits;
             }
             state.set(posted, posted_width, value);
             state.events.push(Event::Flushed(posted, posted_width));

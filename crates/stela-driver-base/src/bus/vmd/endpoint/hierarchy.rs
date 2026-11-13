@@ -209,8 +209,11 @@ impl Hierarchy {
         {
             return Err(Error::ActiveChild);
         }
+        // Firmware may leave a child mastering or signalling; stop each one
+        // while the parent's own Bus Master is still clear, then capture it.
         let mut children = Vec::new();
         for child in host.scan()? {
+            host.stop_child(child.address)?;
             children.push(capture(host, child)?);
         }
         let candidates: Vec<_> = children

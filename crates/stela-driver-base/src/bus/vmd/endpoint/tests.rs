@@ -293,6 +293,90 @@ fn stopped_siblings_remain_contained_and_a_second_nvme_is_explicitly_refused() {
     }
 }
 
+/// Give `base` an MSI capability after its PCIe one, enabled as firmware
+/// may leave it, and an MSI-X capability after that, enabled and masked.
+fn signalling(state: &mut State, base: usize) {
+    state.set(base + 0x41, 1, 0x80);
+    state.set(base + 0x80, 2, 0x9005);
+    state.set(base + 0x82, 2, 1);
+    state.set(base + 0x90, 2, 0x0011);
+    state.set(base + 0x92, 2, 0xc000);
+}
+
+#[test]
+fn a_child_firmware_left_mastering_is_stopped_with_the_parent_unmastered() {
+    let model = Model::default();
+    let state = model.state.clone();
+    {
+        let mut state = state.lock().unwrap();
+        state.set(
+            NVME + 4,
+            2,
+            u32::from(regs::COMMAND_MEMORY | regs::COMMAND_MASTER),
+        );
+        signalling(&mut state, NVME);
+        state.set(BRIDGE + 4, 2, u32::from(regs::COMMAND_MASTER));
+    }
+    let (mut host, bar) = fixture(model);
+    let mut hierarchy = Hierarchy::discover(&mut host, &bar, NVME_CLASS).unwrap();
+    {
+        let state = state.lock().unwrap();
+        assert!(!state.any_master());
+        for base in [BRIDGE, NVME] {
+            assert_eq!(
+                state.child(base + 4, 2) as u16
+                    & (regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE),
+                regs::COMMAND_INTX_DISABLE
+            );
+        }
+        // Decode stays as found until preparation.
+        assert_ne!(state.child(NVME + 4, 2) as u16 & regs::COMMAND_MEMORY, 0);
+        assert_eq!(state.child(NVME + 0x82, 2), 0);
+        assert_eq!(state.child(NVME + 0x92, 2), 0x4000);
+        // The parent's Bus Master was never set on the way.
+        assert!(!state.events.iter().any(|event| matches!(
+            event,
+            Event::Parent(command) if command & regs::COMMAND_MASTER != 0
+        )));
+    }
+    hierarchy.prepare(&mut host, &*model_timer()).unwrap();
+    hierarchy.enable(&mut host).unwrap();
+}
+
+#[test]
+fn a_child_that_keeps_mastering_or_signalling_is_refused_and_the_host_poisoned() {
+    for (offset, bits) in [
+        (NVME + 4, u32::from(regs::COMMAND_MASTER)),
+        (NVME + 0x82, 1),
+    ] {
+        let model = Model::default();
+        let state = model.state.clone();
+        {
+            let mut state = state.lock().unwrap();
+            state.set(
+                NVME + 4,
+                2,
+                u32::from(regs::COMMAND_INTX_DISABLE | regs::COMMAND_MASTER),
+            );
+            signalling(&mut state, NVME);
+            state.stuck = Some((offset, bits));
+        }
+        let (mut host, bar) = fixture(model);
+        assert_eq!(
+            Hierarchy::discover(&mut host, &bar, NVME_CLASS).err(),
+            Some(Error::UnstoppedChild(2, 0, 0))
+        );
+        assert_eq!(
+            Hierarchy::discover(&mut host, &bar, NVME_CLASS).err(),
+            Some(Error::Quarantined)
+        );
+        assert_eq!(
+            state.lock().unwrap().parent(regs::COMMAND, 2) & u32::from(regs::COMMAND_MASTER),
+            0
+        );
+    }
+}
+
 #[test]
 fn failed_posted_bus_master_ack_keeps_original_hierarchy_and_domain() {
     let model = Model::default();
@@ -513,7 +597,7 @@ fn provider_epoch_refusal_and_release_failure_keep_original_resources_pinned() {
 
 #[test]
 fn malformed_capabilities_active_translation_and_bar_profiles_are_refused() {
-    for case in 0..5 {
+    for case in 0..4 {
         let model = Model::default();
         {
             let mut state = model.state.lock().unwrap();
@@ -524,12 +608,7 @@ fn malformed_capabilities_active_translation_and_bar_profiles_are_refused() {
                     state.set(NVME + 0x100, 4, 0x0001_000f);
                     state.set(NVME + 0x106, 2, 0x8000);
                 }
-                3 => state.set(NVME + 0x100, 4, 0x0001_0010), // Unqualified SR-IOV.
-                _ => state.set(
-                    NVME + 4,
-                    2,
-                    u32::from(regs::COMMAND_INTX_DISABLE | regs::COMMAND_MASTER),
-                ),
+                _ => state.set(NVME + 0x100, 4, 0x0001_0010), // Unqualified SR-IOV.
             }
         }
         let (mut host, bar) = fixture(model);

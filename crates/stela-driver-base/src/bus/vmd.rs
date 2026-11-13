@@ -47,6 +47,9 @@ pub enum Error {
     Suspended,
     Quarantined,
     ActiveChild,
+    /// A child behind VMD whose Bus Master, MSI or MSI-X enable stayed set
+    /// after it was cleared, by bus, device and function.
+    UnstoppedChild(u8, u8, u8),
     PciPower(crate::bus::pci::power::Error),
 }
 
@@ -66,6 +69,10 @@ impl core::fmt::Display for Error {
             Self::Suspended => f.write_str("the VMD hierarchy is suspended"),
             Self::Quarantined => f.write_str("the VMD hierarchy is quarantined after a fault"),
             Self::ActiveChild => f.write_str("a child may not enable DMA behind VMD"),
+            Self::UnstoppedChild(bus, device, function) => write!(
+                f,
+                "child {bus:02x}:{device:02x}.{function} behind VMD kept DMA or interrupts on after a stop"
+            ),
             Self::PciPower(error) => write!(f, "VMD power timing {error:?}"),
         }
     }

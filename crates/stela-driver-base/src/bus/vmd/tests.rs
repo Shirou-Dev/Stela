@@ -342,30 +342,34 @@ fn scan_honors_multifunction_and_never_enables_child_dma() {
 }
 
 #[test]
-fn a_child_bar_is_sized_with_decode_off_and_restored() {
-    let mut model = Model::new(0x201d);
-    model.bars[0].1 = 1 << 20;
-    model.child_set(0, 4, 0x5678_144d);
-    model.child_set(4, 2, 0x0402);
-    model.child_set(8, 4, 0x0108_0200);
-    model.child_set(0x0e, 1, 0);
-    model.child_set(0x10, 4, 0x8000_4004);
-    model.child_set(0x14, 4, 0);
-    model.child_masks.insert(0x10, 0xffff_c000);
-    model.child_masks.insert(0x14, u32::MAX);
-    let mut host = start(model);
-    let child = host.scan().unwrap()[0].address;
-    assert_eq!(host.memory_bar_bytes(child), Ok(0x4000));
-    let mut config = host.config(0, 0, 0).unwrap();
-    assert_eq!(config.read(0x10, 4), Ok(0x8000_4004));
-    assert_eq!(config.read(0x14, 4), Ok(0));
-    assert_eq!(config.read(regs::COMMAND, 2), Ok(0x0402));
-    let writes = &host.registers.as_ref().unwrap().writes;
-    let sizing = writes
-        .iter()
-        .position(|write| *write == (1, 0x10, 4, u32::MAX))
-        .unwrap();
-    assert!(writes[..sizing].contains(&(1, 4, 2, 0x0400)));
+fn a_child_bar_is_sized_with_decode_off_and_restored_stopped() {
+    // The second child was left mastering, without INTx Disable.
+    for command in [0x0402, 0x0006] {
+        let mut model = Model::new(0x201d);
+        model.bars[0].1 = 1 << 20;
+        model.child_set(0, 4, 0x5678_144d);
+        model.child_set(4, 2, command);
+        model.child_set(6, 2, 0);
+        model.child_set(8, 4, 0x0108_0200);
+        model.child_set(0x0e, 1, 0);
+        model.child_set(0x10, 4, 0x8000_4004);
+        model.child_set(0x14, 4, 0);
+        model.child_masks.insert(0x10, 0xffff_c000);
+        model.child_masks.insert(0x14, u32::MAX);
+        let mut host = start(model);
+        let child = host.scan().unwrap()[0].address;
+        assert_eq!(host.memory_bar_bytes(child), Ok(0x4000));
+        let mut config = host.config(0, 0, 0).unwrap();
+        assert_eq!(config.read(0x10, 4), Ok(0x8000_4004));
+        assert_eq!(config.read(0x14, 4), Ok(0));
+        assert_eq!(config.read(regs::COMMAND, 2), Ok(0x0402));
+        let writes = &host.registers.as_ref().unwrap().writes;
+        let sizing = writes
+            .iter()
+            .position(|write| *write == (1, 0x10, 4, u32::MAX))
+            .unwrap();
+        assert!(writes[..sizing].contains(&(1, 4, 2, 0x0400)));
+    }
 }
 
 #[test]
