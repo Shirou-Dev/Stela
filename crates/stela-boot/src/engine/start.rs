@@ -2912,7 +2912,14 @@ fn start_devices(
                 && let Ok(work) = work
                 && open_gpus(work, mmio, remappers, handoff, host_firmware, gpus)
             {
-                gpu::serve(handoff.screen.map_or((0, 0), |screen| screen.resolution()));
+                let firmware = handoff
+                    .screen
+                    .and_then(|screen| screen.pci_source)
+                    .map(|source| format!("{}", source.address));
+                gpu::serve(
+                    handoff.screen.map_or((0, 0), |screen| screen.resolution()),
+                    firmware.as_deref(),
+                );
             }
             disks.profile_callbacks(options.profile);
             if let Some(store) = store {

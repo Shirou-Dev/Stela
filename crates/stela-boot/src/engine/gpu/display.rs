@@ -20,7 +20,7 @@ use core::ops::Range;
 use core::sync::atomic::Ordering;
 use core::{cell::UnsafeCell, ffi::c_int, ffi::c_void, ptr::NonNull};
 use stela_contracts::refuse;
-use stela_drivers::gpu::metal::kms::{Display, Drm, Error as DisplayError};
+use stela_drivers::gpu::metal::kms::{self, Display, Drm, Error as DisplayError};
 use stela_soc::machine::{Scanout, ScanoutFormat, ScanoutMode};
 
 /// A GPU's primary node, the DRM master.
@@ -124,25 +124,75 @@ unsafe impl Sync for Taken {}
 
 static TAKEN: Taken = Taken(UnsafeCell::new(None));
 
+/// How long the GPU that showed the firmware's picture may take to detect
+/// its display again. The GPU's reset ends the signal, and a monitor that
+/// then searches its inputs drops hot-plug detect for some seconds; Linux
+/// takes such a display when its hot-plug event arrives.
+const RETURN_SECONDS: u64 = 8;
+/// The pause between two detections in that time.
+const RETURN_STEP_MILLIS: u64 = 100;
+
 /// Moves the display to the first bound GPU with an output, in the mode of
-/// `wanted` pixels if it has it. What stops one GPU is reported.
-pub(in crate::engine) fn take(wanted: (usize, usize)) {
+/// `wanted` pixels if it has it. `firmware` names the function that showed
+/// the firmware's picture: its display is known to exist, so it is awaited
+/// within [`RETURN_SECONDS`]. What stops one GPU is reported with what its
+/// connectors detected.
+pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Option<&str>) {
     let Some(gpu) = super::installed() else {
         return;
     };
+    let wanted = (wanted.0 as u32, wanted.1 as u32);
     for (minor, bound) in gpu.start.bound.iter().enumerate() {
         let Some(fd) = client::open_node(minor as u32) else {
             continue;
         };
-        match Display::take(Node(fd), (wanted.0 as u32, wanted.1 as u32)) {
+        let began = host::rdtsc();
+        let patience = match firmware == Some(bound.name.as_str()) {
+            true => RETURN_SECONDS.saturating_mul(gpu.tsc_hz),
+            false => 0,
+        };
+        let taken = loop {
+            match Display::take(Node(fd), wanted) {
+                Err(DisplayError::NoOutput) if host::rdtsc().wrapping_sub(began) < patience => {
+                    let step = host::rdtsc();
+                    while host::rdtsc().wrapping_sub(step) < gpu.tsc_hz / 1000 * RETURN_STEP_MILLIS
+                    {
+                        core::hint::spin_loop();
+                    }
+                }
+                taken => break taken,
+            }
+        };
+        let waited_ms = host::rdtsc().wrapping_sub(began) / (gpu.tsc_hz / 1000).max(1);
+        match taken {
             Ok(display) => {
+                if waited_ms >= RETURN_STEP_MILLIS {
+                    output::arguments(format_args!(
+                        "GPU {}: display detected after {waited_ms} ms\n",
+                        bound.name
+                    ));
+                }
                 crate::status::take_screen(Some(screen(&display)));
                 // SAFETY: the one boot CPU, before any reader.
                 unsafe { *TAKEN.0.get() = Some(display) };
                 return;
             }
             Err(error) => {
-                output::arguments(format_args!("GPU {}: no display: {error:?}\n", bound.name));
+                output::arguments(format_args!(
+                    "GPU {}: no display after {waited_ms} ms: {error:?}\n",
+                    bound.name
+                ));
+                match kms::survey(&mut Node(fd)) {
+                    Ok(seen) => {
+                        for seen in seen {
+                            output::arguments(format_args!("GPU {}: output {seen}\n", bound.name));
+                        }
+                    }
+                    Err(error) => output::arguments(format_args!(
+                        "GPU {}: outputs unreadable: {error:?}\n",
+                        bound.name
+                    )),
+                }
                 client::close_descriptor(fd);
             }
         }

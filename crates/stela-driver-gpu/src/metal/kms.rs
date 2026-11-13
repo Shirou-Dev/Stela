@@ -307,6 +307,78 @@ struct Output {
     size_mm: [u32; 2],
     modes: Vec<ModeInfo>,
     encoders: Vec<u32>,
+    /// `DRM_MODE_CONNECTOR_*` and the connector's number among its kind.
+    kind: u32,
+    index: u32,
+}
+
+/// One connector as the driver reports it, for the report of a GPU whose
+/// display was not taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seen {
+    kind: u32,
+    index: u32,
+    /// Whether the driver detected a display on it.
+    pub connected: bool,
+    /// How many modes and encoders it lists.
+    pub modes: usize,
+    pub encoders: usize,
+}
+
+impl core::fmt::Display for Seen {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Linux's `drm_connector_enum_list` names.
+        const KINDS: [&str; 21] = [
+            "Unknown",
+            "VGA",
+            "DVI-I",
+            "DVI-D",
+            "DVI-A",
+            "Composite",
+            "SVIDEO",
+            "LVDS",
+            "Component",
+            "DIN",
+            "DP",
+            "HDMI-A",
+            "HDMI-B",
+            "TV",
+            "eDP",
+            "Virtual",
+            "DSI",
+            "DPI",
+            "Writeback",
+            "SPI",
+            "USB",
+        ];
+        let kind = KINDS.get(self.kind as usize).copied().unwrap_or(KINDS[0]);
+        let state = match self.connected {
+            true => "connected",
+            false => "not connected",
+        };
+        write!(
+            f,
+            "{kind}-{} {state} modes={} encoders={}",
+            self.index, self.modes, self.encoders
+        )
+    }
+}
+
+/// Every connector of `drm`, each detected anew as Linux's forced probe does.
+pub fn survey<D: Drm>(drm: &mut D) -> Result<Vec<Seen>, Error> {
+    let (_, connectors) = resources(drm)?;
+    connectors
+        .iter()
+        .map(|&id| {
+            output(drm, id).map(|found| Seen {
+                kind: found.kind,
+                index: found.index,
+                connected: found.connected,
+                modes: found.modes.len(),
+                encoders: found.encoders.len(),
+            })
+        })
+        .collect()
 }
 
 fn output<D: Drm>(drm: &mut D, id: u32) -> Result<Output, Error> {
@@ -339,6 +411,8 @@ fn output<D: Drm>(drm: &mut D, id: u32) -> Result<Output, Error> {
             size_mm: described.size_mm,
             modes,
             encoders,
+            kind: described.kind,
+            index: described.kind_id,
         });
     }
     Err(Error::Changed)

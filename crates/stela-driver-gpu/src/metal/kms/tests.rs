@@ -224,6 +224,24 @@ fn the_connected_output_runs_on_a_controller_it_can_reach() {
 }
 
 #[test]
+fn the_survey_names_every_connector_with_what_the_driver_detected() {
+    let mut card = Card::new(vec![mode(4, 2, PREFERRED)]);
+    let seen = survey(&mut &mut card).unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen.iter().filter(|seen| seen.connected).count(), 1);
+    let connected = seen.iter().find(|seen| seen.connected).unwrap();
+    assert_eq!(
+        alloc::format!("{connected}"),
+        "Unknown-0 connected modes=1 encoders=1"
+    );
+    let other = seen.iter().find(|seen| !seen.connected).unwrap();
+    assert_eq!(
+        alloc::format!("{other}"),
+        "Unknown-0 not connected modes=0 encoders=1"
+    );
+}
+
+#[test]
 fn an_output_with_no_mode_or_controller_is_not_taken() {
     let mut card = Card::new(Vec::new());
     assert_eq!(
