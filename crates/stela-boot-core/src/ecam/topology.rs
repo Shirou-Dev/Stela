@@ -1,5 +1,5 @@
 //! Validate the captured PCI bus tree before a source can assign its slots.
-use super::RootWindow;
+use super::{RootWindow, census};
 use alloc::vec::Vec;
 use stela_drivers::bus::pci::Address;
 
@@ -28,6 +28,12 @@ pub enum Error {
     DuplicateSecondary(Address),
     OverlappingBridges(Address),
     MissingParent(Address),
+    /// A function with a CardBus or unknown header has Bus Master set or
+    /// asserts INTx, so it cannot be left undriven.
+    ActiveUnsupportedHeader(Address),
+    /// A function reading vendor ID 0000 has Bus Master set or asserts
+    /// INTx, so it cannot be treated as absent.
+    ActiveWithoutVendor(Address),
 }
 
 struct Route {
@@ -70,16 +76,14 @@ pub fn resolve(
         let Some(buses) = function.bridge_buses else {
             continue;
         };
-        let [primary, secondary, subordinate, _] = buses.to_le_bytes();
-        if secondary == 0 && subordinate == 0 {
-            continue;
-        }
+        // As in Linux, the primary field routes nothing and is not checked.
+        let (secondary, subordinate) = match census::route(address.bus, buses) {
+            census::Route::Unconfigured => continue,
+            census::Route::Forwards { buses, .. } => (*buses.start(), *buses.end()),
+            census::Route::Invalid => return Err(Error::InvalidBridge(address)),
+        };
         let grant = roots[root].buses().expect("validated root bus grant");
-        if primary != address.bus
-            || secondary <= primary
-            || secondary > subordinate
-            || !grant.contains(&subordinate)
-        {
+        if !grant.contains(&subordinate) {
             return Err(Error::InvalidBridge(address));
         }
         routes.try_reserve(1).map_err(|_| Error::Exhausted)?;
@@ -208,6 +212,25 @@ mod tests {
         assert_eq!(
             resolve(&[root(0, 4), root(5, 9)], &[cross_root]),
             Err(Error::InvalidBridge(cross_root.address))
+        );
+    }
+
+    #[test]
+    fn a_wrong_primary_bus_field_keeps_the_bridge_route() {
+        let mut upstream = node(0, 1, Some((2, 8)));
+        upstream.bridge_buses = upstream.bridge_buses.map(|buses| buses & !0xff | 0x07);
+        let endpoint = node(2, 0, None);
+        assert_eq!(
+            resolve(&[root(0, 9)], &[upstream, endpoint]).unwrap(),
+            [
+                (upstream.address, Parent::Root(0)),
+                (endpoint.address, Parent::Bridge(upstream.address)),
+            ]
+        );
+        let backwards = node(3, 1, Some((3, 4)));
+        assert_eq!(
+            resolve(&[root(0, 9)], &[backwards]),
+            Err(Error::InvalidBridge(backwards.address))
         );
     }
 }

@@ -622,33 +622,100 @@ struct Input {
     plan: Rc<Plan>,
 }
 
+enum Observed {
+    Absent,
+    Function(Input),
+    /// A function the fabric does not drive, left idle with the buses
+    /// behind it, and its layout dword.
+    Left {
+        layout: u32,
+        behind: Option<RangeInclusive<u8>>,
+    },
+}
+
+/// Whether `candidate` repeats single-function `first` (census::alias).
+fn repeats(
+    reader: &mut ConfigInventory<'_>,
+    first: Address,
+    candidate: Address,
+) -> Result<bool, Error> {
+    let mut words = [[0; 9]; 2];
+    for (at, offset) in census::ALIAS_OFFSETS.into_iter().enumerate() {
+        words[0][at] = reader.read32(first, offset)?;
+        words[1][at] = reader.read32(candidate, offset)?;
+    }
+    Ok(census::alias(&words[0], &words[1]))
+}
+
 impl Input {
     /// `root_bus`: no bridge the census found forwards to `address`'s bus.
+    /// `single`: function 0 of this device, when it has no multifunction bit.
     fn observe(
         reader: &mut ConfigInventory<'_>,
         address: Address,
         root_bus: bool,
-    ) -> Result<Option<Self>, ContainmentError> {
+        single: Option<Address>,
+    ) -> Result<Observed, ContainmentError> {
         let identity = reader.read32(address, 0)?;
-        match identity as u16 {
-            u16::MAX => return Ok(None),
-            0 | 1 => return Err(Error::InvalidPlatformReply.into()),
-            _ => {}
+        match census::presence(identity) {
+            census::Presence::Absent => return Ok(Observed::Absent),
+            census::Presence::NotReady => {
+                report_oddity(census::Oddity::NotReady, address);
+                return Ok(Observed::Absent);
+            }
+            // Its other registers do answer; skip it only while they show
+            // it cannot reach memory or raise INTx.
+            census::Presence::NoVendor if census::quiet(reader.read32(address, 4)?) => {
+                report_oddity(census::Oddity::NoVendor, address);
+                return Ok(Observed::Absent);
+            }
+            census::Presence::NoVendor => {
+                return Err(topology::Error::ActiveWithoutVendor(address).into());
+            }
+            census::Presence::Present => {}
+        }
+        if let Some(first) = single
+            && repeats(reader, first, address)?
+        {
+            report_oddity(census::Oddity::Alias, address);
+            return Ok(Observed::Absent);
         }
         let class_revision = reader.read32(address, 8)?;
         if class_revision == u32::MAX {
             return Err(Error::InvalidPlatformReply.into());
         }
         let layout = reader.read32(address, 0x0c)?;
-        let bridge = if reader.header_type(layout)? == 1 {
-            if class_revision >> 16 != 0x0604 {
-                return Err(Error::InvalidPlatformReply.into());
+        let kind = census::layout(layout);
+        if census::bridge_class(class_revision) != (kind == census::Layout::Bridge) {
+            report_oddity(census::Oddity::BridgeClass, address);
+        }
+        let bridge = match kind {
+            census::Layout::Endpoint => None,
+            census::Layout::Bridge => {
+                let buses = reader.read32(address, 0x18)?;
+                reader.check_bridge(address, buses)?;
+                Some(buses)
             }
-            let buses = reader.read32(address, 0x18)?;
-            reader.check_bridge(address, buses)?;
-            Some(buses)
-        } else {
-            None
+            census::Layout::CardBus | census::Layout::Unknown(_) => {
+                // Not driven: there is no CardBus driver, and Linux ignores
+                // an unknown header. Left alone only while it cannot reach
+                // memory or raise INTx.
+                if !census::quiet(reader.read32(address, 4)?) {
+                    return Err(topology::Error::ActiveUnsupportedHeader(address).into());
+                }
+                report_oddity(census::Oddity::UnsupportedHeader, address);
+                // A CardBus bridge shares the Type 1 bus fields. With Bus
+                // Master clear it forwards no memory request from behind it.
+                // Buses it cannot own stay in the scan, where any function
+                // on them fails the topology.
+                let behind = if kind == census::Layout::CardBus {
+                    let buses = reader.read32(address, 0x18)?;
+                    reader.check_bridge(address, buses).ok().flatten()
+                } else {
+                    None
+                };
+                return Ok(Observed::Left { layout, behind });
+            }
         };
         let plan = Plan::read(
             |offset, width| {
@@ -661,7 +728,7 @@ impl Input {
         let (window, span) = reader
             .geometry
             .function(address, reader.source.platform.wire().roots())?;
-        Ok(Some(Self {
+        Ok(Observed::Function(Self {
             address,
             window,
             span,
@@ -681,6 +748,8 @@ fn census(
     reader: &mut ConfigInventory<'_>,
 ) -> Result<Vec<Input>, ContainmentError> {
     let mut inputs: Vec<Input> = Vec::new();
+    // Buses behind a function left undriven, with that function.
+    let mut left: Vec<(Address, RangeInclusive<u8>)> = Vec::new();
     for window in windows {
         for bus in window.start_bus..=window.end_bus {
             // A bridge's secondary bus is above its own, so every bridge
@@ -691,7 +760,19 @@ fn census(
                         (buses >> 8 & 0xff..=buses >> 16 & 0xff).contains(&u32::from(bus))
                     })
             });
+            if let Some((owner, _)) = left
+                .iter()
+                .find(|(owner, buses)| owner.segment == window.segment && buses.contains(&bus))
+            {
+                // A driven bridge forwarding here too would leave its
+                // functions uncontained.
+                if !root_bus {
+                    return Err(topology::Error::OverlappingBridges(*owner).into());
+                }
+                continue;
+            }
             for device in 0..32 {
+                let mut single = None;
                 for function in 0..8 {
                     let address = Address {
                         segment: window.segment,
@@ -699,11 +780,30 @@ fn census(
                         device,
                         function,
                     };
-                    if let Some(input) = Input::observe(reader, address, root_bus)
-                        .map_err(|error| error.at(address))?
-                    {
-                        inputs.try_reserve(1).map_err(|_| Error::Exhausted)?;
-                        inputs.push(input);
+                    // Linux reads functions 1-7 only of a multifunction
+                    // device. Here they are read, and dropped only when
+                    // they repeat function 0: ARI and nonconforming
+                    // functions can reach memory too.
+                    let observed = Input::observe(reader, address, root_bus, single)
+                        .map_err(|error| error.at(address))?;
+                    let layout = match observed {
+                        Observed::Absent => continue,
+                        Observed::Function(input) => {
+                            let layout = input.header.layout;
+                            inputs.try_reserve(1).map_err(|_| Error::Exhausted)?;
+                            inputs.push(input);
+                            layout
+                        }
+                        Observed::Left { layout, behind } => {
+                            if let Some(buses) = behind {
+                                left.try_reserve(1).map_err(|_| Error::Exhausted)?;
+                                left.push((address, buses));
+                            }
+                            layout
+                        }
+                    };
+                    if function == 0 && !census::multifunction(layout) {
+                        single = Some(address);
                     }
                 }
             }

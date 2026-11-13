@@ -2,7 +2,8 @@
 //! views are private to their consumers and never enter physical lookup.
 use super::*;
 use crate::native_mmio::ecam::EcamInventory;
-use core::mem::ManuallyDrop;
+use core::{mem::ManuallyDrop, ops::RangeInclusive};
+use stela_boot_core::ecam::census;
 use stela_drivers::bus::{mmio::owned::Mapping, pci::Address};
 mod containment;
 pub(super) use containment::PciSlots;
@@ -14,6 +15,16 @@ fn report_ecam_conflict(line: core::fmt::Arguments<'_>) {
     static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if !REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         crate::output::arguments(line);
+    }
+}
+
+/// Log a census oddity that leaves the segment usable, the first time
+/// each kind is seen this boot.
+fn report_oddity(oddity: census::Oddity, address: Address) {
+    static REPORTED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    let bit = oddity.bit();
+    if REPORTED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        crate::output::arguments(format_args!("HOST PCI {address} {}\n", oddity.message()));
     }
 }
 
@@ -198,26 +209,29 @@ impl ConfigInventory<'_> {
         scope.read(offset, width)
     }
 
-    pub(crate) fn header_type(&self, word: u32) -> Result<u8, Error> {
-        match ((word >> 16) & 0x7f) as u8 {
-            kind @ (0 | 1) => Ok(kind),
-            _ => Err(Error::InvalidPlatformReply),
+    /// Check a bridge's buses against its root grant and the ECAM windows,
+    /// returning the buses it forwards. The primary field routes nothing;
+    /// like Linux, a wrong one is kept.
+    pub(crate) fn check_bridge(
+        &self,
+        address: Address,
+        buses: u32,
+    ) -> Result<Option<RangeInclusive<u8>>, Error> {
+        match census::route(address.bus, buses) {
+            census::Route::Unconfigured => Ok(None),
+            census::Route::Invalid => Err(Error::InvalidPlatformReply),
+            census::Route::Forwards { buses, primary } => {
+                self.geometry.check_bridge(
+                    self.source.platform.wire().roots(),
+                    address,
+                    buses.clone(),
+                )?;
+                if !primary {
+                    report_oddity(census::Oddity::PrimaryBus, address);
+                }
+                Ok(Some(buses))
+            }
         }
-    }
-
-    pub(crate) fn check_bridge(&self, address: Address, buses: u32) -> Result<(), Error> {
-        let [primary, secondary, subordinate, _] = buses.to_le_bytes();
-        if secondary == 0 && subordinate == 0 {
-            return Ok(());
-        }
-        if primary != address.bus || secondary <= address.bus || subordinate < secondary {
-            return Err(Error::InvalidPlatformReply);
-        }
-        self.geometry.check_bridge(
-            self.source.platform.wire().roots(),
-            address,
-            secondary..=subordinate,
-        )
     }
 
     fn withdraw(&mut self) -> Result<(), Error> {
