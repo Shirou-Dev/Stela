@@ -131,7 +131,7 @@ static LINES: Lines = Lines(UnsafeCell::new(Tail::new()));
 /// again. Later calls say what the first did.
 ///
 /// Nothing is written without the services ([`arm`]), without lines, or
-/// where the record would leave less than half of the firmware's store
+/// where the record would leave less than the reserve of the firmware's store
 /// free (`Space::takes`).
 pub(crate) fn keep(fill: impl FnOnce(&mut Tail)) -> bool {
     if STATE

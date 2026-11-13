@@ -91,15 +91,20 @@ pub struct Space {
     pub largest: u64,
 }
 
+/// What stays free in the store after a record: Linux's `EFI_MIN_RESERVE`.
+pub const STORE_RESERVE: u64 = 5120;
+
 impl Space {
     /// Whether a record taking `needed` bytes ([`store_bytes`]) may be
-    /// written: each piece fits one variable, and at least half of the
-    /// store stays free after it. Some firmware fails once its store
-    /// fills, which Linux's `efi_query_variable_store` guards against too.
+    /// written: each piece fits one variable, and [`STORE_RESERVE`] bytes
+    /// of the store stay free after it. Some firmware fails once its store
+    /// fills; this is the rule of Linux's `efi_query_variable_store`, which
+    /// replaced its earlier half-of-the-store rule, since a store is often
+    /// more than half full as the firmware ships it.
     pub const fn takes(&self, needed: u64) -> bool {
         self.largest >= PIECE_BYTES as u64 + VARIABLE_OVERHEAD
             && needed <= self.remaining
-            && self.remaining - needed >= self.maximum.div_ceil(2)
+            && self.remaining - needed >= STORE_RESERVE
             && self.maximum != 0
     }
 }
@@ -462,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_is_written_only_into_a_store_it_leaves_half_free() {
+    fn a_record_is_written_only_into_a_store_it_leaves_a_reserve_in() {
         let needed = store_bytes(TEXT_BYTES);
         assert!(needed > TEXT_BYTES as u64 && needed < 2 * TEXT_BYTES as u64);
         let space = |maximum, remaining, largest| Space {
@@ -471,17 +476,19 @@ mod tests {
             largest,
         };
         assert!(space(0x10000, 0xe000, 0x2000).takes(needed));
-        assert!(space(0x10000, 0x8000 + needed, 0x2000).takes(needed));
-        assert!(!space(0x10000, 0x8000 + needed - 1, 0x2000).takes(needed));
+        // A store two thirds full, as firmware often ships it.
+        assert!(space(0x20000, 0xa000, 0x2000).takes(needed));
+        assert!(space(0x10000, STORE_RESERVE + needed, 0x2000).takes(needed));
+        assert!(!space(0x10000, STORE_RESERVE + needed - 1, 0x2000).takes(needed));
         // Less free than the record needs.
         assert!(!space(0x10000, needed - 1, 0x2000).takes(needed));
-        // A store too small to keep half free, or none at all.
-        assert!(!space(0x2000, 0x2000, 0x2000).takes(needed));
+        // No store at all.
         assert!(!space(0, 0, 0).takes(needed));
         // Its largest variable is smaller than a piece.
         assert!(!space(0x10000, 0xe000, 0x200).takes(needed));
         // A short record needs less.
         assert!(store_bytes(100) < store_bytes(PIECE_BYTES + 1));
-        assert!(space(0x10000, 0x8000 + store_bytes(100), 0x2000).takes(store_bytes(100)));
+        assert!(space(0x10000, STORE_RESERVE + store_bytes(100), 0x2000).takes(store_bytes(100)));
+        assert!(!space(0x10000, STORE_RESERVE + store_bytes(100), 0x2000).takes(needed));
     }
 }
