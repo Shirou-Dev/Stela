@@ -1413,7 +1413,8 @@ fn open_gpus(
     // even when the start never returns.
     output::flush_log();
     let opening = host::rdtsc();
-    let opened = gpu::open(machine, claimed);
+    // A stop inside the start stores the USB's log from there.
+    let opened = storage::in_gpu_start(|| gpu::open(machine, claimed));
     // `GPU START claim_ms=… linux_ms=… probe_ms=… total_ms=…`: claiming the
     // functions, starting Linux, and nouveau's probe, which boots the GSP
     // and binds DRM.

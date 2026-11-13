@@ -233,15 +233,39 @@ fn between_drivers<T>(between: impl FnOnce() -> T) -> T {
 /// which the holder of the host drivers' lock drives itself.
 static HELD_USB_LOG: AtomicBool = AtomicBool::new(false);
 
-/// Store the USB's log from a wait in the GPU's start, which holds the host
-/// drivers' lock outside every storage driver's call, so a start that never
-/// returns leaves its lines on the stick. Only the log the device start
-/// resumed is driven by the lock's holder; any other would wait for the
-/// lock, and its lines wait for the next store after the start.
-pub(super) fn store_usb_log_in_gpu_start() {
-    if HELD_USB_LOG.load(Ordering::Acquire) && host_drivers_held_here() {
+/// The GS base of the processor in the GPU's start, zero while none is
+/// ([`in_gpu_start`]).
+static GPU_START_GS: AtomicU64 = AtomicU64::new(0);
+
+/// Run `start`, the GPU's start, as one where the USB's log may be stored
+/// ([`store_usb_log_in_gpu_start`]): it holds the host drivers' lock for
+/// Linux's whole start and calls no storage driver.
+pub(super) fn in_gpu_start<T>(start: impl FnOnce() -> T) -> T {
+    GPU_START_GS.store(this_gs(), Ordering::Release);
+    let result = start();
+    GPU_START_GS.store(0, Ordering::Release);
+    result
+}
+
+/// Store the USB's log from the GPU's start ([`in_gpu_start`]), which holds
+/// the host drivers' lock outside every storage driver's call: from a long
+/// wait, so a start that never returns leaves its lines on the stick, and
+/// from a stop there, a fault, panic or Linux BUG, whose screen the GPU's
+/// reset may have left dead. Only the log the device start resumed is
+/// driven by the lock's holder; any other would wait for the lock, and its
+/// lines wait for the next store after the start. A store already running
+/// here, as one a stop interrupted, is not entered again. Whether it was
+/// tried.
+pub(super) fn store_usb_log_in_gpu_start() -> bool {
+    let gs = this_gs();
+    let storable = HELD_USB_LOG.load(Ordering::Acquire)
+        && host_drivers_held_here()
+        && GPU_START_GS.load(Ordering::Acquire) == gs
+        && BETWEEN_GS.load(Ordering::Acquire) == 0;
+    if storable {
         between_drivers(output::store_usb_log);
     }
+    storable
 }
 
 /// Counter ticks cores waited for [`HOST_DRIVERS`] since the last report,

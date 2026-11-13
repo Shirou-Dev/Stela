@@ -1379,6 +1379,13 @@ pub(crate) fn starting_host_devices() -> bool {
     storage::starting_devices_here()
 }
 
+/// Store the USB's log from inside the GPU's start, which holds the host
+/// drivers' lock outside every storage driver's call; whether this
+/// processor is where that can be done (`storage::store_usb_log_in_gpu_start`).
+pub(crate) fn store_usb_log_in_gpu_start() -> bool {
+    storage::store_usb_log_in_gpu_start()
+}
+
 /// Run a stop's firmware call in the loader's root `root`
 /// (`storage::at_stop_in_loader_root`).
 ///

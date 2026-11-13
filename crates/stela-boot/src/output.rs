@@ -640,9 +640,10 @@ pub fn leave_boot_services() {
 /// firmware ([`keep_stop_record`]).
 static UNKEPT_FROM: AtomicU64 = AtomicU64::new(0);
 
-/// Leave the newest lines the USB's log does not hold in the PC's firmware
-/// (`stop_record::keep`), for the next start to copy into the log; whether
-/// the firmware holds them. The lines end with the stop's reason, which
+/// Leave the newest lines in the PC's firmware (`stop_record::keep`), for
+/// the next start to copy into the log and to say this one stopped: those
+/// the USB's log does not hold, or a stop's inside the host drivers, whose
+/// screen may be dead; whether the firmware holds them. The lines end with the stop's reason, which
 /// the caller has printed; `reason` stands for them where the record
 /// cannot be read, as in a stop raised while a line was being written.
 fn keep_stop_record(reason: Option<&str>) -> bool {
@@ -829,8 +830,13 @@ static UNSTORED: AtomicBool = AtomicBool::new(false);
 
 fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
     // The interrupted driver call holds the disks' lock and may be partway
-    // through a request of its own.
+    // through a request of its own. The GPU's start holds it outside every
+    // storage driver's call and stores the USB's log itself, which a stop
+    // there waits for: no other log is open then.
     if crate::engine::inside_host_drivers() {
+        if wait && crate::engine::store_usb_log_in_gpu_start() {
+            return;
+        }
         static SAID: AtomicBool = AtomicBool::new(false);
         // The device start stores the USB's log itself between devices.
         if !crate::engine::starting_host_devices() && !SAID.swap(true, Ordering::Relaxed) {
@@ -1053,6 +1059,15 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
     // The reason reaches the port before any later step can stop for good.
     unqueue_serial();
     crate::engine::stop_gpus_for_fatal();
+    // Inside the host drivers no store goes through them, or only the USB's
+    // log the GPU's start drives. The lines go to the stick where they can
+    // and to the PC's firmware in any case, before the screen is drawn: the
+    // start's reset of the GPU may have left none, and the next start then
+    // shows that this one stopped, and why (`stop_record::carry`).
+    if crate::engine::inside_host_drivers() {
+        flush_log();
+        keep_stop_record(Some(&message));
+    }
     // The reason is on the screen before the last store, which may be what
     // fails, and the advice after it says whether the log was kept.
     stopped(&message, &|| {
