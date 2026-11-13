@@ -1519,14 +1519,21 @@ fn place_devices(
             })
     };
     // The firmware's scanout keeps its newest frame itself; a GPU's is
-    // wrapped to keep one for `--scanout-mirror`.
+    // wrapped to keep one for `--scanout-mirror`. With neither a GPU's
+    // display nor the firmware's screen, which a bound GPU's reset ended, the
+    // guest keeps that screen's mode and a GPU's display found later shows it.
+    #[cfg(feature = "nvk")]
+    let mirrored = |scanout: alloc::boxed::Box<dyn stela_soc::machine::Scanout>| match options
+        .scanout_mirror
+    {
+        true => alloc::boxed::Box::new(display::MirroredScanout::new(scanout)) as _,
+        false => scanout,
+    };
     #[cfg(feature = "nvk")]
     let scanout = gpu::display::scanout()
-        .map(|scanout| match options.scanout_mirror {
-            true => alloc::boxed::Box::new(display::MirroredScanout::new(scanout)) as _,
-            false => scanout,
-        })
-        .or_else(firmware_scanout);
+        .map(mirrored)
+        .or_else(firmware_scanout)
+        .or_else(|| gpu::display::awaited(handoff.screen?).map(mirrored));
     #[cfg(not(feature = "nvk"))]
     let scanout = firmware_scanout();
     let programmed = mount::memory_locks(placement.read_only_region, core_locks);
@@ -2924,7 +2931,7 @@ fn start_devices(
                     .and_then(|screen| screen.pci_source)
                     .map(|source| format!("{}", source.address));
                 gpu::serve(
-                    handoff.screen.map_or((0, 0), |screen| screen.resolution()),
+                    handoff.screen.map(|screen| screen.resolution()),
                     firmware.as_deref(),
                 );
             }

@@ -1579,14 +1579,20 @@ pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
 
 /// Takes the display for the GPUs [`open`] bound, in the firmware's `screen`
 /// size if it can, and opens their Metal services. `firmware` names the PCI
-/// function that showed the firmware's picture.
+/// function that showed the firmware's picture, `None` when there was a
+/// picture whose function is unknown.
 pub(super) fn serve(
-    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] screen: (usize, usize),
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] screen: Option<(usize, usize)>,
     #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] firmware: Option<&str>,
 ) {
     #[cfg(feature = "nvk")]
     {
-        display::take(screen, firmware);
+        let shown = match (screen, firmware) {
+            (None, _) => display::Shown::Nothing,
+            (Some(_), None) => display::Shown::Unknown,
+            (Some(_), Some(function)) => display::Shown::By(function),
+        };
+        display::take(screen.unwrap_or((0, 0)), shown);
         gate::open_service();
     }
 }
