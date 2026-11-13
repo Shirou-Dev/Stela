@@ -91,11 +91,15 @@ static int map_scatter(struct device *dev, struct scatterlist *list, int entries
 	struct scatterlist *entry;
 	int i;
 
+	if (entries > 1)
+		dev_info(dev, "map_scatter: mapping %d entries\n", entries);
+
 	for_each_sg(list, entry, entries, i) {
 		dma_addr_t address = map_phys(dev, sg_phys(entry), entry->length, direction,
 					      attributes);
 
 		if (address == DMA_MAPPING_ERROR) {
+			dev_warn(dev, "map_scatter: entry %d failed\n", i);
 			unmap_scatter(dev, list, i, direction, attributes);
 			return -EIO;
 		}
@@ -109,15 +113,20 @@ static void *alloc_coherent(struct device *dev, size_t size, dma_addr_t *address
 			    unsigned long attributes)
 {
 	unsigned int order = (unsigned int)get_order(size);
+	dev_info(dev, "alloc_coherent: size=%zu order=%u\n", size, order);
 	struct page *page = alloc_pages(gfp | __GFP_ZERO, order);
 
-	if (!page)
+	if (!page) {
+		dev_warn(dev, "alloc_coherent: failed to allocate %zu bytes (order %u)\n", size, order);
 		return NULL;
+	}
 	*address = map_phys(dev, page_to_phys(page), size, DMA_BIDIRECTIONAL, attributes);
 	if (*address == DMA_MAPPING_ERROR) {
+		dev_warn(dev, "alloc_coherent: map_phys failed for %zu bytes\n", size);
 		__free_pages(page, order);
 		return NULL;
 	}
+	dev_info(dev, "alloc_coherent: success, phys=0x%llx\n", (unsigned long long)*address);
 	return page_address(page);
 }
 

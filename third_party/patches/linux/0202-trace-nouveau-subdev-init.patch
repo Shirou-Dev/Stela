@@ -1,13 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 11:45:00 +0000
-Subject: [PATCH] trace(nouveau): instrument subdev, tu102 gsp, and falcon boot progress
+Date: Fri, 13 Nov 2026 15:00:00 +0000
+Subject: [PATCH] fix(nouveau): trace tu102 gsp oneinit and bypass vga workspace mmio
 
 ---
- drivers/gpu/drm/nouveau/nvkm/core/subdev.c      | 11 ++++++-----
- drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c     |  3 +++
- drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c | 10 +++++++++-
- 3 files changed, 18 insertions(+), 6 deletions(-)
+ drivers/gpu/drm/nouveau/nvkm/core/subdev.c           | 11 ++++++-----
+ drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c          |  3 +++
+ drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c | 24 ++++++++++++++++++++++++
+ drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c      | 33 ++++++++++++++++++++++++++-------
+ 4 files changed, 59 insertions(+), 12 deletions(-)
 
 diff --git a/drivers/gpu/drm/nouveau/nvkm/core/subdev.c b/drivers/gpu/drm/nouveau/nvkm/core/subdev.c
 index aab5a73f467a1cc4a28ef1ef6000c929d1e0b43d..6e4f97c092267f830d43fb966bf7308cace08cc5 100644
@@ -67,7 +68,7 @@ index aab5a73f467a1cc4a28ef1ef6000c929d1e0b43d..6e4f97c092267f830d43fb966bf7308c
  }
  
 diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
-index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..a23f4415f512908f91e1f963a36ca5fe4eac6c3d 100644
+index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..4335aced843d5d1f480ca0281edd8462c3eb6de9 100644
 --- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
 +++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
 @@ -191,6 +191,8 @@
@@ -97,13 +98,117 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..a23f4415f512908f91e1f963a36ca5fe
  }
  
  static int
-@@ -330,6 +337,7 @@
- int
- tu102_gsp_oneinit(struct nvkm_gsp *gsp)
+@@ -275,20 +282,9 @@
+ static u64
+ tu102_gsp_vga_workspace_addr(struct nvkm_gsp *gsp, u64 fb_size)
  {
-+	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: starting\n");
+-	struct nvkm_device *device = gsp->subdev.device;
+ 	const u64 base = fb_size - 0x100000;
+-	u64 addr = 0;
+-
+-	if (device->disp)
+-		addr = nvkm_rd32(gsp->subdev.device, 0x625f04);
+-	if (!(addr & 0x00000008))
+-		return base;
+-
+-	addr = (addr & 0xffffff00) << 8;
+-	if (addr < base)
+-		return fb_size - 0x20000;
+-
+-	return addr;
++	nvkm_info(&gsp->subdev, "tu102_gsp_vga_workspace_addr: base = 0x%llx (skipping disp MMIO 0x625f04)\n", base);
++	return base;
+ }
+ 
+ /*
+@@ -333,19 +329,17 @@
  	struct nvkm_device *device = gsp->subdev.device;
  	int ret;
+ 
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: starting\n");
+ 	gsp->fb.size = nvkm_fb_vidmem_size(device);
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: fb.size = 0x%llx\n", gsp->fb.size);
+ 
+ 	gsp->fb.bios.vga_workspace.addr = tu102_gsp_vga_workspace_addr(gsp, gsp->fb.size);
+ 	gsp->fb.bios.vga_workspace.size = gsp->fb.size - gsp->fb.bios.vga_workspace.addr;
+ 	gsp->fb.bios.addr = gsp->fb.bios.vga_workspace.addr;
+ 	gsp->fb.bios.size = gsp->fb.bios.vga_workspace.size;
+-
+-	/*
+-	 * On GA100, VBIOS may lock the top of FB via MMU_LOCK to reserve
+-	 * space for the row remapper.  Mirror OpenRM's kgspCalculateFbLayout
+-	 * by clamping bios.addr to min(mmuLockLo, vgaWorkspace) so that the
+-	 * entire WPR2 layout and gspFwWprEnd stay within usable FB.
+-	 */
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: bios.addr = 0x%llx, size = 0x%llx\n",
++		  gsp->fb.bios.addr, gsp->fb.bios.size);
++
+ 	if (device->chipset == 0x170) {
+ 		u64 lock_lo = ga100_gsp_mmu_lock_lo(gsp);
+ 
+@@ -353,17 +347,23 @@
+ 			gsp->fb.bios.addr = min(gsp->fb.bios.addr, lock_lo);
+ 	}
+ 
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: booter-load ctor...\n");
+ 	ret = gsp->func->booter.ctor(gsp, "booter-load", gsp->fws.booter.load,
+ 				     &device->sec2->falcon, &gsp->booter.load);
+-	if (ret)
+-		return ret;
+-
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: booter-load ret = %d\n", ret);
++	if (ret)
++		return ret;
++
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: booter-unload ctor...\n");
+ 	ret = gsp->func->booter.ctor(gsp, "booter-unload", gsp->fws.booter.unload,
+ 				     &device->sec2->falcon, &gsp->booter.unload);
+-	if (ret)
+-		return ret;
+-
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: booter-unload ret = %d\n", ret);
++	if (ret)
++		return ret;
++
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: calling r535_gsp_oneinit...\n");
+ 	ret = r535_gsp_oneinit(gsp);
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: r535_gsp_oneinit ret = %d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -393,24 +393,33 @@
+ 	gsp->fb.heap.size = 0x100000;
+ 	gsp->fb.heap.addr = gsp->fb.wpr2.addr - gsp->fb.heap.size;
+ 
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: wpr2.addr = 0x%llx, size = 0x%llx\n",
++		  gsp->fb.wpr2.addr, gsp->fb.wpr2.size);
++
+ 	ret = tu102_gsp_wpr_meta_init(gsp);
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: wpr_meta_init ret = %d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* Only boot FWSEC-FRTS if it actually exists */
+ 	if (gsp->fb.wpr2.frts.size) {
++		nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: calling fwsec_frts...\n");
+ 		ret = nvkm_gsp_fwsec_frts(gsp);
++		nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: fwsec_frts ret = %d\n", ret);
+ 		if (WARN_ON(ret))
+ 			return ret;
+ 	}
+ 
+ 	/* Reset GSP into RISC-V mode. */
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: resetting GSP into RISC-V mode...\n");
+ 	ret = gsp->func->reset(gsp);
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: reset ret = %d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+ 	nvkm_falcon_wr32(&gsp->falcon, 0x040, lower_32_bits(gsp->libos.addr));
+ 	nvkm_falcon_wr32(&gsp->falcon, 0x044, upper_32_bits(gsp->libos.addr));
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: finished successfully!\n");
+ 	return 0;
+ }
  
 diff --git a/drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c b/drivers/gpu/drm/nouveau/nvkm/falcon/gm200.c
 index 7c43397c19e61d0b9347ec50034a8808ee0db9fa..dc2158fa3c850605581f1e57f94effca2c9e078a 100644
@@ -123,5 +228,89 @@ index 7c43397c19e61d0b9347ec50034a8808ee0db9fa..dc2158fa3c850605581f1e57f94effca
  
 +	nvkm_info(falcon->user, "gm200_flcn_fw_boot: finished with ret=%d (mbox0=%08x mbox1=%08x)\n", ret, mbox0, mbox1);
  	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+index 94925f1590ea48820b50cbbe2ba56562f8b75056..46427478e40ec7bfc5f7a2f4b68235f13a0cb4b3 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+@@ -2141,31 +2141,39 @@
+ 	u64 size;
+ 	int ret;
+ 
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: starting\n");
+ 	mutex_init(&gsp->cmdq.mutex);
+ 	mutex_init(&gsp->msgq.mutex);
+ 
+ 	/* Load GSP firmware from ELF image into DMA-accessible memory. */
+ 	ret = r535_gsp_elf_section(gsp, ".fwimage", &data, &size);
+-	if (ret)
+-		return ret;
+-
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: elf .fwimage ret=%d size=%llu\n", ret, size);
++	if (ret)
++		return ret;
++
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: ctor gsp-rm firmware (%llu bytes)...\n", size);
+ 	ret = nvkm_firmware_ctor(&r535_gsp_fw, "gsp-rm", device, data, size, &gsp->fw);
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: ctor gsp-rm firmware ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* Load relevant signature from ELF image. */
+ 	ret = r535_gsp_elf_section(gsp, gsp->func->sig_section, &data, &size);
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: elf sig_section ret=%d size=%llu\n", ret, size);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = nvkm_gsp_mem_ctor(gsp, ALIGN(size, 256), &gsp->sig);
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: mem_ctor sig ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+ 	memcpy(gsp->sig.data, data, size);
+ 
+ 	/* Build radix3 page table for ELF image. */
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: building radix3 table...\n");
+ 	ret = nvkm_gsp_radix3_sg(gsp, &gsp->fw.mem.sgt, gsp->fw.len, &gsp->radix3);
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: radix3 ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2183,27 +2191,36 @@
+ 	if (rmapi->gsp->drop_post_nocat_record)
+ 		rmapi->gsp->drop_post_nocat_record(gsp);
+ 
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: ctor rm_boot...\n");
+ 	ret = r535_gsp_rm_boot_ctor(gsp);
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: rm_boot_ctor ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* Release FW images - we've copied them to DMA buffers now. */
+ 	nvkm_gsp_dtor_fws(gsp);
+ 
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: libos_init...\n");
+ 	ret = r535_gsp_libos_init(gsp);
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: libos_init ret=%d\n", ret);
+ 	if (WARN_ON(ret))
+ 		return ret;
+ 
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: set_system_info...\n");
+ 	ret = rmapi->gsp->set_system_info(gsp);
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: set_system_info ret=%d\n", ret);
+ 	if (WARN_ON(ret))
+ 		return ret;
+ 
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: rpc_set_registry...\n");
+ 	ret = r535_gsp_rpc_set_registry(gsp);
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: rpc_set_registry ret=%d\n", ret);
+ 	if (WARN_ON(ret))
+ 		return ret;
+ 
+ 	mutex_init(&gsp->client_id.mutex);
+ 	idr_init(&gsp->client_id.idr);
++	nvkm_info(&gsp->subdev, "r535_gsp_oneinit: complete!\n");
+ 	return 0;
  }
  
