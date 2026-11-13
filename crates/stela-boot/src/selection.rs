@@ -374,15 +374,6 @@ fn find<'a>(target: &Target, pending: &'a Pending) -> Result<Partition<'a>> {
     })
 }
 
-/// Whether the partition Install macOS chose before (`SERIAL:GUID`) is on
-/// this PC: exactly one disk with its serial, and exactly one partition
-/// with its GUID that is no EFI system partition. The menu asks about the
-/// disk as it is, whatever is pending.
-pub fn chosen_present(disk: &str) -> bool {
-    disk.parse::<Target>()
-        .is_ok_and(|target| matches!(search(&target, &Pending::default()), Ok(Ok(_))))
-}
-
 /// Why the partition `target` names is no longer there to boot, when it is
 /// not (`chosen_disk::Stale::of`).
 fn stale(target: &Target, pending: &Pending) -> Result<Option<Stale>> {

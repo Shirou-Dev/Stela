@@ -45,7 +45,6 @@ use {
     stela_formats::payload::gpt::Guid, stela_formats::payload::gpt::Role,
     stela_formats::payload::gpt::Table, stela_runtime::pc::disk_plan,
     stela_runtime::pc::disk_plan::Plan, stela_runtime::pc::machine_state,
-    stela_runtime::pc::storage::Target,
 };
 
 const MIB: u64 = 1 << 20;
@@ -467,48 +466,6 @@ fn log(plan: &Plan, how: &str) {
         plan.partition.blocks,
         plan.table.len()
     ));
-}
-
-/// Install macOS again on the Stela partition chosen before (`SERIAL:GUID`),
-/// as choosing it again in the picker does: the plan that leaves its table
-/// unchanged and makes its first MiB and machine state blank.
-pub fn again(chosen: &str) -> Result<Plan> {
-    let target: Target = chosen.parse()?;
-    let mut disks = disks();
-    let disk = disks
-        .iter_mut()
-        .find(|disk| disk.serial.as_deref() == Some(target.serial.as_str()))
-        .ok_or(refuse!("the disk chosen before is not there"))?;
-    let index = disk
-        .table
-        .as_ref()
-        .and_then(|table| {
-            table.partitions.iter().position(|partition| {
-                partition.unique_guid == target.partition
-                    && partition.role() == Some(Role::AppleRegion)
-            })
-        })
-        .ok_or(refuse!("the partition chosen before is not there"))?;
-    if let Some(refusal) = disk.refusal {
-        return Err(refuse!("{refusal}", refusal));
-    }
-    let seen = disk.seen()?;
-    let plan = disk_plan::plan(
-        &disk_plan::Decision {
-            serial: &target.serial,
-            geometry: disk.geometry,
-            seen,
-            table: disk.table.as_ref(),
-            deleted: &[],
-            erased: false,
-            place: disk_plan::Place::Reuse(index),
-            name: NAME,
-        },
-        &mut disk.entropy(),
-    )
-    .map_err(|error| refuse!("{error}", %error))?;
-    log(&plan, "the partition chosen before, again");
-    Ok(plan)
 }
 
 /// Open `handle`'s block I/O, without taking it from its driver.

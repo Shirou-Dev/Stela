@@ -192,9 +192,6 @@ fn storage(options: &str) -> Option<&str> {
 enum Item {
     /// Entry `n` of the startup choices.
     Choice(usize, ChoiceKind),
-    /// Entry `n`, an Install macOS that chooses its disk, on a disk other
-    /// than the one chosen before; named.
-    Another(usize, String),
     /// One of the PC firmware's own boot entries.
     Firmware(Entry),
 }
@@ -204,9 +201,6 @@ struct Menu<'a> {
     choices: &'a Choices,
     /// The partition Install macOS chose, when it chose one.
     disk: Option<String>,
-    /// [`Self::disk`] is still on this PC and holds no macOS: Install macOS
-    /// goes on with it, and [`Item::Another`] chooses another.
-    present: bool,
     items: Vec<Item>,
     selected: usize,
     /// Seconds before the first entry starts, while the countdown runs.
@@ -258,11 +252,6 @@ impl<'a> Menu<'a> {
             .filter(|((_, r), _)| **r == Readiness::Ready)
             .map(|(_, options)| options.as_deref().and_then(storage))
             .collect();
-        // A disk with macOS on it is erased only through the picker, which
-        // asks first.
-        let present = disk
-            .as_deref()
-            .is_some_and(|disk| !prepared.contains(&Some(disk)) && selection::chosen_present(disk));
         let mut items = Vec::new();
         for (n, entry) in choices.entries.iter().enumerate() {
             let kind = entry.kind();
@@ -285,12 +274,7 @@ impl<'a> Menu<'a> {
                     n + 1,
                     entry.name
                 )),
-                None => {
-                    items.push(Item::Choice(n, kind));
-                    if present && kind == ChoiceKind::Setup && unchosen(entry.options.as_bytes()) {
-                        items.push(Item::Another(n, format!("{} on another disk", entry.name)));
-                    }
-                }
+                None => items.push(Item::Choice(n, kind)),
             }
         }
         // A setup without its restore choice still lists its own.
@@ -330,7 +314,6 @@ impl<'a> Menu<'a> {
         Self {
             choices,
             disk,
-            present,
             countdown: match opens {
                 Opening::Countdown(seconds) => Some(seconds),
                 Opening::Glance | Opening::Wait => None,
@@ -346,7 +329,6 @@ impl<'a> Menu<'a> {
     fn name(&self, item: &'a Item) -> &'a str {
         match item {
             Item::Choice(n, _) => &self.choices.entries[*n].name,
-            Item::Another(_, name) => name,
             Item::Firmware(entry) => &entry.name,
         }
     }
@@ -468,23 +450,21 @@ fn asked() -> bool {
     pressed().is_some() || matches!(key(Some(GLANCE)), Wait::Key(_))
 }
 
-/// `menu` until one of `choices` is chosen; its options. Install macOS on a
-/// disk not chosen yet, no longer on this PC or holding macOS opens the
-/// disk picker first ([`installer::choose`]), as does its "on another disk"
-/// item, and returns to the menu when it is left; with the disk chosen
-/// before still here and without macOS it goes on with that one, blank
-/// again ([`installer::again`]). Either gives a plan and writes nothing to
-/// the disk; the plan goes with the options. A firmware entry chosen
-/// restarts the PC into it. `None` without console input to choose with.
+/// `menu` until one of `choices` is chosen; its options. Install macOS that
+/// chooses its disk always opens the disk picker first
+/// ([`installer::choose`]), where the partition chosen before can be chosen
+/// again, and returns to the menu when the picker is left. The picker gives
+/// a plan and writes nothing to the disk; the plan goes with the options. A
+/// firmware entry chosen restarts the PC into it. `None` without console
+/// input to choose with.
 fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Option<Chosen> {
     loop {
         let index = menu.run()?;
-        let (n, picker) = match &menu.items[index] {
-            Item::Another(n, _) => (*n, true),
+        let n = match &menu.items[index] {
             Item::Choice(n, ChoiceKind::Setup)
                 if unchosen(choices.entries[*n].options.as_bytes()) =>
             {
-                (*n, !menu.present)
+                *n
             }
             Item::Choice(n, _) => {
                 return Some(chosen(choices, *n, menu.disk.as_deref()).into());
@@ -495,22 +475,6 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
                 continue;
             }
         };
-        if !picker {
-            let disk = menu.disk.clone()?;
-            match crate::installer::again(&disk) {
-                Ok(plan) => {
-                    return Some(Chosen {
-                        options: chosen(choices, n, Some(&disk)),
-                        plan: Some(plan),
-                    });
-                }
-                Err(error) => {
-                    output::arguments(format_args!("INSTALLER again refused: {error}\n"));
-                    menu.notice = Some("The disk chosen before cannot be used again.");
-                    continue;
-                }
-            }
-        }
         let Some(plan) = crate::installer::choose() else {
             continue;
         };
