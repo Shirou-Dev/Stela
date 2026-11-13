@@ -84,6 +84,16 @@ static void tile_span(NSUInteger start, NSUInteger length, NSUInteger tile, NSUI
 	*count = high > low ? high - low : 0;
 }
 
+/* Names to the kernel console why a device failed before its gate could carry
+ * the report: the kext logs the accelerator's kStelaGPUPluginReportKey once. A
+ * task the sandbox keeps from setting it is not heard. */
+static void report_open(io_service_t accelerator, NSString *step)
+{
+	NSLog(@"StelaGPU: %@", step);
+	IORegistryEntrySetCFProperty(accelerator, (__bridge CFStringRef)@kStelaGPUPluginReportKey,
+				     (__bridge CFTypeRef)step);
+}
+
 @implementation StelaGPUDevice {
 	io_service_t _port;
 	id _acceleratorService;
@@ -146,12 +156,15 @@ static void tile_span(NSUInteger start, NSUInteger length, NSUInteger tile, NSUI
 	_wake = dispatch_semaphore_create(0);
 	mach_vm_address_t page = 0;
 	mach_vm_size_t bytes = 0;
-	if (IOServiceOpen(port, mach_task_self(), kStelaGPUUserClientType, &_gate.connect) != KERN_SUCCESS) {
+	kern_return_t opened = IOServiceOpen(port, mach_task_self(), kStelaGPUUserClientType, &_gate.connect);
+	if (opened != KERN_SUCCESS) {
+		report_open(port, [NSString stringWithFormat:@"IOServiceOpen failed: 0x%x", opened]);
 		return nil;
 	}
-	if (IOConnectMapMemory64(_gate.connect, kStelaGPUGateMemory, mach_task_self(), &page, &bytes,
-				 kIOMapAnywhere | kIOMapDefaultCache)
-	    != KERN_SUCCESS) {
+	kern_return_t mapped = IOConnectMapMemory64(_gate.connect, kStelaGPUGateMemory, mach_task_self(), &page,
+						    &bytes, kIOMapAnywhere | kIOMapDefaultCache);
+	if (mapped != KERN_SUCCESS) {
+		report_open(port, [NSString stringWithFormat:@"gate page map failed: 0x%x", mapped]);
 		IOServiceClose(_gate.connect);
 		return nil;
 	}
@@ -162,13 +175,16 @@ static void tile_span(NSUInteger start, NSUInteger length, NSUInteger tile, NSUI
 	StelaFailure failure;
 	if (STELA_CALL(&_gate, Negotiate, &versions, &agreed, &failure) != StelaStatusOk) {
 		stela_report("the service's protocol", &failure);
+		report_open(port, [NSString stringWithFormat:@"protocol %u.%u refused: status %u", STELA_MAJOR,
+							     STELA_MINOR, failure.status]);
 		return nil;
 	}
 	stela_report_to(&_gate);
 	StelaEmpty nothing = {};
 	if (agreed.capability_bytes != sizeof(*_capabilities)) {
-		NSLog(@"StelaGPU: the capability block is %u bytes, not %zu", agreed.capability_bytes,
-		      sizeof(*_capabilities));
+		NSString *message = [NSString stringWithFormat:@"the capability block is %u bytes, not %zu",
+							       agreed.capability_bytes, sizeof(*_capabilities)];
+		report_open(port, message);
 		return nil;
 	}
 	_capabilities = malloc(sizeof(*_capabilities));

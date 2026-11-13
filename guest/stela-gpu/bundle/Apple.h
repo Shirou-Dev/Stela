@@ -222,6 +222,7 @@ kern_return_t IOConnectCallAsyncScalarMethod(io_connect_t connect, uint32_t sele
 kern_return_t IOObjectRetain(io_object_t object);
 kern_return_t IOObjectRelease(io_object_t object);
 CFTypeRef IORegistryEntryCreateCFProperty(io_service_t entry, CFStringRef key, const void *allocator, uint32_t options);
+kern_return_t IORegistryEntrySetCFProperty(io_service_t entry, CFStringRef key, CFTypeRef value);
 kern_return_t IORegistryEntryGetRegistryEntryID(io_service_t entry, uint64_t *identifier);
 IONotificationPortRef IONotificationPortCreate(mach_port_t main);
 mach_port_t IONotificationPortGetMachPort(IONotificationPortRef port);

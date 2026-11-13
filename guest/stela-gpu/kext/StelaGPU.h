@@ -21,6 +21,7 @@
 #include <kern/thread.h>
 
 #include "IOAccelerator.h"
+#include "plugin_report.h"
 
 class StelaGPU : public IOAccelerator {
 	OSDeclareDefaultStructors(StelaGPU);
@@ -29,6 +30,12 @@ public:
 	bool start(IOService *provider) override;
 	void stop(IOService *provider) override;
 	void free() override;
+	/* Logs each process's first open result of each kind (plugin_report.h). */
+	using IOAccelerator::newUserClient;
+	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+	    IOUserClient **handler) override;
+	/* Takes a plugin's kStelaGPUPluginReportKey alone, to log it once. */
+	IOReturn setProperties(OSObject *properties) override;
 
 	/* Opens a gate connection, answering its gate page, 0 when none is free. */
 	uint64_t openGate();
@@ -63,6 +70,8 @@ private:
 	/* Maps the gate's control page and takes its interrupt. */
 	bool attachGate(IOService *provider);
 	static void interruptOccurred(OSObject *owner, IOInterruptEventSource *source, int count);
+	/* Logs "StelaGPU: <this process>: <event>" unless logged before. */
+	void reportOnce(const char *event);
 	uint64_t read(uint64_t reg) const;
 	void write(uint64_t reg, uint64_t value);
 
@@ -78,6 +87,8 @@ private:
 	/* A stopped provider with unretired DMA cannot be freed or unloaded. */
 	bool retainedForDma = false;
 	uint64_t completionCount = 0;
+	/* With lock held: the lines reportOnce logged. */
+	stela_plugin_reports *reports = nullptr;
 };
 
 class StelaGPUUserClient : public IOUserClient {

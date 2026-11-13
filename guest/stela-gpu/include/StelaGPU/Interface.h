@@ -11,6 +11,13 @@
  */
 #pragma once
 
+/*
+ * The accelerator's property a plugin that fails before its gate connection
+ * opens sets to a short printable string naming the failed step, which the
+ * kext logs to the kernel console once.
+ */
+#define kStelaGPUPluginReportKey "StelaPluginReport"
+
 enum {
 	/* The `IOServiceOpen` type. */
 	kStelaGPUUserClientType = 0,
