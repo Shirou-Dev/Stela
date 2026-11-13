@@ -1832,6 +1832,11 @@ pub unsafe fn open(
             "USB VENDOR WARNING {location}: {error}; started without its firmware patch\n"
         ));
     }
+    for address in &devices.bridges_reopened {
+        output::arguments(format_args!(
+            "HOST PCI bridge {address} had bus mastering off: turned on for the devices below it\n"
+        ));
+    }
     for (address, class, why) in &devices.unsupported {
         output::arguments(format_args!(
             "HOST UNSUPPORTED pci={address} class={:02x}{:02x}{:02x}: {why}\n",

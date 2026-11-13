@@ -745,6 +745,10 @@ pub struct Devices {
     /// Storage, network, audio and USB functions no driver here takes, with
     /// their class and why.
     pub unsupported: Vec<(Address, [u8; 3], &'static str)>,
+    /// PCI bridges found with bus mastering off, which the scan turned on
+    /// so the functions below them reach memory and the interrupt
+    /// controllers.
+    pub bridges_reopened: Vec<Address>,
     /// Functions whose start ran past [`DEVICE_START_US`]: their waits then
     /// ended at once, the driver gave up, and the function was left with
     /// bus mastering and interrupts off where the probe still held it.
@@ -1605,6 +1609,20 @@ pub unsafe fn probe_observed(
             if function.class[..2] == [6, 4] {
                 use crate::bus::pci::ConfigSpace;
                 let checked = (|| -> Result<_, BlockError> {
+                    // A driver that enables a function needs every bridge
+                    // above it to forward the function's DMA and message
+                    // interrupts upstream: Linux's `pci_enable_bridge`. A
+                    // mount that stopped the bridges and did not reopen
+                    // them itself leaves that to this scan, which visits a
+                    // bridge before the functions below it.
+                    if legacy_pci_writes
+                        && function.config().read16(crate::bus::pci::regs::COMMAND)?
+                            & crate::bus::pci::regs::COMMAND_MASTER
+                            == 0
+                    {
+                        function.enable_memory_and_bus_master()?;
+                        devices.bridges_reopened.push(address);
+                    }
                     Ok(native::Bridge {
                         address,
                         secondary: function.config().read8(0x19)?,
@@ -3201,6 +3219,66 @@ mod tests {
                 "{first:?}"
             );
         }
+    }
+
+    /// A bridge found with bus mastering off forwards nothing upstream from
+    /// the functions below it; the scan turns it on, as Linux's
+    /// `pci_enable_bridge` does, and says so. One that forwards is left.
+    #[test]
+    fn a_bridge_with_bus_mastering_off_is_reopened_for_the_functions_below_it() {
+        let mut ecam = alloc::vec![u32::MAX; (1 << 20) / 4];
+        for (device, command) in [(0, 0x0002), (1, 0x0006)] {
+            let start = device * (1 << 15) / 4;
+            let page = &mut ecam[start..start + 4096 / 4];
+            page.fill(0);
+            page[0] = 0x5678_1234;
+            page[1] = command;
+            page[2] = 0x0604_0000;
+            page[3] = 0x0001_0000;
+        }
+        let window = EcamWindow {
+            base: ecam.as_mut_ptr() as u64,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 0,
+        };
+        let handoff = Handoff {
+            ecam: alloc::vec![window],
+            mapped: alloc::vec![window.range()],
+            dma: 0..0,
+            clock: Clock {
+                ticks_per_microsecond: 1,
+            },
+            firmware: None,
+            completion: None,
+        };
+        let services = services::tests::Refusing::minimum_only();
+        // SAFETY: no DMA pages, only the synthetic ECAM mapped, and every
+        // native grant refused.
+        let mut dma = unsafe { crate::bus::dma::RegionAllocator::new(0..0) };
+        // SAFETY: as above.
+        let devices = unsafe {
+            probe_with_provider(
+                &handoff,
+                PlatformCaptures::default(),
+                &mut dma,
+                handoff_provider(&handoff),
+                Some(&services),
+                None,
+            )
+        };
+        assert_eq!(
+            devices.bridges_reopened,
+            [Address {
+                segment: 0,
+                bus: 0,
+                device: 0,
+                function: 0,
+            }]
+        );
+        assert!(devices.failures.is_empty());
+        assert_eq!(ecam[1] & 0xffff, 0x0006);
+        assert_eq!(ecam[(1 << 15) / 4 + 1] & 0xffff, 0x0006);
     }
 
     /// Every function a driver here claims ends its probe with a record:
