@@ -456,6 +456,32 @@ fn a_fatal_status_standing_at_ready_fails_no_command_the_controller_answers() {
     ));
 }
 
+/// CAP.MQES bounds the I/O queues alone, as Linux shortens its I/O queue
+/// depth to it: a controller with four-entry queues is started with a
+/// four-entry I/O queue and three tags. Only the reserved MQES 0, one
+/// entry that can hold no command, is refused.
+#[test]
+fn a_short_mqes_shortens_the_io_queue_and_only_one_entry_is_refused() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.clock = Clock {
+        ticks_per_microsecond: 1,
+    };
+    // MQES 3, CAP.TO one half second, the NVM command set. The fixture's
+    // CSTS never shows RDY, so the start ends waiting for it.
+    c.registers
+        .write64(CAPABILITIES, 3 | 1 << 24 | 1 << 37)
+        .unwrap();
+    assert_eq!(c.initialize(), Err(BlockError::Timeout.at(ENABLE_WAIT)));
+    assert_eq!(c.io.entries, 4);
+    assert_eq!(c.tags.len(), 3);
+    c.registers
+        .write64(CAPABILITIES, 1 << 24 | 1 << 37)
+        .unwrap();
+    assert!(matches!(c.initialize(), Err(BlockError::Unsupported(_))));
+}
+
 #[test]
 fn submission_publication_keeps_the_whole_wire_entry_and_rings_its_queue() {
     let fixture = Fixture::new();

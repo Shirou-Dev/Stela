@@ -66,11 +66,13 @@ impl Controller {
                 "NVMe controller without 4 KiB pages",
             ));
         }
-        // CAP.MQES is zero-based; both queues must fit.
+        // CAP.MQES, zero-based, bounds the I/O queues alone; AQA sizes the
+        // admin queue. Linux shortens its I/O queues to it, refusing none
+        // (the value 0, one entry, is reserved).
         let longest = (capabilities & 0xffff) + 1;
-        if longest < u64::from(ADMIN_ENTRIES) {
+        if longest < 2 {
             return Err(BlockError::Unsupported(
-                "NVMe queues shorter than 16 entries",
+                "NVMe controller reports one-entry queues (CAP.MQES 0)",
             ));
         }
         self.io.entries = self
