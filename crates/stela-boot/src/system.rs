@@ -1012,6 +1012,7 @@ fn load(
             amd_tables,
             device_skips,
             device_needs,
+            stop_record: crate::stop_record::services(),
         });
     }
     // SAFETY: boot services ended; the completed root maps this code and

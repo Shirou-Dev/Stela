@@ -47,6 +47,7 @@ pub fn open() -> Option<Guid> {
         let writer = Writer::open(&mut *device)
             .map_err(|error| refuse!("firmware boot log: {error}", %error))?;
         report(&writer, "firmware");
+        crate::stop_record::set_boot(writer.boots());
         output::add_log(writer, device, Log::Firmware)
             .map_err(|error| refuse!("firmware boot log output: {error}", %error))?;
         Ok(partition)

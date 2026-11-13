@@ -57,6 +57,7 @@ mod selection;
 mod serial;
 mod status;
 mod stop;
+mod stop_record;
 mod storage;
 mod system;
 mod tables;
@@ -260,7 +261,13 @@ fn main() -> Status {
     };
     status::set_clock(firmware::tsc_hz());
     firmware::start_ticker();
+    // A stop the USB's log cannot keep leaves its record in the firmware.
+    stop_record::arm(stop_record::Services::capture(), None);
     let log = log_file::open();
+    // The record of such a stop at an earlier start reaches the log now.
+    if log.is_some() {
+        stop_record::carry();
+    }
     output::arguments(format_args!("{}", host_identity()));
     if output::hypervisor_exit_port() {
         output::arguments(format_args!(
@@ -324,6 +331,8 @@ fn main() -> Status {
         console::install(screen);
         output::arguments(format_args!("STELA UEFI MOUNT\n"));
     }
+    // The storage check's tables do not map the firmware's runtime regions.
+    stop_record::disarm();
     // SAFETY: boot services have ended; the new tables map the image, heap,
     // the stack and every RAM byte in use.
     unsafe {

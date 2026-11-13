@@ -494,6 +494,54 @@ impl Drop for RestoreRoot {
     }
 }
 
+/// Run `call` in the loader's root for a stop's one firmware call
+/// (`stop_record`), without the host drivers' lock: the stopped processor
+/// may hold it, or one that never lets go, and the call reaches no driver.
+/// Interrupts are masked meanwhile, and SMAP is lifted as for a driver
+/// call. A processor that stopped inside a driver call is in that root
+/// already.
+///
+/// # Safety
+/// `root` is the live loader root, keeping the engine window, and nothing
+/// resumes this processor's work after the stop.
+pub(super) unsafe fn at_stop_in_loader_root<T>(root: u64, call: impl FnOnce() -> T) -> T {
+    /// CR3's table address.
+    const TABLE: u64 = 0x000f_ffff_ffff_f000;
+    let (flags, previous, cr4): (u64, u64, u64);
+    // SAFETY: CPL0 control register reads; interrupts stay off until the
+    // flags are restored below.
+    unsafe {
+        asm!("pushfq", "pop {flags}", "cli", "mov {previous}, cr3", "mov {cr4}, cr4",
+            flags = out(reg) flags, previous = out(reg) previous, cr4 = out(reg) cr4);
+    }
+    let enter = previous & TABLE != root & TABLE;
+    // Tagged, the load flushes the loader's context alone.
+    let root = if cr4 & PCIDE != 0 {
+        root & !CONTEXT | LOADER_CONTEXT
+    } else {
+        root
+    };
+    // SAFETY: CPL0 with SMAP; the caller's live root, which shares this
+    // code and stack with the root it replaces.
+    unsafe {
+        if cr4 & SMAP != 0 {
+            asm!("stac", options(nomem, nostack));
+        }
+        if enter {
+            asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+        }
+    }
+    let result = call();
+    // SAFETY: the root this processor had, then the flags it had.
+    unsafe {
+        if enter {
+            asm!("mov cr3, {}", in(reg) previous, options(nostack, preserves_flags));
+        }
+        asm!("push {}", "popfq", in(reg) flags);
+    }
+    result
+}
+
 /// Enter the real host-driver lock for the native contention diagnostic.
 ///
 /// # Safety

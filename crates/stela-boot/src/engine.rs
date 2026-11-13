@@ -1379,6 +1379,16 @@ pub(crate) fn starting_host_devices() -> bool {
     storage::starting_devices_here()
 }
 
+/// Run a stop's firmware call in the loader's root `root`
+/// (`storage::at_stop_in_loader_root`).
+///
+/// # Safety
+/// As for `storage::at_stop_in_loader_root`.
+pub(crate) unsafe fn in_loader_root_at_stop<T>(root: u64, call: impl FnOnce() -> T) -> T {
+    // SAFETY: the caller's.
+    unsafe { storage::at_stop_in_loader_root(root, call) }
+}
+
 /// Unload the GPUs' firmware before a fatal stop, where one can
 /// (`gpu::gate::stop_for_fatal`).
 pub(crate) fn stop_gpus_for_fatal() {

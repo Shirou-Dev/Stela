@@ -118,6 +118,11 @@ pub struct Handoff {
     /// The controllers of the disks this boot cannot continue without,
     /// which it never skips (`selection::disk_controllers`).
     pub(crate) device_needs: pc::device_starts::Needed,
+    /// The firmware's variable services, whose regions the loader keeps
+    /// mapped by identity as it does `efi_reset`'s, and this boot's number
+    /// in the USB's log: what a stop the log cannot keep leaves its record
+    /// with (`stop_record`).
+    pub(crate) stop_record: crate::stop_record::Services,
 }
 
 /// A read of the firmware's real-time clock: its time as UTC and its

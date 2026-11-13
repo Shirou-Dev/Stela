@@ -201,6 +201,9 @@ fn start(handoff: u64) -> Started {
     if handoff.magic != MAGIC {
         output::fatal("engine handoff has the wrong magic");
     }
+    // From here a stop the USB's log cannot keep leaves its record in the
+    // firmware; an earlier one has only the screen.
+    crate::stop_record::arm(handoff.stop_record, Some(handoff.root));
     layout::set(handoff.placement);
     // Use the physmap directly: its CPU and physical bases have the
     // same alignment phase. A separately placed heap alias cannot in general

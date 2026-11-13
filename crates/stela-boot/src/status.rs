@@ -259,7 +259,7 @@ impl State {
         let mut text = running.title;
         // A failed step keeps what it was on, such as the PCI function a
         // probe stopped in: before the engine resumes the boot log, the
-        // screen is the only record of it.
+        // screen shows it whatever becomes of the stop's record.
         if matches!(mark, Mark::Failed) && !running.detail.is_empty() {
             text.push_str(" at ");
             text.push_str(&running.detail);
