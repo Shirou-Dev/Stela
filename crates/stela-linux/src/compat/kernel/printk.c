@@ -77,11 +77,11 @@ static int emit_record(int level, const char *fmt, va_list args, bool force_defe
 {
 	const struct stela_linux_owner *owner = stela_linux_owner();
 	static char message[1024];
+	(void)force_deferred;
 	if (flushing)
 		return 0; /* The native log sink must not reenter Linux. */
 	stela_linux_printk_flush();
-	if (owner->services->log &&
-	    (deferred_depth || deferred_owner || (force_deferred && !stela_linux_quiescent()))) {
+	if (owner && owner->services && owner->services->log && deferred_depth > 0) {
 		if (deferred_owner && deferred_owner != owner)
 			return 0;
 		deferred_owner = owner;
@@ -90,13 +90,13 @@ static int emit_record(int level, const char *fmt, va_list args, bool force_defe
 			record->level = level;
 			return vscnprintf(record->text, sizeof(record->text), fmt, args);
 		}
-		if (deferred_dropped != UINT_MAX)
-			deferred_dropped++;
-		return vscnprintf(message, sizeof(message), fmt, args);
 	}
 	int length = vscnprintf(message, sizeof(message), fmt, args);
-	if (owner->services->log)
+	if (owner && owner->services && owner->services->log) {
+		flushing = true;
 		owner->services->log(owner->context, level, message);
+		flushing = false;
+	}
 	return length;
 }
 
