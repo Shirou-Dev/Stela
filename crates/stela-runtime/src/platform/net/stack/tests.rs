@@ -454,6 +454,51 @@ fn a_network_without_dhcp_reports_no_ipv4_lease() {
     }
 }
 
+/// A switch port that runs spanning tree forwards nothing for 30 seconds
+/// after the link comes up: the client still asks after that, and gives up
+/// only after a minute.
+#[test]
+fn dhcp_still_asks_after_a_spanning_tree_port_starts_forwarding() {
+    /// Each reading advances 100 ms.
+    #[derive(Clone)]
+    struct Coarse(Rc<Cell<u64>>);
+    impl Clock for Coarse {
+        fn now_us(&self) -> Result<u64, ClockError> {
+            self.0.set(self.0.get() + 100_000);
+            Ok(self.0.get())
+        }
+    }
+    /// Notes when each DHCP request (UDP to port 67) left.
+    struct Recording(End, Coarse, Rc<RefCell<Vec<u64>>>);
+    impl Link for Recording {
+        fn mac(&self) -> Mac {
+            self.0.mac()
+        }
+        fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
+            if frame.len() > 38 && frame[12..14] == [0x08, 0x00] && frame[36..38] == [0, 67] {
+                self.2.borrow_mut().push(self.1.0.get());
+            }
+            self.0.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+            self.0.receive()
+        }
+    }
+    let clock = Coarse(Rc::default());
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let silent = End {
+        mac: CLIENT,
+        out: Rc::default(),
+        into: Rc::default(),
+    };
+    let link = Recording(silent, clock.clone(), requests.clone());
+    let mut stack = Stack::new(link, clock.clone(), 7).unwrap();
+    assert!(matches!(stack.automatic(), Err(NetError::Dhcp(_))));
+    assert!(clock.0.get() >= 60_000_000, "{}", clock.0.get());
+    let requests = requests.borrow();
+    assert!(requests.iter().any(|&at| at > 31_000_000), "{requests:?}");
+}
+
 #[test]
 fn a_silent_or_absent_peer_times_out() {
     let clock = TestClock::default();
@@ -517,7 +562,7 @@ fn a_signalling_link_sleeps_until_the_deadline_when_nothing_arrives() {
         Err(NetError::Dhcp(why)) => assert!(why.starts_with("no IPv4 lease"), "{why}"),
         other => panic!("{other:?}"),
     }
-    // DHCP's retransmissions bound each sleep, so the 30 s wait takes a
+    // DHCP's retransmissions bound each sleep, so the 60 s wait takes a
     // handful of sleeps rather than a poll per clock reading.
     assert!((1..64).contains(&clock.1.get()), "{}", clock.1.get());
     assert!(clock.0.get() >= DHCP_WAIT_US);

@@ -207,7 +207,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
                     return Err(NetError::DuplicateAddress(*address));
                 }
                 return Err(NetError::Dhcp(
-                    "no DHCPv4 lease or usable IPv6 router advertisement within 30 seconds; stateful DHCPv6 is unsupported",
+                    "no DHCPv4 lease or usable IPv6 router advertisement within 60 seconds; stateful DHCPv6 is unsupported",
                 ));
             }
             self.wait_until(deadline)?;

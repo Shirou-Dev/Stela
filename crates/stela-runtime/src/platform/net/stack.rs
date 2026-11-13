@@ -31,8 +31,13 @@ pub struct Config {
     pub dns: Vec<Ipv4>,
 }
 
-/// smoltcp's DHCP client retries within this.
-const DHCP_WAIT_US: u64 = 30_000_000;
+/// smoltcp's DHCP client asks every 10 seconds within this. A switch port
+/// that runs spanning tree forwards nothing for its first 30 seconds after
+/// the link comes up (IEEE 802.1D: 15 s listening, 15 s learning), and the
+/// adapter's start has just dropped and raised the link, so a wait of 30
+/// seconds lost every request there. Other systems' clients ask for a
+/// minute or longer.
+const DHCP_WAIT_US: u64 = 60_000_000;
 /// smoltcp's resolver retries each server within this.
 const DNS_WAIT_US: u64 = 15_000_000;
 /// How long a name's address is used before it is looked up again.
@@ -499,7 +504,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
             }
             if self.now()? >= deadline {
                 return Err(NetError::Dhcp(
-                    "no IPv4 lease: no DHCP server answered within 30 seconds",
+                    "no IPv4 lease: no DHCP server answered within 60 seconds",
                 ));
             }
             self.poll()?;
