@@ -176,6 +176,10 @@ struct Model {
     stuck_ready: bool,
     /// CSTS.RDY never follows CC.EN: the controller never answers.
     never_ready: bool,
+    /// After each enable, this many CSTS reads report CSTS.CFS without
+    /// CSTS.RDY before the controller is ready; `usize::MAX` for ever.
+    fatal_while_enabling: usize,
+    enabling_reads: usize,
     coherent: bool,
     events: Vec<&'static str>,
     commands: usize,
@@ -260,6 +264,8 @@ impl Model {
             fail_disable: false,
             stuck_ready: false,
             never_ready: false,
+            fatal_while_enabling: 0,
+            enabling_reads: 0,
             coherent: true,
             events: Vec::new(),
             commands: 0,
@@ -758,6 +764,12 @@ unsafe impl Registers for Regs {
         if m.fail_read {
             return Err(register_error());
         }
+        if offset == 0x1c && m.enabled && m.enabling_reads > 0 {
+            if m.enabling_reads != usize::MAX {
+                m.enabling_reads -= 1;
+            }
+            return Ok(1 << 1);
+        }
         if offset == 0x1c {
             return Ok(u32::from((m.enabled && !m.never_ready) || m.stuck_ready)
                 | u32::from(m.fatal) << 1
@@ -776,6 +788,7 @@ unsafe impl Registers for Regs {
                 if value & 1 != 0 {
                     assert!(m.dma_enabled());
                     m.enabled = true;
+                    m.enabling_reads = m.fatal_while_enabling;
                     m.stopped = false;
                     m.queues[0] = (m.register64(0x28), m.register64(0x30));
                     m.record("enable");
@@ -1127,6 +1140,35 @@ fn a_controller_that_never_becomes_ready_fails_within_its_bound() {
     let took_us = (Clock::ticks() - started) / 1000;
     assert!(took_us < 40_000, "{took_us}");
     assert!(budget.expired().is_some());
+}
+
+/// Linux `nvme_wait_ready` waits for CSTS.RDY alone: a controller showing
+/// CSTS.CFS while it starts is waited for, at attach and at a reset, and
+/// one that stays fatal fails at its ready timeout with its CSTS.
+#[test]
+fn a_fatal_status_while_enabling_is_waited_out_like_nvme_wait_ready() {
+    let _clock = crate::test_clock::virtualize();
+    let f = Fixture::new();
+    f.model.lock().unwrap().fatal_while_enabling = 3;
+    let mut a = f.attach().unwrap();
+    assert_eq!(f.model.lock().unwrap().enabling_reads, 0);
+    let disk = &mut a.namespaces[0];
+    disk.write(0, &[0x3c; 512]).unwrap();
+    // A reset enables the controller the same way.
+    disk.controller.borrow_mut().reset_and_settle().unwrap();
+    assert_eq!(f.model.lock().unwrap().enabling_reads, 0);
+    let mut data = [0; 512];
+    disk.read(0, &mut data).unwrap();
+    assert_eq!(data, [0x3c; 512]);
+    disk.retire_owned().unwrap();
+
+    let f = Fixture::new();
+    f.model.lock().unwrap().fatal_while_enabling = usize::MAX;
+    let started = Clock::ticks();
+    assert_eq!(f.attach().err(), Some(BlockError::Device { status: 2 }));
+    let took_us = (Clock::ticks() - started) / 1000;
+    assert!((500_000..2_000_000).contains(&took_us), "{took_us}");
+    assert_eq!(f.model.lock().unwrap().commands, 0);
 }
 
 #[test]

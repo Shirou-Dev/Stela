@@ -93,7 +93,21 @@ impl Controller {
             owner.lifecycle.enable_dma()?;
         }
         let timeout = self.enable()?;
-        self.wait_status(timeout, |status| status & (READY | FATAL) != 0)?;
+        self.wait_enabled(timeout)
+    }
+
+    /// Linux `nvme_wait_ready` after CC.EN is set: CSTS.RDY alone ends the
+    /// wait. CSTS.CFS standing while the controller starts, left from
+    /// before its reset, is not a failure; one still set once the
+    /// controller is ready, or at the timeout, is.
+    fn wait_enabled(&self, timeout: u64) -> Result<(), BlockError> {
+        match self.wait_status(timeout, |status| status & READY != 0) {
+            Err(BlockError::Timeout) => {
+                self.check_fatal()?;
+                return Err(BlockError::Timeout);
+            }
+            other => other?,
+        }
         self.check_fatal()
     }
 
