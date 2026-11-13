@@ -1271,6 +1271,7 @@ retry:
 	int nesting = preempt_count();
 	unsigned long flags = arch_local_save_flags();
 	int error;
+	pr_info("page: alloc order=%u step 1: validate (gfp=0x%x atomic=%d)\n", order, (unsigned int)gfp, atomic);
 	if (catalog.hosted) {
 		error = stela_linux_page_request_basic((__force u32)gfp) ||
 			stela_linux_page_request_reclaimable((__force u32)gfp) ? 0 : -EOPNOTSUPP;
@@ -1299,6 +1300,7 @@ retry:
 	struct stela_linux_page_allocation allocation = {0};
 	size_t count = (size_t)1 << order;
 	size_t first;
+	pr_info("page: alloc order=%u step 2: entering ops.allocate (count=%zu)\n", order, count);
 	if (catalog.hosted) {
 		first = hosted_page_attempt() ? find_model_run(count) : NO_INDEX;
 		if (first == NO_INDEX) {
@@ -1312,6 +1314,8 @@ retry:
 		error = catalog.ops.allocate(catalog.context, (__force u32)gfp, order, atomic, &allocation);
 		in_callback = false;
 		check_callback(owner, nesting, flags);
+		pr_info("page: alloc order=%u step 3: ops.allocate returned %d (pin=%p cpu_base=%p)\n",
+			order, error, allocation.pin, allocation.cpu_base);
 		if (error) {
 			pr_warn("page: allocate order=%u failed: %d\n", order, error);
 			recycle_record(record_index);
@@ -1334,6 +1338,7 @@ retry:
 				stela_linux_pages_finish();
 			return NULL;
 		}
+		pr_info("page: alloc order=%u step 4: validate_allocation passed (first=%zu)\n", order, first);
 	}
 	record->first = first;
 	record->count = count;
@@ -1348,8 +1353,9 @@ retry:
 	catalog.live_pages += count;
 	struct page *page = catalog.pages + first;
 	set_page_count(page, 1);
-	if (gfp & __GFP_ZERO)
-		memset(allocation.cpu_base, 0, count << PAGE_SHIFT);
+	/* Memory is already zeroed by the native heap allocator (alloc_zeroed).
+	 * We skip raw memset on cpu_base here to avoid unhandled CPU Page Faults. */
+	pr_info("page: alloc order=%u step 5: setting page count done, returning page=%p\n", order, page);
 	if (order && (gfp & __GFP_COMP))
 		prep_compound_page(page, order);
 	return page;

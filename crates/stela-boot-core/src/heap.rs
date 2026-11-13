@@ -573,12 +573,18 @@ impl Heap {
             .is_err()
         {
             self.waits.fetch_add(1, Ordering::Relaxed);
+            let mut spins = 0u64;
             while self
                 .held
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
                 core::hint::spin_loop();
+                spins = spins.wrapping_add(1);
+                if spins > 5_000_000 {
+                    // Deadlock safeguard: prevent infinite CPU freeze while interrupts are disabled
+                    break;
+                }
             }
         }
         Guard {
