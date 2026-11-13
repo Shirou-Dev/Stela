@@ -331,13 +331,18 @@ impl Service {
             }
         }
         if due(LOGS, true, next) {
-            if now.wrapping_sub(*log_flushed) >= *tsc_hz {
-                output::flush_due();
-                *log_flushed = host::rdtsc();
-            } else {
-                output::advance_logs();
-            }
-            lap.part(Part::Log);
+            // The logs' disks are looked at without waiting for the host
+            // drivers: a store another processor's driver call holds up
+            // goes on at a later turn.
+            let ((), drivers) = super::storage::without_waiting(*tsc_hz, || {
+                if now.wrapping_sub(*log_flushed) >= *tsc_hz {
+                    output::flush_due();
+                    *log_flushed = host::rdtsc();
+                } else {
+                    output::advance_logs();
+                }
+            });
+            lap.part_of(Part::Log, |_| drivers);
         }
         if let Some(network) = network.as_mut().filter(|_| due(NETWORK, true, next)) {
             // The host adapter's sends and receives wait outside the
@@ -372,6 +377,7 @@ impl Service {
             lap.part(Part::Bluetooth);
         }
         if due(NOR, true, next) {
+            let mut drivers = String::new();
             if let Some(nor) = nor {
                 let due =
                     anchored.is_none_or(|at| now.wrapping_sub(at) >= ANCHOR_SECONDS * *tsc_hz);
@@ -379,16 +385,22 @@ impl Service {
                     let anchor = due.then(|| devices.rtc_anchor()).flatten();
                     (nor::HostNor::dirty(devices), anchor)
                 });
-                nor.store(dirty);
-                if let Some(anchor) = anchor {
-                    nor.keep_anchor(anchor);
+                if anchor.is_some() {
                     *anchored = Some(now);
                 }
+                // As the logs' stores: never waiting for the host drivers.
+                let ((), line) = super::storage::without_waiting(*tsc_hz, || {
+                    nor.store(dirty);
+                    if let Some(anchor) = anchor {
+                        nor.keep_anchor(anchor);
+                    }
+                });
+                drivers = line;
             }
             if power.pressed() {
                 devices.serve(|devices| power.press(devices));
             }
-            lap.part(Part::Nor);
+            lap.part_of(Part::Nor, |_| drivers);
         }
         let interrupted = || !boot && host::interrupted();
         if let Some(experiment) = restore.as_mut().filter(|_| due(RESTORE, false, next)) {

@@ -25,6 +25,7 @@ use core::{
     ptr,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
+use stela_boot_core::drivers_turn::{self, Call, Entry};
 use stela_boot_core::staged_disk::{self, DiskWorker};
 use stela_contracts::refuse;
 use stela_drivers::{
@@ -227,6 +228,41 @@ fn between_drivers<T>(between: impl FnOnce() -> T) -> T {
     let result = between();
     BETWEEN_GS.store(0, Ordering::Release);
     result
+}
+
+/// The GS base of the processor in a service turn's store, which puts off
+/// a disk's call that would wait for the host drivers' lock
+/// ([`drivers_turn`]); zero while none is ([`without_waiting`]).
+static TURN_GS: AtomicU64 = AtomicU64::new(0);
+/// What a turn's store met at the lock: calls put off, and the ticks a
+/// start waited anyway, when another processor took the lock after the
+/// disk's room was looked at. One processor at a time holds the service.
+static TURN_PUT_OFF: AtomicU64 = AtomicU64::new(0);
+static TURN_WAITED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether this processor runs a service turn's store.
+fn turn_here() -> bool {
+    let gs = TURN_GS.load(Ordering::Acquire);
+    gs != 0 && gs == this_gs()
+}
+
+/// Run a service turn's store, whose disk calls never wait for the host
+/// drivers' lock to look ([`drivers_turn`]); with ` drivers_put_off=…
+/// drivers_wait_us=…`: the calls put off, and what its starts waited for
+/// the lock anyway.
+pub(super) fn without_waiting<T>(tsc_hz: u64, store: impl FnOnce() -> T) -> (T, String) {
+    TURN_PUT_OFF.store(0, Ordering::Relaxed);
+    TURN_WAITED.store(0, Ordering::Relaxed);
+    TURN_GS.store(this_gs(), Ordering::Release);
+    let result = store();
+    TURN_GS.store(0, Ordering::Release);
+    let waited = TURN_WAITED.swap(0, Ordering::Relaxed);
+    let line = format!(
+        " drivers_put_off={} drivers_wait_us={}",
+        TURN_PUT_OFF.swap(0, Ordering::Relaxed),
+        u128::from(waited) * 1_000_000 / u128::from(tsc_hz.max(1)),
+    );
+    (result, line)
 }
 
 /// Whether the USB's log is the one the device start resumed ([`HeldLog`]),
@@ -648,13 +684,41 @@ impl Service {
         }
     }
 
+    /// Enter the drivers for `call`; `None` when a service turn's store puts
+    /// it off while another processor holds them ([`drivers_turn::entry`]).
+    #[track_caller]
+    fn enter_for(&self, call: Call) -> Option<RestoreRoot> {
+        let turn = turn_here();
+        match drivers_turn::entry(turn, call) {
+            Entry::Try => {
+                // SAFETY: open() captured the loader root, as for every
+                // service call.
+                let root = unsafe { RestoreRoot::try_enter(self.root) };
+                if root.is_none() {
+                    TURN_PUT_OFF.fetch_add(1, Ordering::Relaxed);
+                }
+                root
+            }
+            Entry::Wait => {
+                let started = turn.then(super::host::rdtsc);
+                // SAFETY: as above.
+                let root = unsafe { RestoreRoot::enter(self.root) };
+                if let Some(started) = started {
+                    TURN_WAITED.fetch_add(root.entered.wrapping_sub(started), Ordering::Relaxed);
+                }
+                Some(root)
+            }
+        }
+    }
+
     /// Start `command` on the disk, which is told of it at once unless
-    /// `more` follow ([`BlockDevice::commit`]).
+    /// `more` follow ([`BlockDevice::commit`]) outside a service turn's
+    /// store, whose commit may be put off.
     fn start_with(&mut self, command: Command, more: bool) -> Result<u32, BlockError> {
         let lba = command_lba(&command);
+        let more = !drivers_turn::rings_at_once(turn_here(), more);
         let started = {
-            // SAFETY: as in read().
-            let _root = unsafe { RestoreRoot::enter(self.root) };
+            let _root = self.enter_for(Call::Start);
             timed(DiskPart::Start, || {
                 if more {
                     self.inner.start_more(command)
@@ -743,7 +807,7 @@ impl BlockDevice for Service {
         self.inner.depth()
     }
     fn room(&self) -> bool {
-        self.inner.room()
+        drivers_turn::room(turn_here(), host_drivers_taken(), self.inner.room())
     }
     fn start(&mut self, command: Command) -> Result<u32, BlockError> {
         self.start_with(command, false)
@@ -751,15 +815,15 @@ impl BlockDevice for Service {
     fn start_more(&mut self, command: Command) -> Result<u32, BlockError> {
         self.start_with(command, true)
     }
+    /// Put off in a service turn's store, whose starts rang at once.
     fn commit(&mut self) {
-        // SAFETY: as in read().
-        let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.inner.commit();
+        if let Some(_root) = self.enter_for(Call::Commit) {
+            self.inner.commit();
+        }
     }
     fn finish(&mut self, tag: u32) -> Option<Finished> {
         let finished = {
-            // SAFETY: as in read().
-            let _root = unsafe { RestoreRoot::enter(self.root) };
+            let _root = self.enter_for(Call::Look)?;
             timed(DiskPart::Finish, || self.inner.finish(tag))
         };
         self.running = self.running.saturating_sub(u32::from(finished.is_some()));
@@ -793,8 +857,9 @@ impl BlockDevice for Service {
         if gate.skip(self.signals(), doorbells, now, window) {
             return false;
         }
-        // SAFETY: as in read().
-        let _root = unsafe { RestoreRoot::enter(self.root) };
+        let Some(_root) = self.enter_for(Call::Look) else {
+            return false;
+        };
         let posted = timed(DiskPart::Posted, || self.inner.posted());
         gate.looked(posted, doorbells, now);
         self.looked.set(gate);
@@ -804,8 +869,11 @@ impl BlockDevice for Service {
         if let Some(signals) = self.signals.get() {
             return signals;
         }
-        // SAFETY: as in read(); this query reaches shared controller state.
-        let _root = unsafe { RestoreRoot::enter(self.root) };
+        // This query reaches shared controller state. A put-off one is
+        // asked again: a disk that is polled meanwhile loses nothing.
+        let Some(_root) = self.enter_for(Call::Look) else {
+            return false;
+        };
         let signals = self.inner.signals();
         self.signals.set(Some(signals));
         signals

@@ -27,6 +27,7 @@ pub mod console_lines;
 pub mod crs;
 pub mod dmar;
 pub mod doorbell;
+pub mod drivers_turn;
 pub mod early_fault;
 pub mod entropy;
 pub mod exit_port;

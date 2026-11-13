@@ -44,12 +44,20 @@ unsafe impl<T> Sync for Global<T> {}
 /// processor itself, interrupted or failing inside a write.
 static WRITING: AtomicBool = AtomicBool::new(false);
 const WRITING_WAIT_MICROS: u64 = 250_000;
+/// How long a log store that may not wait ([`flush_due`]) waits for the
+/// record: the copy of its new bytes goes to the next store instead.
+const STORE_COPY_WAIT_MICROS: u64 = 1000;
 /// Spins to wait while the counter's rate is not known yet.
 const WRITING_WAIT_SPINS: u64 = 1 << 22;
 
 /// Run `f` while no other processor writes the record; `None` when the
 /// wait ran out.
 fn exclusive<R>(f: impl FnOnce() -> R) -> Option<R> {
+    exclusive_within(WRITING_WAIT_MICROS, f)
+}
+
+/// [`exclusive`], waiting `micros` at most.
+fn exclusive_within<R>(micros: u64, f: impl FnOnce() -> R) -> Option<R> {
     let hz = TSC_HZ.load(Ordering::Relaxed);
     let started = rdtsc();
     let mut spins = 0u64;
@@ -60,7 +68,7 @@ fn exclusive<R>(f: impl FnOnce() -> R) -> Option<R> {
         spins += 1;
         let waited = match hz {
             0 => spins >= WRITING_WAIT_SPINS,
-            hz => rdtsc().wrapping_sub(started) >= hz / 1_000_000 * WRITING_WAIT_MICROS,
+            hz => rdtsc().wrapping_sub(started) >= hz / 1_000_000 * micros,
         };
         if waited {
             return None;
@@ -857,7 +865,12 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
         // store them without holding the others' output up. Polling in-flight
         // writes needs neither the record nor a list of sinks to prepare.
         if sinks.iter().any(&is_due) {
-            let _ = exclusive(|| {
+            let bound = if wait {
+                WRITING_WAIT_MICROS
+            } else {
+                STORE_COPY_WAIT_MICROS
+            };
+            let _ = exclusive_within(bound, || {
                 let Ok(record) = RECORD.0.try_borrow() else {
                     return;
                 };
