@@ -1254,6 +1254,8 @@ static bool hosted_page_attempt(void)
 struct page *__alloc_pages_noprof(gfp_t gfp, unsigned int order, int preferred_nid,
 				nodemask_t *nodemask)
 {
+	if (order > 0)
+		pr_info("page: alloc order=%u step 0: enter __alloc_pages_noprof\n", order);
 	require_context();
 	if (gfp & __GFP_NOFAIL) {
 		stela_linux_unsupported("page allocation with __GFP_NOFAIL");
@@ -1261,8 +1263,12 @@ struct page *__alloc_pages_noprof(gfp_t gfp, unsigned int order, int preferred_n
 	}
 	if (!catalog.pages || order > MAX_PAGE_ORDER ||
 	    (preferred_nid != NUMA_NO_NODE && preferred_nid != 0) ||
-	    (nodemask && !node_isset(0, *nodemask)))
+	    (nodemask && !node_isset(0, *nodemask))) {
+		if (order > 0)
+			pr_warn("page: alloc order=%u rejected early: pages=%p max=%u nid=%d\n",
+				order, catalog.pages, MAX_PAGE_ORDER, preferred_nid);
 		return NULL;
+	}
 	bool retried = false;
 	bool atomic;
 retry:

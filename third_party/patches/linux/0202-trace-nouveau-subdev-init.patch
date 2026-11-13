@@ -70,25 +70,32 @@ diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c b/drivers/gpu/drm/n
 index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..3956feb95fdb7dff2a3358ff3ec2c6d5dc5b4b4b 100644
 --- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
 +++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
-@@ -85,6 +85,7 @@
+@@ -85,18 +85,27 @@
  	u32 loc, sig, cnt;
  	int ret;
  
-+	nvkm_info(subdev, "tu102_gsp_booter_ctor: %s starting (size %zu)\n", name, blob ? blob->size : 0);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: %s starting (size %zu, data=%p)\n", name, blob ? blob->size : 0, blob ? blob->data : NULL);
  	hdr = nvfw_bin_hdr(subdev, blob->data);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 1: bin_hdr=%p (hdr_off=%u data_off=%u data_sz=%u)\n",
++		  hdr, hdr ? hdr->header_offset : 0, hdr ? hdr->data_offset : 0, hdr ? hdr->data_size : 0);
  	hshdr = nvfw_hs_header_v2(subdev, blob->data + hdr->header_offset);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 2: hs_header=%p (patch_loc=%u patch_sig=%u num_sig=%u)\n",
++		  hshdr, hshdr ? hshdr->patch_loc : 0, hshdr ? hshdr->patch_sig : 0, hshdr ? hshdr->num_sig : 0);
  	loc = *(u32 *)(blob->data + hshdr->patch_loc);
-@@ -93,11 +94,13 @@
+ 	sig = *(u32 *)(blob->data + hshdr->patch_sig);
+ 	cnt = *(u32 *)(blob->data + hshdr->num_sig);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 3: loc=0x%08x sig=0x%08x cnt=%u, calling falcon_fw_ctor...\n",
++		  loc, sig, cnt);
  
  	ret = nvkm_falcon_fw_ctor(func, name, subdev->device, true,
  				  blob->data + hdr->data_offset, hdr->data_size, falcon, fw);
-+	nvkm_info(subdev, "tu102_gsp_booter_ctor: %s falcon_fw_ctor ret=%d\n", name, ret);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 4: falcon_fw_ctor ret=%d\n", name, ret);
  	if (ret)
  		goto done;
  
  	ret = nvkm_falcon_fw_sign(fw, loc, hshdr->sig_prod_size / cnt, blob->data,
  				  cnt, hshdr->sig_prod_offset + sig, 0, 0);
-+	nvkm_info(subdev, "tu102_gsp_booter_ctor: %s falcon_fw_sign ret=%d\n", name, ret);
++	nvkm_info(subdev, "tu102_gsp_booter_ctor: step 5: falcon_fw_sign ret=%d\n", name, ret);
  	if (ret)
  		goto done;
  
@@ -175,11 +182,12 @@ index 11a37963bd4e7ecc3f3a65d8ce19290822ab4646..3956feb95fdb7dff2a3358ff3ec2c6d5
  	if (device->chipset == 0x170) {
  		u64 lock_lo = ga100_gsp_mmu_lock_lo(gsp);
  
-@@ -353,17 +351,23 @@
+@@ -353,17 +351,24 @@
  			gsp->fb.bios.addr = min(gsp->fb.bios.addr, lock_lo);
  	}
  
-+	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: booter-load ctor...\n");
++	nvkm_info(&gsp->subdev, "tu102_gsp_oneinit: booter-load ctor (dev=%p sec2=%p load=%p)...\n",
++		  device, device ? device->sec2 : NULL, gsp->fws.booter.load);
  	ret = gsp->func->booter.ctor(gsp, "booter-load", gsp->fws.booter.load,
  				     &device->sec2->falcon, &gsp->booter.load);
 -	if (ret)

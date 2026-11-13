@@ -102,6 +102,8 @@ struct page *dma_alloc_pages(struct device *dev, size_t size, dma_addr_t *dma_ha
 {
 	const struct dma_map_ops *ops = get_dma_ops(dev);
 
+	dev_info(dev, "dma_alloc_pages: enter size=%zu dir=%d gfp=0x%x ops=%p\n",
+		 size, (int)dir, (unsigned int)gfp, ops);
 	if (stela_linux_kernel_hosted() || !ops->alloc_pages_op)
 		return NULL;
 	gfp &= ~(__GFP_DMA | __GFP_DMA32 | __GFP_HIGHMEM);
