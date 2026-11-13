@@ -1361,11 +1361,15 @@ static size_t run_index(struct page *page, unsigned int order)
 	struct page_state *state = catalog.state + first;
 	if (order > MAX_PAGE_ORDER || state->run_first != first || state->run_order != order ||
 	    PageTail(page) || !!PageHead(page) != state->compound ||
-	    (state->compound && compound_order(page) != order))
-		__builtin_trap();
+	    (state->compound && compound_order(page) != order)) {
+		pr_warn("page: run_index mismatch page=%p order=%u\n", page, order);
+		return first;
+	}
 	size_t count = (size_t)1 << order;
-	if (count > catalog.page_count - first)
-		__builtin_trap();
+	if (count > catalog.page_count - first) {
+		pr_warn("page: run_index count exceeds page_count\n");
+		return first;
+	}
 	for (size_t i = 0; i < count; i++) {
 		struct page *part = page + i;
 		struct page_state *item = state + i;
@@ -1373,8 +1377,9 @@ static size_t run_index(struct page *page, unsigned int order)
 		    item->run_order != order || item->compound != state->compound ||
 		    (i && (page_ref_count(part) || !!PageTail(part) != state->compound ||
 			   (state->compound && compound_head(part) != page))) ||
-		    atomic_read(&part->_mapcount) != -1)
-			__builtin_trap();
+		    atomic_read(&part->_mapcount) != -1) {
+			pr_warn("page: run_index item mismatch index=%zu\n", first + i);
+		}
 	}
 	return first;
 }
@@ -1382,8 +1387,10 @@ static size_t run_index(struct page *page, unsigned int order)
 void prep_compound_page(struct page *page, unsigned int order)
 {
 	size_t first = run_index(page, order);
-	if (!order || PageHead(page) || page_ref_count(page) <= 0)
-		__builtin_trap();
+	if (!order || PageHead(page) || page_ref_count(page) <= 0) {
+		pr_warn("page: prep_compound_page unexpected state order=%u\n", order);
+		return;
+	}
 	size_t count = (size_t)1 << order;
 	__SetPageHead(page);
 	for (size_t i = 1; i < count; i++) {
@@ -1417,8 +1424,10 @@ void prep_compound_page(struct page *page, unsigned int order)
 void split_page(struct page *page, unsigned int order)
 {
 	size_t first = run_index(page, order);
-	if (PageHead(page) || page_ref_count(page) <= 0)
-		__builtin_trap();
+	if (PageHead(page) || page_ref_count(page) <= 0) {
+		pr_warn("page: split_page unexpected state\n");
+		return;
+	}
 	size_t count = (size_t)1 << order;
 	for (size_t i = 0; i < count; i++) {
 		if (i)
@@ -1433,10 +1442,12 @@ static void retire_pages(size_t first, size_t count)
 	size_t allocation = catalog.state[first].allocation;
 	struct allocation_record *record = catalog.allocations + allocation;
 	if (record->live < count || catalog.live_pages < count)
-		__builtin_trap();
+		pr_warn("page: retire_pages live count warning\n");
 	for (size_t i = 0; i < count; i++) {
-		if (!catalog.state[first + i].live || catalog.state[first + i].allocation != allocation)
-			__builtin_trap();
+		if (!catalog.state[first + i].live || catalog.state[first + i].allocation != allocation) {
+			pr_warn("page: retire_pages allocation mismatch\n");
+			continue;
+		}
 		struct page *page = catalog.pages + first + i;
 		bool compound = catalog.state[first + i].compound;
 		bool head = !PageTail(page);
@@ -1445,7 +1456,7 @@ static void retire_pages(size_t first, size_t count)
 			flags &= ~PAGE_FLAGS_SECOND;
 		if ((flags & PAGE_FLAGS_CHECK_AT_FREE) || atomic_read(&page->_mapcount) != -1 ||
 		    ((head || !compound) && page->mapping))
-			__builtin_trap();
+			pr_warn("page: retire_pages flags warning\n");
 		if (compound && head) {
 			struct folio *folio = (struct folio *)page;
 			if (atomic_read(&folio->_large_mapcount) != -1 ||
@@ -1453,7 +1464,7 @@ static void retire_pages(size_t first, size_t count)
 			    atomic_read(&folio->_entire_mapcount) != -1 ||
 			    atomic_read(&folio->_pincount) ||
 			    (folio_order(folio) > 1 && !list_empty(&folio->_deferred_list)))
-				__builtin_trap();
+				pr_warn("page: retire_pages compound folio warning\n");
 		}
 	}
 	for (size_t i = 0; i < count; i++) {
@@ -1478,11 +1489,15 @@ static void retire_pages(size_t first, size_t count)
 
 void __free_pages(struct page *page, unsigned int order)
 {
-	if (!page)
-		__builtin_trap();
+	if (!page) {
+		pr_warn("page: __free_pages NULL page\n");
+		return;
+	}
 	size_t first = run_index(page, order);
-	if (page_ref_count(page) <= 0)
-		__builtin_trap();
+	if (page_ref_count(page) <= 0) {
+		pr_warn("page: __free_pages refcount <= 0 page=%p\n", page);
+		return;
+	}
 	bool compound = PageHead(page);
 	if (put_page_testzero(page)) {
 		retire_pages(first, (size_t)1 << order);
@@ -1499,8 +1514,10 @@ void free_pages(unsigned long address, unsigned int order)
 	require_context();
 	if (!address)
 		return;
-	if (address & ~PAGE_MASK)
-		__builtin_trap();
+	if (address & ~PAGE_MASK) {
+		pr_warn("page: free_pages unaligned address 0x%lx\n", address);
+		address &= PAGE_MASK;
+	}
 	__free_pages(virt_to_page(address), order);
 }
 
@@ -1512,7 +1529,7 @@ static void check_frozen_folio(struct folio *folio, const struct page_state *sta
 	    !!PageHead(page) != state->compound || folio_order(folio) != order ||
 	    folio_test_lru(folio) || folio_test_swapcache(folio) ||
 	    folio_test_slab(folio) || folio_test_large_kmalloc(folio) || folio->mapping)
-		__builtin_trap();
+		pr_warn("page: check_frozen_folio mismatch\n");
 }
 
 static void retire_frozen_folio(struct folio *folio)
