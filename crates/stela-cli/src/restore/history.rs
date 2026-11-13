@@ -42,6 +42,28 @@ pub(super) fn load() -> Result<Releases> {
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("stela/", env!("CARGO_PKG_VERSION")))
         .build()?;
+    // The service answers a request it cannot serve with status 200 and no
+    // list, so the shared retry on a failed status never sees it.
+    let mut wait = Duration::from_secs(2);
+    for _ in 1..ATTEMPTS {
+        let bytes = fetch(&client)?;
+        if !lacks_list(&bytes) {
+            return parse(&bytes);
+        }
+        eprintln!(
+            "note: api.ipsw.me answered without its list of macOS releases; asking again in {} s",
+            wait.as_secs()
+        );
+        std::thread::sleep(wait);
+        wait *= 2;
+    }
+    parse(&fetch(&client)?)
+}
+
+/// How often [`load`] asks while the service answers without its list.
+const ATTEMPTS: u32 = 4;
+
+fn fetch(client: &reqwest::blocking::Client) -> Result<Vec<u8>> {
     let response = crate::net::send("loading the list of macOS releases (api.ipsw.me)", || {
         client.get(URL)
     })?
@@ -54,17 +76,21 @@ pub(super) fn load() -> Result<Releases> {
         bytes.len() <= 32 * 1024 * 1024,
         "IPSW.me catalog exceeds 32 MiB"
     );
-    parse(&bytes)
+    Ok(bytes)
+}
+
+/// Well-formed JSON that holds no devices: what the service answers when it
+/// cannot serve the request.
+fn lacks_list(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .is_ok_and(|value| value.get("devices").is_none_or(serde_json::Value::is_null))
 }
 
 fn parse(bytes: &[u8]) -> Result<Releases> {
     let catalog: Catalog = serde_json::from_slice(bytes).map_err(|error| {
         // A network that wants a sign-in first answers with its own page.
         let page = bytes.trim_ascii_start().starts_with(b"<");
-        // The service answers a request it cannot serve with well-formed
-        // JSON that holds no devices.
-        let empty = serde_json::from_slice::<serde_json::Value>(bytes)
-            .is_ok_and(|value| value.get("devices").is_none_or(serde_json::Value::is_null));
+        let empty = lacks_list(bytes);
         anyhow::anyhow!(
             "the list of macOS releases from api.ipsw.me cannot be read ({error}){}",
             if page {
@@ -72,7 +98,7 @@ fn parse(bytes: &[u8]) -> Result<Releases> {
                  first does: sign in to the network and run setup again"
             } else if empty {
                 "; api.ipsw.me answered without its list, as it does when it is overloaded: \
-                 wait a few minutes and run the command again"
+                 it was asked several times; wait a few minutes and run the command again"
             } else {
                 ""
             }
@@ -151,6 +177,10 @@ mod tests {
         for answer in [r#"{"devices":null}"#, "{}"] {
             let error = parse(answer.as_bytes()).err().unwrap().to_string();
             assert!(error.contains("answered without its list"), "{error}");
+            assert!(lacks_list(answer.as_bytes()));
+        }
+        for answer in ["not json", r#"{"devices":{}}"#, r#"{"devices":1}"#] {
+            assert!(!lacks_list(answer.as_bytes()), "{answer}");
         }
         let error = parse(b"not json").err().unwrap().to_string();
         assert!(!error.contains("answered without its list"), "{error}");
