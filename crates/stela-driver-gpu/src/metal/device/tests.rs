@@ -43,7 +43,8 @@ use crate::metal::{
         object::{Buffer, MemoryRequest, Pipeline, PipelineSource, QueryType, Semaphore},
     },
 };
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::AtomicBool;
 
 use super::fixture::{LIBRARY, MockBackend, MockCompiler, TestDevice, device, device_on};
 use crate::metal::library::{
@@ -2982,6 +2983,178 @@ fn framebuffer_reads_of_a_linear_attachment_run_on_its_copy() {
     assert_eq!(pairs, [to, from, to, from]);
     let (order, pairs) = copies(&mut device, optimal);
     assert_eq!((order.as_str(), pairs.len()), ("be", 0));
+}
+
+/// Core Animation's compositor passes on macOS 27: a stored color target
+/// (loaded, or a cleared two-plane extended-range one) beside memoryless
+/// color attachments of other formats that the shader can read, which its
+/// tile shaders use as imageblock data and which the pass neither loads
+/// nor stores.
+#[test]
+fn compositor_passes_with_readable_memoryless_attachments_begin() {
+    let mut device = device();
+    assert!(device.capabilities().framebuffer_reads);
+    let usage = TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET;
+    let new = |device: &mut TestDevice, format, height, storage| {
+        let descriptor = TextureDescriptor {
+            width: 1920,
+            height,
+            options: options(storage),
+            ..texture(format, usage)
+        };
+        device.new_texture(&descriptor).unwrap()
+    };
+    let attachment = |texture, load_action, store_action| AttachmentRequest {
+        texture,
+        level: 0,
+        slice: 0,
+        depth_plane: 0,
+        resolve: None,
+        load_action,
+        store_action,
+        store_action_options: StoreActionOptions::EMPTY,
+        clear: [0.0, 0.0, 0.0, 1.0],
+        surface: None,
+    };
+    let request = |colors| RenderPassRequest {
+        color_attachments: colors,
+        depth_attachment: None,
+        depth_resolve_filter: MultisampleDepthResolveFilter::Sample0,
+        stencil_attachment: None,
+        stencil_resolve_filter: MultisampleStencilResolveFilter::Sample0,
+        visibility_result_buffer: None,
+        visibility_result_type: VisibilityResultType::Reset,
+        render_target_array_length: 0,
+        render_target_width: 0,
+        render_target_height: 0,
+        default_raster_sample_count: 0,
+        tile_memory: Default::default(),
+        sample_positions: Vec::new(),
+        rasterization_rate_map: false,
+        counter_samples: Vec::new(),
+    };
+    let scratch = |texture| {
+        Some(attachment(
+            texture,
+            LoadAction::DontCare,
+            StoreAction::DontCare,
+        ))
+    };
+    // The first pass of each IOSurface target makes an image whose memory
+    // Linux allocates in a job: the pass defers, which the boot log once
+    // noted as a refusal, and begins when made again.
+    let lock = crate::metal::deferred::JobLock {
+        lock: Arc::new(crate::metal::compiler::CompileLock::new()),
+        relax: || {},
+    };
+    let run = |device: &mut TestDevice, colors| {
+        if device.backend().image_gate.is_some() {
+            device.backend().defer_pipelines(Some(&lock));
+            let mut commands = device.new_command_buffer();
+            assert_eq!(
+                device.begin_render(&mut commands, &request(colors)).err(),
+                Some(crate::metal::compiler::DEFERRED)
+            );
+            device.discard(commands);
+            device.backend().stop_deferring();
+            assert!(device.backend().take_job().is_some());
+        }
+        let mut commands = device.new_command_buffer();
+        device
+            .begin_render(&mut commands, &request(colors))
+            .unwrap();
+        commands.end_encoding(&mut device.resolver()).unwrap();
+        let serial = device.commit(commands).unwrap();
+        complete(device, serial);
+    };
+
+    // The targets are textures of their own or an IOSurface's.
+    let managed = options(StorageMode::Managed);
+    let buffer = device
+        .new_buffer(1920 * 1440 * 5 + (1 << 16), managed)
+        .unwrap();
+    let descriptor = |format, height| TextureDescriptor {
+        width: 1920,
+        height,
+        options: managed,
+        ..texture(format, usage)
+    };
+    let strips = [
+        new(
+            &mut device,
+            PixelFormat::Bgra8Unorm,
+            60,
+            StorageMode::Managed,
+        ),
+        device
+            .new_texture_from_buffer(buffer, &descriptor(PixelFormat::Bgra8Unorm, 60), 0, 7680)
+            .unwrap(),
+    ];
+    let half = new(
+        &mut device,
+        PixelFormat::Rgba16Float,
+        60,
+        StorageMode::Memoryless,
+    );
+    for (strip, surface) in strips.into_iter().zip([false, true]) {
+        if surface {
+            device.backend().image_gate = Some(Arc::new(AtomicBool::new(true)));
+        }
+        let mut colors = [None; MAX_COLOR_ATTACHMENTS];
+        colors[0] = Some(AttachmentRequest {
+            surface: Some((3, 1)),
+            ..attachment(strip, LoadAction::Load, StoreAction::Store)
+        });
+        colors[1] = scratch(half);
+        run(&mut device, colors);
+    }
+
+    let plane = |offset, bytes_per_row| crate::metal::resource::PlaneLayout {
+        offset,
+        bytes_per_row,
+    };
+    let targets = [
+        new(
+            &mut device,
+            PixelFormat::Rgb10A8_2pXr10,
+            1440,
+            StorageMode::Managed,
+        ),
+        device
+            .new_extended_plane_texture(
+                buffer,
+                &descriptor(PixelFormat::Rgb10A8_2pXr10, 1440),
+                [plane(0, 7680), plane(1920 * 1440 * 4, 1920)],
+            )
+            .unwrap(),
+    ];
+    let half = new(
+        &mut device,
+        PixelFormat::Rgba16Float,
+        1440,
+        StorageMode::Memoryless,
+    );
+    let single = new(
+        &mut device,
+        PixelFormat::R32Float,
+        1440,
+        StorageMode::Memoryless,
+    );
+    for (target, surface) in targets.into_iter().zip([false, true]) {
+        if surface {
+            device.backend().image_gate = Some(Arc::new(AtomicBool::new(true)));
+        }
+        let mut colors = [None; MAX_COLOR_ATTACHMENTS];
+        colors[0] = Some(AttachmentRequest {
+            surface: Some((4, 1)),
+            ..attachment(target, LoadAction::Clear, StoreAction::Store)
+        });
+        colors[1] = scratch(half);
+        colors[2] = scratch(single);
+        run(&mut device, colors);
+        colors[2] = None;
+        run(&mut device, colors);
+    }
 }
 
 #[test]
