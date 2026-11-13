@@ -345,6 +345,7 @@ struct pci_dev *pci_get_domain_bus_and_slot(int domain, unsigned int bus, unsign
  * and assigned its resources; this turns on their decoding. */
 int pci_enable_device(struct pci_dev *dev)
 {
+    dev_info(&dev->dev, "pci_enable_device (cnt=%d)\n", atomic_read(&dev->enable_cnt));
     int error;
     u16 old, command;
     if (atomic_inc_return(&dev->enable_cnt) > 1)
@@ -389,6 +390,7 @@ void pci_disable_device(struct pci_dev *dev)
 
 void pci_set_master(struct pci_dev *dev)
 {
+    dev_info(&dev->dev, "pci_set_master called\n");
     u16 command;
     if (pci_read_config_word(dev, PCI_COMMAND, &command))
         stela_linux_fatal("PCI bus-master access failed without completion");

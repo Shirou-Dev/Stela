@@ -116,6 +116,7 @@ static int load(const struct firmware **out, const char *name, struct device *de
 	check_scope(&scope);
 	if (!status)
 		*out = result;
+	dev_info(device, "request_firmware: %s (status=%d)\n", name, status);
 	return status;
 }
 int request_firmware(const struct firmware **fw, const char *name, struct device *device)
