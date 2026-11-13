@@ -785,6 +785,25 @@ impl<P: ColdPlatform, C: UnitConfig> Unit<P, C> {
         self.engine.retired.set(true);
         Ok(())
     }
+
+    /// After a successful [`Self::retire`]: the unit's function and register
+    /// mappings, for the caller to retire with their original owner. Left
+    /// inside a dropped unit they stay claimed, and nothing else can map
+    /// the configuration space they lie in. `None`, with the unit dropped
+    /// as before, when it was not retired or its engine is still shared.
+    pub fn into_inputs(self) -> Option<registers::Inputs<C>> {
+        let Self { engine, table, .. } = self;
+        drop(table);
+        let engine = Rc::try_unwrap(engine).ok()?;
+        if !engine.retired.get() {
+            return None;
+        }
+        let mut engine = ManuallyDrop::new(engine);
+        // SAFETY: the sole, retired engine; its `Drop` never runs, so the
+        // resources are taken exactly once.
+        let Resources { inspection, .. } = unsafe { ManuallyDrop::take(&mut engine.resources) };
+        Some(inspection.into_inputs())
+    }
 }
 
 #[cfg(test)]

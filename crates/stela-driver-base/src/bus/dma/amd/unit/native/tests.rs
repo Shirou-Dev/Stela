@@ -380,6 +380,21 @@ fn a_stopped_unit_with_firmware_leftovers_comes_up() {
     assert_ne!(peer.register(DEVICE_TABLE), 0x7654_3000 | 0x1ff);
 }
 
+/// A retired unit hands its function and register mappings back for their
+/// owner to retire; one that still runs keeps them.
+#[test]
+fn a_retired_unit_gives_its_mappings_back() {
+    let (mut unit, peer) = model::unit();
+    // SAFETY: the peer has no requester, producer or other register user.
+    unsafe { unit.retire() }.unwrap();
+    let inputs = unit.into_inputs().expect("a retired unit's inputs");
+    assert!(!inputs.mappings.is_empty());
+    assert_eq!(peer.live_ram(), 0);
+
+    let (unit, _peer) = model::unit();
+    assert!(unit.into_inputs().is_none());
+}
+
 fn unit_with_entries(entries: &[u8]) -> (Unit<Platform>, Peer) {
     let (inspection, platform, peer, bytes) = inputs_with_entries(entries);
     let ivrs = Ivrs::parse(&bytes, 8).unwrap();

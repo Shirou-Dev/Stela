@@ -311,11 +311,26 @@ struct Cold {
     reserved: Vec<(u16, Range<u64>)>,
 }
 
-/// Stop a cold unit the policy does not take. False when it did not stop.
+/// Stop a cold unit the policy does not take and give back its function's
+/// configuration page and its register mapping: a unit dropped with them
+/// keeps both claimed, and the check that reopens the PCI bridges then
+/// cannot map the configuration space. False when it did not stop or a
+/// mapping did not retire.
 fn retire(mut unit: Unit<Platform, ObservedConfig>) -> bool {
     // SAFETY: no requester was attached and the unit blocks nothing it
     // translated; retiring stops it.
-    unsafe { unit.retire() }.is_ok()
+    if unsafe { unit.retire() }.is_err() {
+        return false;
+    }
+    let Some(mut inputs) = unit.into_inputs() else {
+        return false;
+    };
+    let mut retired = true;
+    for mapping in &mut inputs.mappings {
+        // SAFETY: the stopped unit was the mapping's only user.
+        retired &= unsafe { mapping.retire() }.is_ok();
+    }
+    retired & inputs.function.config().retire().is_ok()
 }
 
 /// Take every unit of `table` (an IVRS) the policy allows, each in the

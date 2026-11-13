@@ -188,11 +188,13 @@ impl Remappers {
             .is_some_and(|original| core::ptr::eq(original, source));
         // SAFETY: this startup step precedes every driver and competing PCI
         // writer. The same complete blocked remappers and line owners are kept.
+        // A unit kept in any mode holds its own function's configuration
+        // page, which the whole-space view cannot map beside it.
         let stopped = unsafe {
-            if amd {
-                self.recheck_amd_stopped(pci)
-            } else {
+            if self.amd.is_empty() {
                 pci.recheck_stopped()
+            } else {
+                self.recheck_amd_stopped(pci)
             }
         };
         if let Err(error) = stopped {
