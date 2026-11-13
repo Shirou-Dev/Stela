@@ -5,6 +5,13 @@
  * The kernel exports vnode_open, vn_rdwr and vnode_lookup to kexts, but
  * nothing that creates, renames or removes a directory or a name: a kext can
  * create a file in an existing directory and rewrite one in place, no more.
+ * VNOP_MKDIR, VNOP_CREATE, VNOP_RENAME, VNOP_REMOVE and VNOP_SYMLINK are
+ * XNU_KERNEL_PRIVATE in sys/vnode_if.h and absent from com.apple.kernel's
+ * symbol table, which the auxiliary collection binds a kext's undefined
+ * symbols against (stela-loader's aux_kc `imports`): its only VNOP_ wrappers
+ * are BWRITE, FSYNC, GETXATTR, IOCTL, READ, SETXATTR, STRATEGY and WRITE.
+ * Their vnop_*_desc descriptors are exported, for stacking file systems, but
+ * calling through one needs the vnode's private operation vector.
  */
 #pragma once
 

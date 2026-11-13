@@ -2,7 +2,9 @@
 //! `/Library/GPUBundles` on the Data volume.
 //!
 //! The StelaGPU kext writes the plugin's files from the copy it carries, but
-//! the kernel gives a kext no way to create a directory (`files.h`), so on a
+//! the kernel gives a kext no way to create a directory (`files.h`:
+//! `VNOP_MKDIR` is kernel-private and not in the kernel's symbol table the
+//! kext is linked against), so on a
 //! freshly installed system, whose Data volume holds only Apple's empty
 //! `/Library/GPUBundles`, it reports the plugin missing. Nothing else can
 //! create them before the first boot: the Data volume is encrypted, Stela's
