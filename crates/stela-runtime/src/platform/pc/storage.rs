@@ -225,7 +225,8 @@ fn locate(
 /// firmware when the target was chosen; Stela's own driver may report the
 /// same disk under another serial (a USB bridge's INQUIRY serial against
 /// its USB string, NVMe padding) or none. When no disk has the serial, the
-/// partition's unique GUID, which the chooser wrote fresh, finds it: on
+/// partition's unique GUID, which the chooser drew fresh and Stela's drivers
+/// wrote (`disk_plan`), finds it: on
 /// exactly one disk, and never an EFI system partition.
 fn find_target(
     devices: &mut [Box<dyn BlockDevice>],
@@ -319,7 +320,7 @@ fn find_any(
     found.ok_or(StorageError::NoPartition(guid))
 }
 
-/// How long [`wait_for_named`] keeps looking for a missing partition: a USB
+/// How long [`wait_for`] keeps looking for a missing partition or disk: a USB
 /// device can connect, train its link and answer its first commands well
 /// after its controller started, as Linux finds it later through a port
 /// change. The wait goes on while devices keep arriving or failing, ends
@@ -349,11 +350,11 @@ pub struct Arrival {
     pub news: bool,
 }
 
-/// How [`wait_for_named`] ended.
+/// How [`wait_for`] ended. `M` is what is still missing: for
+/// [`wait_for_named`], the first partition, by its index in `named`.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Waited {
-    /// The first partition still missing, by its index in `named`.
-    pub missing: Option<(usize, StorageError)>,
+pub struct Waited<M = (usize, StorageError)> {
+    pub missing: Option<M>,
     pub waited_us: u64,
     pub arrived: usize,
     pub looks: usize,
@@ -373,9 +374,8 @@ fn missing(devices: &mut [Box<dyn BlockDevice>], named: &[Named]) -> Option<(usi
         })
 }
 
-/// Wait until every one of `named` is on a disk of `devices`, taking the
-/// disks each `look` brings, by [`Patience`]. Nothing is looked at, and no
-/// time passes, when all are there already.
+/// Wait until every one of `named` is on a disk of `devices`
+/// ([`wait_for`]).
 pub fn wait_for_named(
     devices: &mut Vec<Box<dyn BlockDevice>>,
     named: &[Named],
@@ -384,8 +384,33 @@ pub fn wait_for_named(
     look: &mut dyn FnMut() -> Arrival,
     pause: &mut dyn FnMut(u64),
 ) -> Waited {
+    wait_for(
+        devices,
+        &mut |devices| missing(devices, named),
+        patience,
+        now_us,
+        look,
+        pause,
+    )
+}
+
+/// What [`wait_for`] asks after each arrival: what is still missing among
+/// the disks, if anything.
+pub type Missing<'a, M> = dyn FnMut(&mut [Box<dyn BlockDevice>]) -> Option<M> + 'a;
+
+/// Wait until `missing` finds nothing missing among `devices`, taking the
+/// disks each `look` brings, by [`Patience`]. Nothing is looked at, and no
+/// time passes, when nothing is missing already.
+pub fn wait_for<M>(
+    devices: &mut Vec<Box<dyn BlockDevice>>,
+    missing: &mut Missing<'_, M>,
+    patience: Patience,
+    now_us: &mut dyn FnMut() -> u64,
+    look: &mut dyn FnMut() -> Arrival,
+    pause: &mut dyn FnMut(u64),
+) -> Waited<M> {
     let mut waited = Waited {
-        missing: missing(devices, named),
+        missing: missing(devices),
         waited_us: 0,
         arrived: 0,
         looks: 0,
@@ -410,7 +435,7 @@ pub fn wait_for_named(
         if !arrival.disks.is_empty() {
             waited.arrived += arrival.disks.len();
             devices.extend(arrival.disks);
-            waited.missing = missing(devices, named);
+            waited.missing = missing(devices);
             if waited.missing.is_none() {
                 waited.waited_us = now_us().wrapping_sub(start);
                 return waited;
@@ -423,28 +448,33 @@ pub fn wait_for_named(
 /// counted.
 const ACCOUNT_PARTITIONS: usize = 6;
 
+/// A disk as the screen names it: the bus, model, size and block size, and
+/// the serial's last four characters ([`tail`]).
+pub fn describe(identity: &Identity) -> String {
+    let bytes = identity
+        .blocks
+        .saturating_mul(u64::from(identity.block_size));
+    alloc::format!(
+        "{} {:?} {} {}-byte blocks serial {}",
+        bus(identity.transport),
+        identity.model.trim(),
+        size(bytes),
+        identity.block_size,
+        tail(&identity.serial)
+    )
+}
+
 /// One line per disk of `devices` for the account of a failed search, so a
-/// photo of the screen tells what Stela's drivers saw: the bus, model,
-/// size and block size, the serial's last four characters ([`tail`]), and
-/// the partitions its GPT holds, each by its GUID's last four characters,
-/// size and type, or why it has none. A disk whose serial is `chosen`'s is
-/// marked.
+/// photo of the screen tells what Stela's drivers saw: the disk
+/// ([`describe`]) and the partitions its GPT holds, each by its GUID's last
+/// four characters, size and type, or why it has none. A disk whose serial
+/// is `chosen`'s is marked.
 pub fn disk_account(devices: &mut [Box<dyn BlockDevice>], chosen: Option<&Target>) -> Vec<String> {
     devices
         .iter_mut()
         .map(|device| {
             let identity = device.identity().clone();
-            let bytes = identity
-                .blocks
-                .saturating_mul(u64::from(identity.block_size));
-            let mut line = alloc::format!(
-                "{} {:?} {} {}-byte blocks serial {}",
-                bus(identity.transport),
-                identity.model.trim(),
-                size(bytes),
-                identity.block_size,
-                tail(&identity.serial)
-            );
+            let mut line = describe(&identity);
             if chosen.is_some_and(|target| target.serial.trim() == identity.serial.trim()) {
                 line.push_str(" (the chosen disk)");
             }
