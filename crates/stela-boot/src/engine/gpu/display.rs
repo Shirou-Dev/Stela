@@ -139,7 +139,10 @@ pub(in crate::engine) fn take(wanted: (usize, usize)) {
     output::flush_log();
     for (minor, bound) in gpu.start.bound.iter().enumerate() {
         let Some(fd) = client::open_node(minor as u32) else {
-            output::arguments(format_args!("GPU {}: failed to open DRM node {minor}\n", bound.name));
+            output::arguments(format_args!(
+                "GPU {}: failed to open DRM node {minor}\n",
+                bound.name
+            ));
             output::flush_log();
             continue;
         };
@@ -148,7 +151,10 @@ pub(in crate::engine) fn take(wanted: (usize, usize)) {
                 let (w, h) = display.size();
                 output::arguments(format_args!(
                     "GPU {}: display taken successfully: {}x{} @ {}mHz\n",
-                    bound.name, w, h, display.refresh_millihertz()
+                    bound.name,
+                    w,
+                    h,
+                    display.refresh_millihertz()
                 ));
                 output::flush_log();
                 crate::status::take_screen(Some(screen(&display)));

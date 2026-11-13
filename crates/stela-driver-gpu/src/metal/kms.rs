@@ -488,7 +488,9 @@ impl<D: Drm> Display<D> {
         });
 
         for found in found_outputs {
-            let Some(mode) = choose(&found.modes, wanted).filter(|_| found.connected || !found.modes.is_empty()) else {
+            let Some(mode) =
+                choose(&found.modes, wanted).filter(|_| found.connected || !found.modes.is_empty())
+            else {
                 continue;
             };
             if let Some(crtc) = controller(&mut drm, &found.encoders, &crtcs)? {

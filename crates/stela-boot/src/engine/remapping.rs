@@ -656,7 +656,10 @@ impl Remappers {
                 0
             }
         };
-        match source.initial_pci_lines().or_else(|_| source.force_unremapped_pci_lines()) {
+        match source
+            .initial_pci_lines()
+            .or_else(|_| source.force_unremapped_pci_lines())
+        {
             Ok(lines) => {
                 self.initial_lines = Some(lines);
                 output::arguments(format_args!("HOST PCI initial interrupt paths contained\n"));

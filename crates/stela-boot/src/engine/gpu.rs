@@ -1854,14 +1854,18 @@ fn mount_and_start(
             return Err(Error::Submit(refusal.error));
         }
     };
-    output::arguments(format_args!("GPU mount_and_start waiting for child (deadline={START_SECONDS}s)\n"));
+    output::arguments(format_args!(
+        "GPU mount_and_start waiting for child (deadline={START_SECONDS}s)\n"
+    ));
     flush_gpu_log();
     let waited = wait_for_child(runtime, threads, time, deadline, || pending.status().joined);
     // The job has returned (or the wait gave up): Linux time no longer needs
     // to be fast-forwarded, and the jump must not leak into later boots.
     GPU_START_DEADLINE_NS.store(0, Ordering::Release);
     waited?;
-    output::arguments(format_args!("GPU mount_and_start child joined successfully\n"));
+    output::arguments(format_args!(
+        "GPU mount_and_start child joined successfully\n"
+    ));
     flush_gpu_log();
     // SAFETY: physical return on the same dispatcher with the joined status.
     let joined =
