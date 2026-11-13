@@ -395,7 +395,9 @@ impl Remappers {
             if blocked == Some(true) {
                 // SAFETY: no driver, AP or competing configuration writer
                 // can change the original stopped PCI cohort during takeover.
-                match unsafe { remappers.recheck_amd_stopped(pci, native_mmio::PciScope::Fabric) } {
+                match unsafe {
+                    remappers.recheck_stopped_by_page(pci, native_mmio::PciScope::Fabric)
+                } {
                     Ok(()) => {
                         remappers.amd_fabric = Some(mmio);
                         output::arguments(format_args!(
