@@ -953,7 +953,8 @@ fn claim(
     {
         return Err(ServiceError::Refused("the GPU's original identity changed"));
     }
-    gpu::cold::check_candidate(function, timer.as_ref())
+    let translated = services.dma_translated(address);
+    gpu::cold::check_candidate(function, timer.as_ref(), translated)
         .map_err(|error| cold_refusal(address, error))?;
     let owns_screen = match gop {
         ScreenOwner::Function(source) if source.address == address => {
@@ -1065,7 +1066,7 @@ fn claim(
         alloc::format!("GPU{line}PCIID"),
         alloc::format!("10de:{:04x}", adapter.device),
     );
-    let ready = gpu::cold::Cold::new(gpu::cold::Inputs {
+    let mut cold = gpu::cold::Cold::new(gpu::cold::Inputs {
         requester,
         views: GpuViews {
             config,
@@ -1074,9 +1075,20 @@ fn claim(
             boot0,
         },
         timer,
-    })
-    .quiesce_and_bind()
-    .map_err(|failure| cold_refusal(address, failure.error))?;
+    });
+    if translated {
+        // SAFETY: the mount's active remapper translates this requester, and
+        // its private domain is the one the cold attempt binds.
+        cold = unsafe { cold.translated() };
+    }
+    let ready = cold
+        .quiesce_and_bind()
+        .map_err(|failure| cold_refusal(address, failure.error))?;
+    if ready.reset().is_none() {
+        output::arguments(format_args!(
+            "GPU {address}: no function-local reset; started as firmware left it, DMA translated\n"
+        ));
+    }
     // SAFETY: both original owners transfer into this retained function
     // lifetime before Linux probe. Only the temporary UC observation is retired.
     let (bound, views) = unsafe { ready.into_parts() };

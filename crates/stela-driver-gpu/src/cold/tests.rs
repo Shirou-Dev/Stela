@@ -3,6 +3,7 @@ extern crate std;
 use super::*;
 use alloc::{rc::Rc, vec::Vec};
 use core::cell::RefCell;
+const FLR: u32 = 1 << 28;
 use stela_driver_base::bus::{
     dma::mapping::DmaError,
     pci::{Address, ConfigError},
@@ -57,7 +58,17 @@ impl ConfigSpace for Config {
         Ok(self.words[usize::from(offset / 4)])
     }
     fn write32(&mut self, offset: u16, value: u32) -> Result<(), ConfigError> {
+        let before = self.words[usize::from(offset / 4)];
         self.words[usize::from(offset / 4)] = value;
+        if offset == 0x84 && value & 3 == 3 {
+            self.state.borrow_mut().events.push("d3hot");
+        }
+        if offset == 0x84 && before & 3 == 3 && value & 3 == 0 {
+            self.state.borrow_mut().events.push("d0");
+            if before & 8 == 0 {
+                self.words[4] = 0;
+            }
+        }
         if offset == 0x48 && value & 0x8000 != 0 {
             let mut state = self.state.borrow_mut();
             state.events.push("flr");
@@ -91,7 +102,12 @@ unsafe impl Preparation for Peer {
         let peer = ManuallyDrop::new(self);
         let failed = {
             let mut state = peer.state.borrow_mut();
-            assert!(state.minimum_waited_us >= 100_000);
+            if state.events.contains(&"flr") {
+                assert!(state.minimum_waited_us >= 100_000);
+            }
+            if state.events.contains(&"d0") {
+                assert!(state.minimum_waited_us >= 20_000);
+            }
             state.events.push("root-drain");
             assert!(!state.panic_drain, "root callback interrupted");
             state.fail_drain
@@ -156,8 +172,9 @@ fn inputs() -> (Inputs<Peer, OldViews>, Rc<RefCell<State>>) {
     words[2] = 0x0300_0001;
     words[4] = 0xfe00_0000;
     words[0x34 / 4] = 0x40;
-    words[0x40 / 4] = 0x0002_0010;
+    words[0x40 / 4] = 0x0002_8010;
     words[0x44 / 4] = FLR;
+    words[0x80 / 4] = 0x0003_0001;
     words[0x100 / 4] = u32::MAX;
     let function = Function::new(
         Address {
@@ -217,7 +234,11 @@ fn preflight_never_seals_or_resets_an_unsupported_or_foreign_source() {
         let (mut inputs, state) = inputs();
         match case {
             0 => state.borrow_mut().fail_timer = true,
-            1 => inputs.requester.function.config().words[0x44 / 4] = 0,
+            1 => {
+                let words = &mut inputs.requester.function.config().words;
+                words[0x44 / 4] = 0;
+                words[0x84 / 4] = 8;
+            }
             2 => inputs.requester.function.config().words[1] |= 4,
             _ => inputs.requester.function.config().words[0] ^= 1,
         }
@@ -328,4 +349,54 @@ fn a_foreign_retained_view_owner_never_certifies_another_function() {
     assert!(state.borrow().events.is_empty());
     assert!(foreign.borrow().events.is_empty());
     assert_eq!(foreign.borrow().view_drops, 0);
+}
+#[test]
+fn a_function_without_flr_gets_a_d3hot_soft_reset() {
+    let (mut inputs, state) = inputs();
+    inputs.requester.function.config().words[0x44 / 4] = 0;
+    let ready = Cold::new(inputs)
+        .quiesce_and_bind()
+        .unwrap_or_else(|error| panic!("{:?}", error.error));
+    assert_eq!(ready.reset(), Some(ResetMethod::PowerManagement));
+    assert_eq!(
+        state.borrow().events,
+        ["views-seal", "d3hot", "d0", "root-drain", "bind"]
+    );
+    // SAFETY: symbolic CPU-only diagnostic handover.
+    let (mut bound, _views) = unsafe { ready.into_parts() };
+    assert_eq!(bound.0.function.config().words[4], 0xfe00_0000);
+}
+#[test]
+fn no_reset_starts_unreset_only_when_dma_is_translated() {
+    for translated in [false, true] {
+        let (mut inputs, state) = inputs();
+        {
+            let words = &mut inputs.requester.function.config().words;
+            words[0x44 / 4] = 0;
+            words[0x84 / 4] = 8;
+        }
+        let candidate = check_candidate(
+            &mut inputs.requester.function,
+            &PhysicalTimer(state.clone()),
+            translated,
+        );
+        let mut cold = Cold::new(inputs);
+        if translated {
+            assert_eq!(candidate, Ok(None));
+            // SAFETY: the symbolic domain stands for a translating one.
+            cold = unsafe { cold.translated() };
+            let ready = cold
+                .quiesce_and_bind()
+                .unwrap_or_else(|error| panic!("{:?}", error.error));
+            assert_eq!(ready.reset(), None);
+            assert_eq!(state.borrow().events, ["views-seal", "root-drain", "bind"]);
+        } else {
+            assert_eq!(candidate, Err(Error::ResetUnavailable));
+            let failed = failure(cold.quiesce_and_bind());
+            assert_eq!(failed.error, Error::ResetUnavailable);
+            drop(failed);
+            assert!(state.borrow().events.is_empty());
+            kept(&state.borrow());
+        }
+    }
 }
