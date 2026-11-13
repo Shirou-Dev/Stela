@@ -1302,6 +1302,23 @@ fn a_failed_start_names_its_admin_command() {
     );
 }
 
+/// Linux `nvme_scan_ns` passes over a namespace whose Identify Namespace
+/// the controller refuses: the controller stays, the namespace is
+/// reported with the command it refused.
+#[test]
+fn a_refused_identify_namespace_leaves_the_controller_attached() {
+    let f = Fixture::new();
+    f.model.lock().unwrap().refuse_identify = Some(0);
+    let a = f.attach().unwrap();
+    assert!(a.namespaces.is_empty());
+    assert_eq!(a.failures.len(), 1);
+    assert_eq!(a.failures[0].0, 1);
+    assert_eq!(
+        format!("{}", a.failures[0].1),
+        "NVMe Identify Namespace (opcode 0x06, CNS 0x00): device status 0x2"
+    );
+}
+
 #[test]
 fn owned_timeouts_abort_then_reset_contain_dma_and_retry_like_linux() {
     // An abort that completes the held write: it is retried, no reset.

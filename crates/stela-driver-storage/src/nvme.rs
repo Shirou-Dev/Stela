@@ -1043,7 +1043,20 @@ fn discover(
                 .push((namespace, BlockError::Unsupported("NVMe I/O command set")));
             continue;
         }
-        let data = controller.identify(IDENTIFY_NAMESPACE, namespace)?;
+        let data = match controller.identify(IDENTIFY_NAMESPACE, namespace) {
+            Ok(data) => data,
+            // Linux `nvme_scan_ns` passes over a namespace whose Identify
+            // the controller refuses, and keeps the controller: a
+            // sequential scan meets the IDs of no namespace this way.
+            Err(error @ BlockError::Device { .. }) => {
+                if !sequential {
+                    let error = error.at(identify_name(IDENTIFY_NAMESPACE));
+                    attached.failures.push((namespace, error));
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if !independent {
             ids.fill(version, data);
         }
