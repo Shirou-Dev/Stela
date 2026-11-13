@@ -1964,3 +1964,109 @@ fn a_stalled_status_is_cleared_without_a_wait() {
         vec![Order::Cbw(0), Order::Clear(0x82)]
     );
 }
+
+/// The disks of a device behind its owner begin a command and return once
+/// its wrapper is submitted, their caller polling for the end, as a
+/// shared disk's queue needs: a start never runs the command through.
+#[test]
+fn an_owned_disk_begins_commands_and_ends_them_at_later_looks() {
+    use super::super::media::{Owner, scan_bot};
+    use crate::block::{BlockDevice, Command};
+    let mut memory = vec![0u64; 32 * 1024];
+    let start = memory.as_mut_ptr() as u64;
+    let mut dma = dma(&mut memory);
+    let io = model(
+        start,
+        start + memory.len() as u64 * 8,
+        vec![unit(1), unit(2)],
+    );
+    let state = io.0.clone();
+    let owner = Rc::new(RefCell::new(Owner::new(
+        Bot::new(io, 3, endpoints(), &mut dma).unwrap(),
+        "reader".into(),
+        "serial".into(),
+    )));
+    let mut failures = Vec::new();
+    let mut disks = scan_bot(owner, &mut failures).unwrap();
+    assert_eq!(disks[1].depth(), 1);
+    let before = state.borrow().transfers;
+    let tag = disks[1]
+        .start(Command::Write {
+            lba: 0,
+            data: vec![0x77; 512],
+            fua: false,
+        })
+        .unwrap();
+    assert_eq!(state.borrow().transfers, before + 1, "the wrapper alone");
+    assert!(!disks[0].room() && !disks[1].room());
+    // A waiting command of the other unit ends the begun one first and
+    // keeps its result for its disk.
+    let mut bytes = [0; 512];
+    disks[0].read(0, &mut bytes).unwrap();
+    assert_eq!(bytes, [1; 512]);
+    assert!(matches!(disks[1].finish(tag), Some(Ok(None))));
+    assert!(disks[1].room());
+    let tag = disks[1]
+        .start(Command::Read { lba: 0, bytes: 512 })
+        .unwrap();
+    let read = (0..16).find_map(|_| disks[1].finish(tag)).unwrap();
+    assert_eq!(read.unwrap().unwrap(), vec![0x77; 512]);
+}
+
+/// A begun command keeps a waiting one's retries: once for the UNIT
+/// ATTENTION a class reset raised, and once more after a port reset.
+#[test]
+fn an_owned_begun_command_is_retried_as_a_waiting_one_is() {
+    use super::super::media::{Owner, scan_bot};
+    use crate::block::{BlockDevice, Command};
+    let mut memory = vec![0u64; 32 * 1024];
+    let start = memory.as_mut_ptr() as u64;
+    let mut dma = dma(&mut memory);
+    let io = model(
+        start,
+        start + memory.len() as u64 * 8,
+        vec![unit(1), unit(2)],
+    );
+    let state = io.0.clone();
+    let owner = Rc::new(RefCell::new(Owner::new(
+        Bot::new(io, 3, endpoints(), &mut dma).unwrap(),
+        "reader".into(),
+        "serial".into(),
+    )));
+    let mut failures = Vec::new();
+    let mut disks = scan_bot(owner, &mut failures).unwrap();
+    let finish = |disk: &mut super::super::Disk<Owner<Bot<Model>>>, tag| {
+        (0..64)
+            .find_map(|_| disk.finish(tag))
+            .expect("a begun command ended")
+    };
+    // A class reset ends one command; the device's UNIT ATTENTION after it
+    // is retried once.
+    state.borrow_mut().fault = Fault::Phase;
+    let tag = disks[1].start(Command::Flush).unwrap();
+    assert!(finish(&mut disks[1], tag).is_err());
+    state.borrow_mut().fault = Fault::None;
+    state.borrow_mut().now += RESET_RECOVERY_US;
+    state.borrow_mut().units[1].as_mut().unwrap().attention = true;
+    assert!(disks[1].room());
+    let tag = disks[1]
+        .start(Command::Read { lba: 0, bytes: 512 })
+        .unwrap();
+    assert_eq!(finish(&mut disks[1], tag).unwrap().unwrap(), vec![2; 512]);
+    // A failed class reset resets the port and runs the write once more.
+    state.borrow_mut().port_reset = true;
+    state.borrow_mut().fault = Fault::Reset;
+    let tag = disks[1]
+        .start(Command::Write {
+            lba: 0,
+            data: vec![0x41; 512],
+            fua: false,
+        })
+        .unwrap();
+    assert!(matches!(finish(&mut disks[1], tag), Ok(None)));
+    assert_eq!(state.borrow().port_resets, 1);
+    assert_eq!(
+        state.borrow().units[1].as_ref().unwrap().media[..512],
+        [0x41; 512]
+    );
+}
