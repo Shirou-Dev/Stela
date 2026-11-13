@@ -13,6 +13,13 @@
 //! So a unit starts blocked only when no device behind it needs the pool,
 //! starts in the window when one does, and is left untranslated when
 //! taking any unit would refuse a native driver the machine needs.
+//!
+//! The IOAPICs and every native attachment need the whole machine's
+//! interrupt and DMA state accounted for: a complete blocked fabric, or no
+//! unit taken with every unit off. A taken unit beside a left one gives
+//! neither, so when the policy leaves one unit (a display behind it, a
+//! reserved region, no requester) and every unit is off, it leaves them
+//! all and the machine runs untranslated, as with no IOMMU described.
 use super::{Leave, Present};
 use alloc::vec::Vec;
 use stela_drivers::bus::pci::Identity;
@@ -79,6 +86,9 @@ pub enum Left {
     /// This requester's driver attaches only on a machine whose units are
     /// all blocked or all left, and some device needs the drivers' pool.
     Native { segment: u16, rid: u16 },
+    /// Another unit is left, and with every unit off a machine is accounted
+    /// for only when it takes none.
+    Beside,
 }
 
 /// How a unit starts.
@@ -116,8 +126,15 @@ impl Access {
 /// present function the units must cover for a complete blocked fabric
 /// (an AMD-Vi unit's own function is not one). `units_off` says whether the
 /// boot proved every described unit off since ExitBootServices, without
-/// which leaving them all gains a native driver nothing.
-pub fn modes(candidates: &[Candidate], requesters: &[Requester], units_off: bool) -> Vec<Mode> {
+/// which leaving them all gains a native driver nothing. `refused` says
+/// whether a described unit that is not a candidate was left off before
+/// the policy ran.
+pub fn modes(
+    candidates: &[Candidate],
+    requesters: &[Requester],
+    units_off: bool,
+    refused: bool,
+) -> Vec<Mode> {
     let covered = |requester: &Requester| {
         candidates.iter().any(|candidate| {
             candidate.segment == requester.segment
@@ -138,6 +155,7 @@ pub fn modes(candidates: &[Candidate], requesters: &[Requester], units_off: bool
         .iter()
         .any(|requester| requester.need == Need::Physical);
     let fabric = !candidates.is_empty()
+        && !refused
         && !any_physical
         && candidates
             .iter()
@@ -147,6 +165,14 @@ pub fn modes(candidates: &[Candidate], requesters: &[Requester], units_off: bool
         .iter()
         .find(|requester| requester.need == Need::Native)
         .filter(|_| units_off && !fabric);
+    // A unit left beside taken ones leaves the IOAPICs and every native
+    // attachment refused; with every unit off, leaving all of them does not.
+    let beside = units_off
+        && !fabric
+        && (refused
+            || candidates
+                .iter()
+                .any(|candidate| candidate.decision.is_err()));
     candidates
         .iter()
         .map(|candidate| match (&candidate.decision, native) {
@@ -156,6 +182,7 @@ pub fn modes(candidates: &[Candidate], requesters: &[Requester], units_off: bool
                 segment: native.segment,
                 rid: native.rid,
             }),
+            (Ok(_), None) if beside => Mode::Left(Left::Beside),
             (Ok(rids), None) if !candidate.blockable || physical(candidate.segment, rids) => {
                 Mode::Window
             }

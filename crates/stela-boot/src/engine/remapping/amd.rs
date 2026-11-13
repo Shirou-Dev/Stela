@@ -485,7 +485,12 @@ pub(super) unsafe fn take(
         .filter(|requester| !own.contains(&(requester.segment, requester.rid)))
         .copied()
         .collect();
-    let modes = initial::modes(&candidates, &covering, units_off);
+    // A unit refused before the policy is left like one the policy leaves.
+    // One in a state no proof covers keeps the machine from being treated
+    // as untranslated, so leaving every unit would then gain nothing.
+    let refused = cold.len() < ivrs.units().count();
+    let units_off = units_off && !outcome.uncertain;
+    let modes = initial::modes(&candidates, &covering, units_off, refused);
     let fabric = modes.iter().all(|mode| *mode == Mode::Blocked);
     for (cold, mode) in cold.into_iter().zip(modes) {
         let Cold {
@@ -503,6 +508,14 @@ pub(super) unsafe fn take(
                     "HOST IOMMU AMD-Vi unit {base:#x} left untranslated: {} attaches only natively, which a taken unit beside the drivers' window refuses\n",
                     super::address(segment, rid)
                 ));
+                outcome.uncertain |= !retire(unit);
+                continue;
+            }
+            (_, Mode::Left(Left::Beside)) => {
+                left(
+                    base,
+                    &"another unit is left and every unit is off, so the machine runs untranslated",
+                );
                 outcome.uncertain |= !retire(unit);
                 continue;
             }

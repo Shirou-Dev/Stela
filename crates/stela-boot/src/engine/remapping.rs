@@ -8,7 +8,9 @@
 //! maps the pool and the unit's reserved regions one to one. A unit with
 //! none starts blocked. When a device the machine needs attaches only
 //! natively (VMD, EHCI) and the fabric cannot be blocked whole, no unit is
-//! taken. A driver that asks the native services for a domain gets its own
+//! taken. With every unit off, a unit the policy leaves leaves them all, as
+//! a taken unit beside it would keep the IOAPICs refused. A driver that
+//! asks the native services for a domain gets its own
 //! ([`Remappers::domain`]).
 //!
 //! With no unit taken and every described unit proven off since
@@ -444,7 +446,10 @@ impl Remappers {
             })
             .collect();
         let units_off = inactive_firmware_units.off_dmar(&parsed.units);
-        let modes = initial::modes(&candidates, &requesters, units_off);
+        // A unit on a segment without a captured configuration space is
+        // never planned, so never taken.
+        let refused = planned.len() < parsed.units.len();
+        let modes = initial::modes(&candidates, &requesters, units_off, refused);
         for ((_, index, decision, reserved), mode) in planned.into_iter().zip(modes) {
             let unit = &parsed.units[index];
             let (requesters, mut window) = match (decision, mode) {
@@ -455,6 +460,13 @@ impl Remappers {
                         "HOST IOMMU VT-d unit {:#x} left untranslated: {} attaches only natively, which a taken unit beside the drivers' window refuses\n",
                         unit.base,
                         address(segment, rid)
+                    ));
+                    continue;
+                }
+                (_, Mode::Left(Left::Beside)) => {
+                    output::arguments(format_args!(
+                        "HOST IOMMU VT-d unit {:#x} left untranslated: another unit is left and every unit is off, so the machine runs untranslated\n",
+                        unit.base
                     ));
                     continue;
                 }
