@@ -25,6 +25,10 @@ fn a_normal_boot_repairs_once_and_then_stops_with_the_manual_remedy() {
         missing(Record::Pending),
         Decision::StopMissing { attempted: false }
     );
+    assert_eq!(
+        missing(Record::Installed),
+        Decision::StopMissing { attempted: false }
+    );
     // Without NVRAM to write, no repair can be asked for.
     assert_eq!(
         decide(Report::Missing, Boot::Normal, Record::None, false),
@@ -70,6 +74,12 @@ fn the_record_round_trips_through_nvram() {
         Record::Attempted
     );
     assert_eq!(Record::read(&variables(Some(b"x"))), Record::Other);
+    // An erase install's request replaces whatever an earlier system left.
+    let mut installed = variables(Some(BUNDLE_REPAIR_ATTEMPTED));
+    assert!(Change::Installed.apply(&mut installed).unwrap());
+    assert!(!Change::Installed.apply(&mut installed).unwrap());
+    assert_eq!(Record::read(&installed), Record::Installed);
+    assert!(Change::Forget.apply(&mut installed).unwrap());
     let mut attempted = variables(Some(BUNDLE_REPAIR_ATTEMPTED));
     attempted
         .set(Partition::Common, BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED)

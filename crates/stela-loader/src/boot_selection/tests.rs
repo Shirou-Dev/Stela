@@ -403,6 +403,30 @@ fn a_pending_bundle_repair_boots_macos_once_for_it_and_never_again_by_itself() {
 }
 
 #[test]
+fn an_installs_bundle_repair_boots_macos_once_for_it_and_leaves_no_record() {
+    let mut vars = variables(&[(Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_INSTALLED)]);
+    let selection = select(&vars).unwrap();
+    assert_eq!(selection.target, Target::MacOs { safe: false });
+    assert!(selection.bundle_repair);
+    let (options, _) = route(CONFIG, Some(&selection)).unwrap();
+    assert!(options.ends_with(BUNDLE_REPAIR_OPTION), "{options}");
+    // Removed before the boot: a repair that fails leaves the next normal
+    // boot free to ask for the usual one.
+    assert!(consume(&mut vars, &selection).unwrap());
+    assert_eq!(lookup(&vars, BUNDLE_REPAIR), None);
+    assert!(!select(&vars).unwrap().bundle_repair);
+    // A recoveryOS boot and a disk without a system leave the request.
+    let mut empty = select(&variables(&[(
+        Partition::System,
+        BUNDLE_REPAIR,
+        BUNDLE_REPAIR_INSTALLED,
+    )]))
+    .unwrap();
+    empty.missing_boot_media();
+    assert!(!empty.bundle_repair && !empty.consumes());
+}
+
+#[test]
 fn a_bundle_repair_waits_for_a_macos_boot_and_stela_cfg_cannot_ask_for_one() {
     let vars = variables(&[
         (Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_PENDING),

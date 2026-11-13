@@ -301,6 +301,9 @@ pub struct Experiment {
     failure: Option<(String, u64)>,
     ledger: usize,
     mode: Mode,
+    /// The restore erases the disk and puts macOS on it, so the first
+    /// macOS boot finds a Data volume without the Metal plugin.
+    installed_macos: bool,
     /// The mux's backpressure as the last poll found it.
     backpressure: MuxBackpressure,
     /// The counter's rate, for [`PREFETCH_MICROS`].
@@ -876,6 +879,8 @@ impl Experiment {
                 .prepare()
                 .map_err(|error| refuse!("restore store: {error}", %error))?;
         }
+        let installed_macos = matches!(mode, Mode::Install | Mode::DevelopmentInstall)
+            && !matches!(route, Route::Recovery);
         let driver = Driver::new(answers, route)
             .map_err(|error| refuse!("restore driver: {error}", %error))?;
         Ok(Self {
@@ -886,6 +891,7 @@ impl Experiment {
             failure: None,
             ledger: 0,
             mode,
+            installed_macos,
             backpressure: MuxBackpressure::default(),
             tsc_hz: handoff.tsc_hz,
         })
@@ -979,6 +985,9 @@ impl Experiment {
             Poll::Pending => {}
             Poll::Ready(Ok(())) => {
                 self.terminal = true;
+                if self.installed_macos {
+                    super::bundle_repair::installed();
+                }
                 output::arguments(format_args!(
                     "{}\n",
                     match self.mode {

@@ -100,10 +100,14 @@ pub const FAILURE_REASONS: [&[u8]; 2] = [b"iboot-failure-reason", b"iboot-failur
 /// asks the next macOS boot to be the repair's single-user maintenance boot,
 /// which sets it to [`BUNDLE_REPAIR_ATTEMPTED`] before it boots, so a failed
 /// or interrupted repair is never retried by itself. The engine removes it
-/// once a boot finds the plugin installed.
+/// once a boot finds the plugin installed. [`BUNDLE_REPAIR_INSTALLED`] is
+/// what a finished erase install leaves: the next macOS boot is the same
+/// maintenance boot and removes the record, so a normal boot that still
+/// finds the plugin missing asks for the repair as usual.
 pub const BUNDLE_REPAIR: &[u8] = b"stela-bundle-repair";
 pub const BUNDLE_REPAIR_PENDING: &[u8] = b"pending";
 pub const BUNDLE_REPAIR_ATTEMPTED: &[u8] = b"attempted";
+pub const BUNDLE_REPAIR_INSTALLED: &[u8] = b"installed";
 const TRUE: &[u8] = b"true";
 const FALSE: &[u8] = b"false";
 /// `8-4-4-4-12` hexadecimal digits.
@@ -367,6 +371,7 @@ impl Selection {
             // The repair waits for a macOS boot, as for any recoveryOS one.
             self.bundle_repair = false;
             self.assigned.retain(|(name, _)| *name != BUNDLE_REPAIR);
+            self.consumed.retain(|name| *name != BUNDLE_REPAIR);
             self.reasons
                 .push("missing-boot-media: the boot disk holds no installed system".into());
         }
@@ -522,12 +527,15 @@ pub fn select(variables: &Variables) -> Result<Selection> {
     // the next one.
     if matches!(selection.target, Target::MacOs { .. })
         && let Some(value) = lookup(variables, BUNDLE_REPAIR)
-        && strip(value) == BUNDLE_REPAIR_PENDING
     {
+        match strip(value) {
+            BUNDLE_REPAIR_PENDING => selection
+                .assigned
+                .push((BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED)),
+            BUNDLE_REPAIR_INSTALLED => selection.consumed.push(BUNDLE_REPAIR),
+            _ => return Ok(selection),
+        }
         selection.reasons.push(shown(BUNDLE_REPAIR, value));
-        selection
-            .assigned
-            .push((BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED));
         selection.bundle_repair = true;
     }
     Ok(selection)

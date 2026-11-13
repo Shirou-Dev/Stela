@@ -18,10 +18,11 @@ static PERSISTENT: AtomicBool = AtomicBool::new(false);
 static CHANGE: AtomicU8 = AtomicU8::new(0);
 
 const BOOTS: [Boot; 3] = [Boot::Normal, Boot::SingleUser, Boot::Repair];
-const RECORDS: [Record; 4] = [
+const RECORDS: [Record; 5] = [
     Record::None,
     Record::Pending,
     Record::Attempted,
+    Record::Installed,
     Record::Other,
 ];
 
@@ -76,6 +77,14 @@ pub(super) fn decide(report: Report) -> Decision {
     decision
 }
 
+/// An erase install finished: its stop asks the first macOS boot to be the
+/// repair, which a fresh Data volume always needs.
+pub(super) fn installed() {
+    if PERSISTENT.load(Ordering::Relaxed) {
+        CHANGE.store(1 + Change::Installed as u8, Ordering::Relaxed);
+    }
+}
+
 /// Whether the stop has a change to store.
 pub(super) fn change_pending() -> bool {
     CHANGE.load(Ordering::Relaxed) != 0
@@ -87,6 +96,7 @@ pub(super) fn at_stop(image: &mut Image) -> Vec<(usize, Vec<u8>)> {
     let change = match CHANGE.swap(0, Ordering::Relaxed) {
         1 => Change::Request,
         2 => Change::Forget,
+        3 => Change::Installed,
         _ => return Vec::new(),
     };
     let result = (|| -> Result<Vec<(usize, Vec<u8>)>, alloc::string::String> {
