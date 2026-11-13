@@ -70,13 +70,8 @@ pub(crate) unsafe fn print_stack_at(stack: *const u64) {
     let _ = writeln!(Serial);
 }
 
-/// The words from `stack` to the end of its page, at most 512, that lie in
-/// this image, as offsets from its base.
-///
-/// # Safety
-/// `stack`'s page reads from `stack` on.
-unsafe fn image_offsets(stack: *const u64) -> impl Iterator<Item = u64> {
-    const PAGE: usize = 4096;
+/// This image's base and its size as mapped.
+fn image_extent() -> (u64, u64) {
     unsafe extern "C" {
         static __ImageBase: u8;
     }
@@ -91,6 +86,63 @@ unsafe fn image_offsets(stack: *const u64) -> impl Iterator<Item = u64> {
                 .read_unaligned(),
         )
     };
+    (base, bytes)
+}
+
+/// The instruction bytes at a faulting address in this image, for a
+/// failure message. They tell an address the processor was sent to by
+/// mistake (the bytes are the build's, read from the middle of an
+/// instruction) from code that was overwritten (the bytes are not the
+/// build's).
+pub(crate) struct Code {
+    bytes: [u8; Self::SHOWN],
+    count: usize,
+}
+
+impl Code {
+    const SHOWN: usize = 8;
+
+    /// The bytes at `rip`, or none when they are not all inside this image,
+    /// whose pages every root maps.
+    pub(crate) fn at(rip: u64) -> Self {
+        let (base, bytes) = image_extent();
+        let mut code = Self {
+            bytes: [0; Self::SHOWN],
+            count: 0,
+        };
+        let inside = rip
+            .checked_sub(base)
+            .and_then(|offset| offset.checked_add(Self::SHOWN as u64))
+            .is_some_and(|end| end <= bytes);
+        if inside {
+            // SAFETY: mapped, readable bytes of this image.
+            code.bytes = unsafe { (rip as *const [u8; Self::SHOWN]).read_unaligned() };
+            code.count = Self::SHOWN;
+        }
+        code
+    }
+}
+
+impl core::fmt::Display for Code {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.count == 0 {
+            return f.write_str("outside-the-image");
+        }
+        for byte in &self.bytes[..self.count] {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The words from `stack` to the end of its page, at most 512, that lie in
+/// this image, as offsets from its base.
+///
+/// # Safety
+/// `stack`'s page reads from `stack` on.
+unsafe fn image_offsets(stack: *const u64) -> impl Iterator<Item = u64> {
+    const PAGE: usize = 4096;
+    let (base, bytes) = image_extent();
     let words = (PAGE - stack.addr() % PAGE) / 8;
     (0..words.min(512))
         // SAFETY: the caller's.

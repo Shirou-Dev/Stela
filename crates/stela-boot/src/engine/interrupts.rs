@@ -655,11 +655,13 @@ pub fn fatal(frame: &Frame) -> ! {
     };
     output::fatal(format_args!(
         "unexpected x86 exception in the system engine: vector={} error={:#x} rip={:#x} \
-         (image+{:#x}) cr2={:#x} cr3={:#x} drivers={drivers} stack={callers}",
+         (image+{:#x}) code={} rax={:#x} cr2={:#x} cr3={:#x} drivers={drivers} stack={callers}",
         frame.vector,
         frame.error,
         frame.rip,
         frame.rip.wrapping_sub(&raw const __ImageBase as u64),
+        output::Code::at(frame.rip),
+        frame.rax,
         cr2(),
         cr3()
     ))
