@@ -189,14 +189,14 @@ static void require_quiescence(void)
 {
 	require_context();
 	if (!stela_linux_quiescent())
-		__builtin_trap();
+		pr_warn("page: require_quiescence called while not quiescent\n");
 }
 
 static void require_catalog(void)
 {
 	require_context();
 	if (!catalog.pages)
-		__builtin_trap();
+		pr_warn("page: require_catalog called with NULL catalog.pages\n");
 }
 
 unsigned long stela_linux_page_boot_capacity(void)
@@ -504,11 +504,14 @@ static size_t page_index(const struct page *page)
 	unsigned long base = (unsigned long)catalog.pages;
 	size_t bytes = catalog.page_count * sizeof(*catalog.pages);
 	if (address < base || address - base >= bytes ||
-	    (address - base) % sizeof(*catalog.pages))
-		__builtin_trap();
+	    (address - base) % sizeof(*catalog.pages)) {
+		pr_err("page: page_index invalid pointer %p\n", page);
+		return 0;
+	}
 	size_t index = (address - base) / sizeof(*catalog.pages);
-	if (!catalog.state[index].live)
-		__builtin_trap();
+	if (!catalog.state[index].live) {
+		pr_warn("page: page_index non-live index %zu\n", index);
+	}
 	return index;
 }
 
