@@ -137,9 +137,10 @@ pub(super) unsafe fn attach(
     bridges: &[native::Bridge],
     clock: Clock,
 ) -> Result<Host, PlatformError> {
-    let requester = services
-        .claim_stopped(address)
-        .map_err(PlatformError::Native)?;
+    // i801 issues no memory requests: Linux `i801_probe` never sets Bus
+    // Master, and the claim keeps it sealed off.
+    let requester =
+        super::services::claim_unmastered(services, address).map_err(PlatformError::Native)?;
     let mut function = requester.into_function();
     let info = ControllerInfo::from_pci_id(function.vendor, function.device)
         .ok_or(PlatformError::Refused("not an i801 SMBus host"))?;

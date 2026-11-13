@@ -9,13 +9,39 @@ use crate::bus::{
         Address, Bar, Function,
         owned::OwnedConfig,
         requester::{
-            ClaimError, RequesterBinding, StoppedRequester, preparation::PreparingRequester,
+            ClaimError, FunctionRole, RequesterBinding, StoppedRequester,
+            preparation::PreparingRequester,
         },
     },
     thunderbolt::manager::Platform,
 };
 use alloc::{boxed::Box, rc::Rc, sync::Arc};
 use core::fmt;
+
+/// Claim the function at `address` for a driver that never sets Bus Master,
+/// such as an SMBus or I2C host, through the mount's cold preparation. The
+/// seal stays set for good ([`PreparingRequester::into_unmastered`]), so it
+/// needs neither an engine stop nor a domain. A driver that masters takes
+/// [`NativeServices::prepare_requester`] and produces its own quiescence
+/// receipt.
+pub(crate) fn claim_unmastered(
+    services: &dyn NativeServices,
+    address: Address,
+) -> Result<StoppedRequester, ServiceError> {
+    let function = services.prepare_requester(address)?.into_unmastered();
+    // SAFETY: a preparation exists only for a physical function of the
+    // complete inventory, parked with Bus Master clear and its outstanding
+    // requests drained. Its seal stays set for this owner's life, so it can
+    // issue no memory request, MSI included; the stopped check confirms its
+    // MSI, MSI-X and INTx are off. Any engine it has reaches no memory.
+    unsafe { StoppedRequester::from_stopped_pci(function, FunctionRole::Physical) }.map_err(
+        |(error, function)| {
+            // Keep the original owner, as a failed preparation does.
+            core::mem::forget(function);
+            ServiceError::Claim(error)
+        },
+    )
+}
 
 /// Complete configuration observations for one adopted PCI subtree.
 /// The callback reaches only the kept bridge and the listed functions.
@@ -61,11 +87,12 @@ impl fmt::Display for ServiceError {
 /// pages and the ACPI namespace.
 ///
 /// # Safety
-/// Implementations transfer ownership: each [`claim_stopped`](Self::claim_stopped)
-/// requester is the unique owner of its configuration, with engines, DMA and
-/// interrupts stopped and drained, as [`StoppedRequester::from_stopped_pci`]
-/// requires. Each bridge is the unique owner of its configuration space,
-/// left forwarding. Each mapping covers exactly the requested BAR, uncached and
+/// Implementations transfer ownership: each
+/// [`prepare_requester`](Self::prepare_requester) preparation is the unique
+/// owner of a physical function's original configuration and root, parked
+/// with Bus Master clear, its outstanding requests drained and the seal set
+/// that keeps it clear, as [`PreparingRequester::new`] requires. Each bridge
+/// is the unique owner of its configuration space, left forwarding. Each mapping covers exactly the requested BAR, uncached and
 /// read/write, with no other accessor. Each domain meets the [`DmaDomain`]
 /// contract for its kind. Every
 /// returned owner stays valid in every access context `probe`'s drivers use.
@@ -96,10 +123,6 @@ pub unsafe trait NativeServices {
     /// has no Stela IRQ/work users; the platform excludes prior firmware and
     /// conflicting reset/configuration/routing owners throughout preparation.
     fn prepare_requester(&self, address: Address) -> Result<PreparingRequester, ServiceError>;
-
-    /// Claim the function at `address` as a stopped requester through an owned
-    /// mapping of its configuration space.
-    fn claim_stopped(&self, address: Address) -> Result<StoppedRequester, ServiceError>;
 
     /// The PCI-to-PCI bridge at `address` through an owned mapping of its
     /// configuration space, left forwarding, for a driver that sets its
@@ -265,7 +288,6 @@ pub(crate) mod tests {
     pub(crate) struct Refusing {
         pub(crate) requests: RefCell<Vec<Address>>,
         pub(crate) preparations: RefCell<Vec<Address>>,
-        pub(crate) stopped: RefCell<Vec<Address>>,
         model_minimum: bool,
     }
     impl Refusing {
@@ -306,11 +328,6 @@ pub(crate) mod tests {
         fn prepare_requester(&self, address: Address) -> Result<PreparingRequester, ServiceError> {
             self.requests.borrow_mut().push(address);
             self.preparations.borrow_mut().push(address);
-            Err(ServiceError::Unavailable)
-        }
-        fn claim_stopped(&self, address: Address) -> Result<StoppedRequester, ServiceError> {
-            self.requests.borrow_mut().push(address);
-            self.stopped.borrow_mut().push(address);
             Err(ServiceError::Unavailable)
         }
         fn bridge(&self, address: Address) -> Result<Function<OwnedConfig>, ServiceError> {
@@ -369,10 +386,11 @@ pub(crate) mod tests {
             function: 0,
         };
         assert_eq!(
-            services.claim_stopped(address).err(),
+            claim_unmastered(&services, address).err(),
             Some(ServiceError::Unavailable)
         );
         assert_eq!(*services.requests.borrow(), [address]);
+        assert_eq!(*services.preparations.borrow(), [address]);
         assert!(matches!(services.entropy(), Err(ServiceError::Unavailable)));
 
         assert_eq!(

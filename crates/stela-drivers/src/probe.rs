@@ -57,6 +57,8 @@ pub enum Error {
     Pch(pch::AttachError),
     /// The mount's [`NativeServices`] refused or lack a resource.
     Native(ServiceError),
+    /// The original root refused a driver's quiescence receipt.
+    Preparation(crate::bus::pci::requester::preparation::Error),
     Vmd(crate::bus::vmd::Error),
     Tg3(net::tg3::Error),
     Aqtion(net::aqtion::native::Error),
@@ -88,6 +90,7 @@ impl fmt::Display for Error {
             Self::Realtek(error) => error.fmt(f),
             Self::Pch(error) => write!(f, "e1000e: {error}"),
             Self::Native(error) => error.fmt(f),
+            Self::Preparation(error) => write!(f, "cold requester preparation: {error}"),
             Self::Vmd(error) => write!(f, "VMD: {error}"),
             Self::Tg3(error) => write!(f, "tg3: {error}"),
             Self::Aqtion(error) => write!(f, "atlantic: {error}"),

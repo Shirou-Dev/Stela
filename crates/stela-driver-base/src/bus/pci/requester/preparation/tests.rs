@@ -316,6 +316,34 @@ fn failed_old_root_or_binding_keeps_the_preparation_graph() {
     }
 }
 #[test]
+fn an_unmastered_function_keeps_its_seal_and_never_touches_the_root() {
+    let (prepared, state) = preparing(false, false);
+    let mut function = prepared.into_unmastered();
+    let config = function.config();
+    assert_eq!(
+        config.write16(
+            regs::COMMAND,
+            regs::COMMAND_MASTER | regs::COMMAND_MEMORY | regs::COMMAND_INTX_DISABLE
+        ),
+        Err(crate::bus::pci::ConfigError::before_effect(
+            ConfigFailure::BusMasterSealed
+        ))
+    );
+    // Decode and interrupt controls stay the driver's.
+    let decoding = regs::COMMAND_MEMORY | regs::COMMAND_INTX_DISABLE;
+    config.write16(regs::COMMAND, decoding).unwrap();
+    assert_eq!(config.read16(regs::COMMAND), Ok(decoding));
+    // It is a stopped requester in every observation.
+    // SAFETY: the isolated fixture has no engine, and its seal stays set.
+    let requester = unsafe { StoppedRequester::from_stopped_pci(function, FunctionRole::Physical) }
+        .unwrap_or_else(|(error, _)| panic!("{error:?}"));
+    let mut config = requester.into_function().into_config();
+    // SAFETY: isolated idle fixture; the kept retention must refuse retirement.
+    assert_eq!(unsafe { config.retire() }, Err(MappingError::Busy));
+    assert!(state.events.lock().unwrap().is_empty());
+    assert_eq!(state.drops.load(Ordering::Relaxed), 0);
+}
+#[test]
 fn abandoning_preparation_does_not_release_an_unstopped_owner() {
     let (prepared, state) = preparing(false, false);
     drop(prepared);

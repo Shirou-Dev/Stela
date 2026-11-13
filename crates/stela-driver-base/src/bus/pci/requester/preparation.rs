@@ -225,6 +225,23 @@ impl PreparingRequester {
         &mut self.owner.resources().function
     }
 
+    /// Keep this original function for a driver that never sets Bus Master,
+    /// such as an SMBus or I2C host. Its seal stays set for the owner's life,
+    /// so the function issues no memory request, MSI included, and needs
+    /// neither an engine stop nor a new domain. The original root is never
+    /// drained or bound; it and the epoch retention stay kept until boot ends.
+    pub fn into_unmastered(self) -> Function<OwnedConfig> {
+        let Resources {
+            function,
+            retained,
+            root,
+            ..
+        } = self.owner.completed();
+        core::mem::forget(retained);
+        core::mem::forget(root);
+        function
+    }
+
     /// # Safety
     /// The owning driver has acknowledged engine stop/reset and submission
     /// exclusion for this original function, with no possibility of restart.

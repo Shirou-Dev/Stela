@@ -25,7 +25,7 @@ use stela_drivers::{
             owned::OwnedConfig,
             power::Timer,
             requester::{
-                ClaimError, FunctionRole, RequesterBinding, StoppedRequester,
+                ClaimError, FunctionRole, RequesterBinding,
                 preparation::{AttachmentBackend, DetachError, Root},
             },
         },
@@ -249,12 +249,6 @@ unsafe impl NativeServices for Services<'_> {
             drop(rejected.function);
             ServiceError::Claim(rejected.error)
         })
-    }
-
-    fn claim_stopped(&self, _: Address) -> Result<StoppedRequester, ServiceError> {
-        Err(ServiceError::Refused(
-            "native endpoint engine stop receipt unavailable",
-        ))
     }
 
     fn bridge(&self, _: Address) -> Result<Function<OwnedConfig>, ServiceError> {

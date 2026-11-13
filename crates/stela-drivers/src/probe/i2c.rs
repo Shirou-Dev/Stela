@@ -792,7 +792,10 @@ mod attach {
         let segment = integer(parent, "_SEG")?.unwrap_or(0) as u16;
         let address = pci_location(adr, segment, bus)
             .ok_or(PlatformError::Refused("I2C controller _ADR out of range"))?;
-        let requester = services.claim_stopped(address).map_err(native)?;
+        // The LPSS host runs its transfers by PIO and never sets Bus Master,
+        // which the claim keeps sealed off.
+        let requester =
+            crate::probe::services::claim_unmastered(services, address).map_err(native)?;
         let mut function = ManuallyDrop::new(requester.into_function());
         let identity = lpss::Identity {
             vendor: function.vendor,
@@ -812,8 +815,8 @@ mod attach {
                 return Err(error);
             }
         };
-        // SAFETY: the mount claimed this function stopped, and sizing its BARs
-        // with decode off left it so.
+        // SAFETY: the claim keeps this function's Bus Master sealed off, and
+        // sizing its BARs with decode off left it stopped.
         let requester = match unsafe {
             StoppedRequester::from_stopped_pci(
                 ManuallyDrop::into_inner(function),
