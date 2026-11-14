@@ -23,8 +23,15 @@ pub fn require_sources() {
 }
 
 fn require_source(source: &str) {
+    let path = Path::new(source);
     assert!(
-        Path::new(source).join(".git").exists(),
+        path.join(".git").exists() || !path.join("Makefile").exists(),
+        "{source} is not a Git checkout: a release's source archive holds the pinned sources \
+         without Stela's patches applied (they are in third_party/patches); build from a clone \
+         of the repository, where `cargo xtask gpu fetch` applies them"
+    );
+    assert!(
+        path.join(".git").exists(),
         "{source} is missing; run `cargo xtask gpu fetch`"
     );
 }
