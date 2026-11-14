@@ -724,11 +724,42 @@ pub(super) fn unmodeled_report<H: Host>(
         ));
     }
     for requirement in requirements {
-        output::arguments(format_args!("UNMODELED {requirement}\n"));
+        let line = alloc::format!("{requirement}");
+        if first_report(&line) {
+            output::arguments(format_args!("UNMODELED {line}\n"));
+        }
     }
     for line in requests {
-        output::arguments(format_args!("UNMODELED {line}\n"));
+        if first_report(&line) {
+            output::arguments(format_args!("UNMODELED {line}\n"));
+        }
     }
+}
+
+/// Lines [`first_report`] remembers; past these every line is printed.
+const REPORTED_LINES: usize = 512;
+/// The FNV-1a hashes of the `UNMODELED` lines printed so far, zero for an
+/// empty place.
+static REPORTED: [AtomicU64; REPORTED_LINES] = [const { AtomicU64::new(0) }; REPORTED_LINES];
+
+/// Whether `line` was not printed before in this boot. Each PE and each
+/// report window finds the same unsupported operation anew, and the log
+/// held one operation's line once for each of them.
+fn first_report(line: &str) -> bool {
+    let hash = line
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+        .max(1);
+    for place in &REPORTED {
+        match place.compare_exchange(0, hash, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(kept) if kept == hash => return false,
+            Err(_) => {}
+        }
+    }
+    true
 }
 
 /// Each device register a survey answered for the first time since the last
