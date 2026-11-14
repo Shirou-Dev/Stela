@@ -364,6 +364,11 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
                         "GPU {name}: display detected after {waited_ms} ms\n"
                     ));
                 }
+                let (width, height) = display.size();
+                output::arguments(format_args!(
+                    "GPU {name}: display runs {width}x{height} at {} mHz\n",
+                    display.refresh_millihertz()
+                ));
                 crate::status::take_screen(Some(screen(&display)));
                 for (_, fd) in waiting.drain(..) {
                     client::close_descriptor(fd);
