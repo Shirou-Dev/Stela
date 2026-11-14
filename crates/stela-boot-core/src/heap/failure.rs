@@ -20,6 +20,8 @@ fn capture(heap: &Heap, layout: Layout) -> Option<Report> {
     {
         return None;
     }
+    heap.failed[0].store(layout.size(), Ordering::Relaxed);
+    heap.failed[1].store(layout.align(), Ordering::Release);
     let usage = heap.try_lock().and_then(|guard| {
         // SAFETY: the successful one-shot guard owns heap metadata and masks
         // local IRQ reentry. No state borrow or guard reaches UART formatting.

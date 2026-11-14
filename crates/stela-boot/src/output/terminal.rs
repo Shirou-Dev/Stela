@@ -159,7 +159,7 @@ pub(crate) struct Callers {
 }
 
 impl Callers {
-    const SHOWN: usize = 10;
+    const SHOWN: usize = 24;
 
     /// # Safety
     /// `stack`'s page reads from `stack` on.
@@ -183,6 +183,21 @@ impl core::fmt::Display for Callers {
             write!(f, "{}{offset:#x}", if index == 0 { "" } else { " " })?;
         }
         Ok(())
+    }
+}
+
+/// The heap's first failed allocation, as a failure message names it.
+struct Failed(Option<(usize, usize)>);
+
+impl core::fmt::Display for Failed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some((bytes, align)) => write!(
+                f,
+                " (the heap had no room for {bytes} bytes aligned to {align})"
+            ),
+            None => Ok(()),
+        }
     }
 }
 
@@ -224,13 +239,18 @@ pub(crate) fn panic(info: &PanicInfo<'_>) -> ! {
         unsafe { asm!("mov {}, rsp", out(reg) stack, options(nomem, nostack, preserves_flags)) };
         // SAFETY: the stack pointer's own page is mapped.
         let callers = unsafe { Callers::at(stack) };
+        // The port had the heap's whole report; the screen and the log
+        // name the allocation that found no memory.
+        let failed = Failed(crate::ALLOCATOR.first_failure());
         match info.location() {
             Some(at) => super::fatal(format_args!(
-                "Stela failed at {}:{}: {message} stack={callers}",
+                "Stela failed at {}:{}: {message}{failed} stack={callers}",
                 at.file(),
                 at.line()
             )),
-            None => super::fatal(format_args!("Stela failed: {message} stack={callers}")),
+            None => super::fatal(format_args!(
+                "Stela failed: {message}{failed} stack={callers}"
+            )),
         }
     }
     if SHOWING.load(Ordering::Acquire) {

@@ -47,6 +47,7 @@ fn first_exhaustion_reports_once_without_allocating() {
     // SAFETY: fresh exclusive aligned stack storage outlives this heap/model.
     unsafe { heap.initialize(ram.0.as_mut_ptr(), ram.0.len()) };
     let layout = Layout::from_size_align(16, 16).unwrap();
+    assert_eq!(heap.first_failure(), None);
     // SAFETY: all allocations remain owned until this synchronous fixture ends;
     // neither their raw pointers nor this model heap escape to another thread.
     while !unsafe { heap.alloc(layout) }.is_null() {}
@@ -55,8 +56,11 @@ fn first_exhaustion_reports_once_without_allocating() {
     assert!(reported.contains("live_estimate="));
     assert!(reported.contains("cpu_counters=relaxed total=4096"));
     assert!(reported.contains("largest=0\nHEAP AT FAILURE large classes 16:0M"));
-    // SAFETY: as above; this second failure must not report again.
-    assert!(unsafe { heap.alloc(layout) }.is_null());
+    assert_eq!(heap.first_failure(), Some((16, 16)));
+    // SAFETY: as above; this second failure must not report again, and the
+    // first stays the one named.
+    assert!(unsafe { heap.alloc(Layout::from_size_align(64, 8).unwrap()) }.is_null());
+    assert_eq!(heap.first_failure(), Some((16, 16)));
     REPORTED.with(|text| assert_eq!(text.borrow().as_str(), reported));
     assert!(capture(&heap, layout).is_none());
 }

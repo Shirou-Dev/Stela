@@ -488,6 +488,9 @@ pub struct Heap {
     failures: AtomicU64,
     /// Where the first failed allocation is reported; it must not allocate.
     failure_sink: fn(core::fmt::Arguments<'_>),
+    /// The first failed allocation's bytes and alignment, for a report that
+    /// can no longer ask the heap ([`Heap::first_failure`]).
+    failed: [AtomicUsize; 2],
     state: UnsafeCell<State>,
     /// Each tagged core's cache and counts.
     cores: [Core; CPUS],
@@ -525,12 +528,20 @@ impl Heap {
         }
     }
 
+    /// The bytes and alignment of the first allocation that found no
+    /// memory, once one has.
+    pub fn first_failure(&self) -> Option<(usize, usize)> {
+        let align = self.failed[1].load(Ordering::Acquire);
+        (align != 0).then(|| (self.failed[0].load(Ordering::Relaxed), align))
+    }
+
     pub const fn new() -> Self {
         Self {
             held: AtomicBool::new(false),
             failure_reported: AtomicBool::new(false),
             failures: AtomicU64::new(0),
             failure_sink: |_| {},
+            failed: [const { AtomicUsize::new(0) }; 2],
             cores: [const { Core::new() }; CPUS],
             tagged: AtomicUsize::new(0),
             any_tagged: AtomicBool::new(false),
