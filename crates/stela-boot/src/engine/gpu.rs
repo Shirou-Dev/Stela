@@ -433,7 +433,11 @@ fn gpu_alloc_stage() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn stela_gpu_stage(stage: u32) {
     GPU_ALLOC_STAGE.store(stage, Ordering::Release);
-    crate::status::info(&format!("GPU DMA stage {stage}"));
+    // The display is already off while nouveau resets it, so the log and the
+    // serial port are the only live outputs. Store the line now instead of
+    // waiting for a safe point the job may never reach.
+    output::arguments(format_args!("GPU DMA stage {stage}\n"));
+    flush_gpu_log();
 }
 
 /// Store GPU logs to USB immediately via storage::between_drivers
