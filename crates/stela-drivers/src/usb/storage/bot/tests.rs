@@ -1120,6 +1120,7 @@ fn native_poison_preflight_preserves_all_buffers() {
                 controller,
                 id,
                 endpoints: endpoints(),
+                command_us: scan_command_time(),
             },
             interface: 3,
             endpoints: endpoints(),

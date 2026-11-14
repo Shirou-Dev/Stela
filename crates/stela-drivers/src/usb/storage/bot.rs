@@ -17,8 +17,11 @@ use crate::{
         pci::power::Interval,
     },
 };
-use alloc::{boxed::Box, vec::Vec};
-use core::ops::{Deref, DerefMut};
+use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use core::{
+    cell::Cell,
+    ops::{Deref, DerefMut},
+};
 pub(in crate::usb) use ehci::{EhciBulk, block as ehci_error};
 
 const RESET: u8 = 0xff;
@@ -28,6 +31,12 @@ const CSW_SIGNATURE: u32 = 0x5342_5355;
 /// bCSWStatus: Command Failed (BOT 5.2).
 const CSW_FAILED: u8 = 1;
 const COMMAND_US: u64 = 30_000_000;
+/// A command's time while the interface's first scan runs. A device that
+/// never answers its first command is reset and probed again, as the SCSI
+/// error handler does, and that must fit, after the controller's own start
+/// and enumeration, inside the start budget of the function it is on: with
+/// [`COMMAND_US`] the budget passed first, and the reset never ran.
+pub(super) const SCAN_COMMAND_US: u64 = 10_000_000;
 const RESET_RECOVERY_US: u64 = 6_000_000;
 const MAX_LUN: u8 = 15;
 /// xHCI completion code 22: the slot must be retired, not cancelled.
@@ -196,7 +205,22 @@ pub(super) struct Native {
     pub controller: Shared,
     pub id: super::super::xhci::SlotId,
     pub endpoints: [Endpoint; 2],
+    /// A command's time: [`SCAN_COMMAND_US`] until the first scan ends,
+    /// then [`COMMAND_US`].
+    pub command_us: Rc<Cell<u64>>,
 }
+
+/// The command time a new interface starts with, and its owner's handle to
+/// raise it by [`scanned`].
+pub(super) fn scan_command_time() -> Rc<Cell<u64>> {
+    Rc::new(Cell::new(SCAN_COMMAND_US))
+}
+
+/// The first scan ended: later commands get the full time.
+pub(super) fn scanned(command_us: &Cell<u64>) {
+    command_us.set(COMMAND_US);
+}
+
 impl Io for Native {
     type Buffer = DmaBuffer;
 
@@ -245,7 +269,7 @@ impl Io for Native {
             endpoint.dci(),
             buffer.physical(),
             length,
-            COMMAND_US,
+            self.command_us.get(),
         )
     }
     fn quarantine(&mut self) {
@@ -284,7 +308,7 @@ impl Io for Native {
         let mut controller = self.controller.borrow_mut();
         let deadline = controller
             .clock
-            .try_deadline(COMMAND_US)
+            .try_deadline(self.command_us.get())
             .map_err(|_| BlockError::Unsupported("xHCI transfer timeout clock unavailable"))?;
         let dci = endpoint.dci();
         let ticket = controller
@@ -1335,6 +1359,7 @@ impl Bot<Native> {
                 controller: controller.clone(),
                 id,
                 endpoints: self.endpoints,
+                command_us: self.io.command_us.clone(),
             };
             let max_lun = Self::startup(&mut io, setting.number, flags).map_err(|e| {
                 (
