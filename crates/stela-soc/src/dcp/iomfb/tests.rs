@@ -2452,3 +2452,21 @@ fn an_abort_never_waits_for_good_for_a_compose_that_does_not_run() {
     assert!(!methods.composing());
     assert_eq!(methods.take_callback().unwrap().tag, SWAP_COMPLETE);
 }
+
+#[test]
+fn a_refresh_that_cannot_be_advertised_is_published_at_the_usual_rate_and_said() {
+    // 1920x1080 at 2000 Hz has no detailed timing.
+    assert!(Advertised::at(FULL_HD, 2_000_000).is_err());
+    let methods = Methods::new(Box::new(FastScreen(2_000_000)), interface());
+    let advertised = methods.advertised.as_ref().unwrap();
+    assert_eq!(advertised.edid, Advertised::new(FULL_HD).unwrap().edid);
+    assert_eq!(methods.reported.len(), 1);
+    assert!(methods.reported[0].contains("2000000 mHz display is advertised at 60000 mHz"));
+    // One that can be is published as it is, with nothing said.
+    let methods = Methods::new(Box::new(FastScreen(240_000)), interface());
+    assert_eq!(
+        methods.advertised.as_ref().unwrap().edid,
+        Advertised::at(FULL_HD, 240_000).unwrap().edid
+    );
+    assert!(methods.reported.is_empty());
+}

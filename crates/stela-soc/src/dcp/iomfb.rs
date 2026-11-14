@@ -643,7 +643,18 @@ impl Methods {
         interface: &'static Interface,
     ) -> Self {
         let refresh = scanout.refresh_millihertz();
-        let advertised = Advertised::sized(scanout.mode(), refresh, scanout.physical_size_mm());
+        // A refresh that cannot be advertised leaves macOS without a
+        // display, and it stops a minute later: the size is published at
+        // the usual rate instead, at which macOS then draws.
+        let mut reported = Vec::new();
+        let advertised = Advertised::sized(scanout.mode(), refresh, scanout.physical_size_mm())
+            .or_else(|refusal| {
+                let usual = super::super::scanout::DEFAULT_REFRESH_MILLIHERTZ;
+                reported.push(format!(
+                    "IOMFB a {refresh} mHz display is advertised at {usual} mHz: {refusal}"
+                ));
+                Advertised::sized(scanout.mode(), usual, scanout.physical_size_mm())
+            });
         Self {
             interface,
             mode: scanout.mode(),
@@ -661,7 +672,7 @@ impl Methods {
             layouts: BTreeSet::new(),
             unlisted_layouts: false,
             placements: 0,
-            reported: Vec::new(),
+            reported,
             called: BTreeSet::new(),
             pending_call: None,
             notified: false,
