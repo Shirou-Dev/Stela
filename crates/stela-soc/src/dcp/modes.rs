@@ -167,18 +167,18 @@ pub fn assumed_size_mm(width: u32, height: u32) -> (u32, u32) {
     (mm(w), mm(h))
 }
 
-/// Whether a mode of this size at `refresh` millihertz fits the detailed
-/// timing the DCP model advertises it by ([`detailed_timing`]): a mode that
-/// does not, as 2560x1440 from about 165 Hz or 3840x2160 at 120 Hz with
-/// their pixel clocks past 655.35 MHz, cannot be published to macOS, and
-/// whoever picks the output's mode takes one that does.
+/// Whether a mode of this size at `refresh` millihertz can be published to
+/// macOS: everything [`Advertised`] makes for it is made. A mode that cannot,
+/// as 2560x1440 from about 165 Hz or 3840x2160 at 120 Hz with their pixel
+/// clocks past a detailed timing's 655.35 MHz, is not taken: whoever picks
+/// the output's mode takes one that can.
 pub fn advertisable(width: u32, height: u32, refresh: u32) -> bool {
-    if width == 0 || height == 0 || width > 0xfff || height > 0xfff {
-        return false;
-    }
-    let (h_front, h_blank, v_blank) = blanking(width, height, refresh);
-    let clock = clock(width, height, (h_front, h_blank, v_blank), refresh);
-    clock != 0 && u16::try_from(clock).is_ok() && v_blank <= 0xfff
+    let mode = Mode {
+        width,
+        height,
+        format: super::super::scanout::PixelFormat::Bgra8888,
+    };
+    Advertised::at(mode, refresh).is_ok()
 }
 
 /// An 18-byte EDID detailed timing descriptor for `mode` at `refresh`
@@ -234,11 +234,17 @@ pub fn detailed_timing_sized(
     Ok(d)
 }
 
-/// The range limits descriptor's five rate bytes (E-EDID 1.4 section
-/// 3.10.3.3) for detailed timing `d`: vertical rates in Hz and horizontal
-/// in kHz, each range holding the timing's and at least 50..=75 Hz and
-/// 30..=80 kHz, and the maximum pixel clock in 10 MHz units.
-fn range_limits(d: &[u8; 18]) -> Result<[u8; 5]> {
+/// The range limits descriptor's offsets byte and five rate bytes (E-EDID
+/// 1.4 section 3.10.3.3) for detailed timing `d`: vertical rates in Hz and
+/// horizontal in kHz, each range holding the timing's and at least 50..=75 Hz
+/// and 30..=80 kHz, and the maximum pixel clock in 10 MHz units. A maximum
+/// rate past 255 is stored less 255 with its offset flag set, as the
+/// standard has it: 1920x1080 at 240 Hz has 291 kHz lines.
+fn range_limits(d: &[u8; 18]) -> Result<(u8, [u8; 5])> {
+    /// The offsets byte's flags: the maximum vertical and horizontal rates
+    /// are 255 more than their bytes.
+    const VERTICAL_MAX_OFFSET: u8 = 0b10;
+    const HORIZONTAL_MAX_OFFSET: u8 = 0b10 << 2;
     let clock = u64::from(u16::from_le_bytes([d[0], d[1]])) * 10_000;
     let h_total = u64::from(u32::from(d[2]) | u32::from(d[4] >> 4) << 8)
         + u64::from(u32::from(d[3]) | u32::from(d[4] & 0xf) << 8);
@@ -246,16 +252,35 @@ fn range_limits(d: &[u8; 18]) -> Result<[u8; 5]> {
         + u64::from(u32::from(d[6]) | u32::from(d[7] & 0xf) << 8);
     let line = clock / h_total;
     let frame = line / v_total;
-    let byte = |value: u64| {
-        u8::try_from(value).map_err(|_| refuse!("DCP mode's rates exceed EDID range limits"))
+    let refusal = || refuse!("DCP mode's rates exceed EDID range limits");
+    let byte = |value: u64| u8::try_from(value).map_err(|_| refusal());
+    // A maximum rate's byte and whether its offset applies.
+    let maximum = |value: u64| match value {
+        0..=255 => Ok((value as u8, false)),
+        256..=510 => Ok(((value - 255) as u8, true)),
+        _ => Err(refusal()),
     };
-    Ok([
-        byte(frame.min(50))?,
-        byte(line.div_ceil(v_total).max(75))?,
-        byte((line / 1000).min(30))?,
-        byte(line.div_ceil(1000).max(80))?,
-        byte(clock.div_ceil(10_000_000).max(17))?,
-    ])
+    let (vertical, vertical_offset) = maximum(line.div_ceil(v_total).max(75))?;
+    let (horizontal, horizontal_offset) = maximum(line.div_ceil(1000).max(80))?;
+    let offsets = if vertical_offset {
+        VERTICAL_MAX_OFFSET
+    } else {
+        0
+    } | if horizontal_offset {
+        HORIZONTAL_MAX_OFFSET
+    } else {
+        0
+    };
+    Ok((
+        offsets,
+        [
+            byte(frame.min(50))?,
+            vertical,
+            byte((line / 1000).min(30))?,
+            horizontal,
+            byte(clock.div_ceil(10_000_000).max(17))?,
+        ],
+    ))
 }
 
 /// A truthful EDID 1.4 base block whose one detailed timing is `mode`'s at
@@ -292,7 +317,9 @@ pub fn edid_sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Resu
     e[75] = 0xfc; // display name
     e[77..77 + 6].copy_from_slice(b"Stela\n");
     e[93] = 0xfd; // range limits
-    e[95..95 + 5].copy_from_slice(&range_limits(&timing)?);
+    let (offsets, rates) = range_limits(&timing)?;
+    e[94] = offsets;
+    e[95..95 + 5].copy_from_slice(&rates);
     e[101] = 0x0a;
     e[111] = 0x10; // dummy descriptor
     let sum = e[0..127].iter().fold(0u8, |a, b| a.wrapping_add(*b));
@@ -694,7 +721,46 @@ mod tests {
     use alloc::format;
 
     #[test]
-    fn a_mode_is_advertisable_exactly_when_its_detailed_timing_is_made() {
+    fn a_fast_modes_rates_past_255_are_stored_with_their_offsets() {
+        // 1920x1080 at 240 Hz: 291 kHz lines, which one byte cannot hold.
+        let e = edid(FULL_HD, 240_000).unwrap();
+        assert_eq!(e[93], 0xfd);
+        assert_eq!(e[94], 0b10 << 2, "the horizontal maximum is offset");
+        let d: [u8; 18] = e[54..72].try_into().unwrap();
+        let clock = u64::from(u16::from_le_bytes([d[0], d[1]])) * 10_000;
+        let h_total = u64::from(d[2])
+            + (u64::from(d[4] >> 4) << 8)
+            + u64::from(d[3])
+            + (u64::from(d[4] & 0xf) << 8);
+        let v_total = u64::from(d[5])
+            + (u64::from(d[7] >> 4) << 8)
+            + u64::from(d[6])
+            + (u64::from(d[7] & 0xf) << 8);
+        let line = clock / h_total;
+        assert!(line > 255_000);
+        assert!(u64::from(e[98]) + 255 >= line.div_ceil(1000));
+        assert!(
+            u64::from(e[96]) >= line.div_ceil(v_total),
+            "240 Hz fits a byte"
+        );
+        assert_eq!(e.iter().fold(0u8, |a, b| a.wrapping_add(*b)), 0, "checksum");
+        // 360 Hz also needs the vertical offset.
+        let fast = Mode {
+            width: 1280,
+            height: 720,
+            ..FULL_HD
+        };
+        let e = edid(fast, 360_000).unwrap();
+        assert_eq!(e[94], 0b1010);
+        assert_eq!(u32::from(e[96]) + 255, 360);
+        // A mode within one byte keeps a zero offsets byte.
+        assert_eq!(edid(FULL_HD, 60_000).unwrap()[94], 0);
+        assert!(advertisable(1920, 1080, 240_000));
+        assert!(Advertised::at(FULL_HD, 240_000).is_ok());
+    }
+
+    #[test]
+    fn a_mode_is_advertisable_exactly_when_everything_advertised_is_made() {
         for (width, height, refresh) in [
             (1920, 1080, 60_000),
             (2560, 1440, 60_000),
@@ -704,6 +770,10 @@ mod tests {
             (3840, 2160, 120_000),
             (5120, 2880, 60_000),
             (0, 1080, 60_000),
+            (1920, 1080, 240_000),
+            (1920, 1080, 360_000),
+            (1280, 720, 480_000),
+            (640, 480, 600_000),
         ] {
             let mode = Mode {
                 width,
@@ -712,7 +782,7 @@ mod tests {
             };
             assert_eq!(
                 advertisable(width, height, refresh),
-                detailed_timing(mode, refresh).is_ok(),
+                Advertised::at(mode, refresh).is_ok(),
                 "{width}x{height}@{refresh}"
             );
         }

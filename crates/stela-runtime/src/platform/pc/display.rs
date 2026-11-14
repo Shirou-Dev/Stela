@@ -27,10 +27,7 @@
 //! axis and a 655.35 MHz pixel clock. 3840x2160 at 60 Hz fits; a 5K or 6K
 //! panel runs the largest smaller mode its firmware offers.
 use core::{cmp::Reverse, fmt};
-use stela_soc::{
-    dcp::modes::Advertised,
-    scanout::{DEFAULT_REFRESH_MILLIHERTZ, Mode as ScanoutMode, PixelFormat},
-};
+use stela_soc::scanout::DEFAULT_REFRESH_MILLIHERTZ;
 
 /// One of the firmware's graphics modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,15 +153,7 @@ pub fn guest_takes(width: u32, height: u32) -> bool {
 /// Whether the DCP model can advertise a `width` by `height` screen at
 /// `refresh` millihertz.
 pub fn guest_takes_at(width: u32, height: u32, refresh: u32) -> bool {
-    Advertised::at(
-        ScanoutMode {
-            width,
-            height,
-            format: PixelFormat::Bgra8888,
-        },
-        refresh,
-    )
-    .is_ok()
+    stela_soc::dcp::modes::advertisable(width, height, refresh)
 }
 
 /// Whether a `width` by `height` picture has the shape of `panel` within
@@ -219,6 +208,7 @@ pub fn choose(modes: &[Mode], current: u32, native: Option<(u32, u32)>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stela_soc::scanout::{Mode as ScanoutMode, PixelFormat};
 
     fn mode(index: u32, width: u32, height: u32) -> Mode {
         Mode {
