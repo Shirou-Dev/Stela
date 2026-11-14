@@ -4,10 +4,9 @@
 //! back while the guest's queues have room. The rest wait in the host
 //! controller, as they would for a host that reads slowly.
 //!
-//! A host with no healthy controller gets the controller model
-//! (`stela_soc::usb::hci::model`) behind the same function: a controller
-//! with no radio, reported once as `BLUETOOTH PLATFORM Modeled`. bluetoothd
-//! then brings it up and idles instead of restarting for a missing chip.
+//! The guest is given no controller yet (`start`): macOS has not configured
+//! its USB one in any run, with a host controller or with the controller
+//! model (`stela_soc::usb::hci::model`), and its Setup waits for bluetoothd.
 //!
 //! One controller serves the guest; others are reported and left idle. A
 //! controller that fails is reported once, and the guest's commands then get
@@ -71,8 +70,7 @@ impl Drop for HostBluetooth {
 }
 
 impl HostBluetooth {
-    /// The first controller `usb` and `pcie` hold that initialized, or the
-    /// model without one.
+    /// The first controller `usb` and `pcie` hold that initialized.
     pub fn first(usb: Vec<UsbHci>, pcie: Vec<PcieHci>, root: u64) -> Option<Self> {
         let usb = usb.into_iter().filter_map(|hci| {
             let healthy = matches!(hci.initialization(), Some(Ok(_)) | None);
@@ -91,21 +89,7 @@ impl HostBluetooth {
             _ => None,
         });
         let mut healthy = usb.chain(pcie);
-        let Some((controller, location)) = healthy.next() else {
-            output::arguments(format_args!(
-                "BLUETOOTH PLATFORM Modeled: no host controller; the guest's controller \
-                 has no radio and finds nothing in range\n"
-            ));
-            return Some(Self {
-                controller: Controller::Modeled { installed: false },
-                location: String::from("model"),
-                root,
-                waiting: VecDeque::new(),
-                up: None,
-                failed: false,
-                unknown: Vec::new(),
-            });
-        };
+        let (controller, location) = healthy.next()?;
         output::arguments(format_args!("BLUETOOTH guest uses {location}\n"));
         for (_, unused) in healthy {
             output::arguments(format_args!("BLUETOOTH unused {unused}\n"));

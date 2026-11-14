@@ -2736,7 +2736,7 @@ fn start_devices(
     } = wanted;
     let mut fdr_device = None;
     let mut host_usb = None;
-    let mut host_bluetooth = None;
+    let host_bluetooth: Option<bluetooth::HostBluetooth> = None;
     let (services, medium, preboot, host_input, host_network, usb_disks, guest_network, host_disks) =
         if targets.is_empty()
             && options.install_source.is_none()
@@ -2946,8 +2946,19 @@ fn start_devices(
                 crate::status::info(super::firmware_requests::MISSING);
             }
             host_usb = Some(usb);
-            // The guest's controller hangs off the hub of its keyboard.
-            host_bluetooth = host_controller.filter(|_| options.input);
+            // macOS gets no Bluetooth controller. Its bluetoothd picks the
+            // guest's USB controller and never sends it a command, in every
+            // run with a host controller or the model, and Setup's Language
+            // Chooser then waits for bluetoothd with a black screen. Without
+            // a controller bluetoothd restarts and Setup goes on. The host's
+            // controller is released in the loader's root by its drop.
+            if host_controller.is_some() && options.input {
+                output::arguments(format_args!(
+                    "BLUETOOTH UNSUPPORTED the guest gets no controller: macOS does not \
+                     configure the guest's USB Bluetooth controller and its Setup waits for it\n"
+                ));
+            }
+            drop(host_controller);
             // With no adapter started, the screen names each one found and
             // why it stayed off, before the steps that need one say so.
             if links.devices.is_empty() && (wants_network || options.guest_network) {
