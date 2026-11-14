@@ -44,6 +44,8 @@ const PAGE_FLIP: u32 = request::<PageFlip>(0xb0);
 const CREATE_DUMB: u32 = request::<CreateDumb>(0xb2);
 const MAP_DUMB: u32 = request::<MapDumb>(0xb3);
 const ADD_FB2: u32 = request::<FramebufferCommand>(0xb8);
+const REMOVE_FB: u32 = request::<u32>(0xaf);
+const DESTROY_DUMB: u32 = request::<DestroyDumb>(0xb4);
 
 /// `DRM_MODE_CONNECTED`.
 const CONNECTED: u32 = 1;
@@ -147,6 +149,13 @@ struct CreateDumb {
     size: u64,
 }
 
+/// `struct drm_mode_destroy_dumb`.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct DestroyDumb {
+    handle: u32,
+}
+
 /// `struct drm_mode_map_dumb`.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -213,6 +222,8 @@ pub unsafe trait Drm {
     fn control(&mut self, request: u32, argument: *mut c_void) -> i64;
     /// Maps `bytes` at `offset`, what `MAP_DUMB` answered.
     fn map(&mut self, offset: u64, bytes: usize) -> Option<NonNull<u8>>;
+    /// Removes the mapping of `bytes` that [`Drm::map`] gave at `pixels`.
+    fn unmap(&mut self, pixels: NonNull<u8>, bytes: usize);
     /// Whether a request made now completes without waiting for another
     /// processor. A display queues what it cannot request now.
     fn immediate(&self) -> bool;
@@ -224,6 +235,9 @@ struct Buffer {
     framebuffer: u32,
     pixels: NonNull<u8>,
     pitch: usize,
+    /// The dumb buffer's handle and mapped bytes, to give it back.
+    handle: u32,
+    bytes: usize,
 }
 
 /// The output a [`Display`] runs.
@@ -522,7 +536,9 @@ fn choose(modes: &[ModeInfo], wanted: (u32, u32), fits: Fits<'_>) -> Option<Mode
     pick(fits).or_else(|| pick(&|_, _, _| true))
 }
 
-/// One buffer of the mode's size, with its framebuffer and mapping.
+/// One buffer of the mode's size, with its framebuffer and mapping. A
+/// buffer that cannot be finished is given back: a display that is not
+/// taken is looked for again, and each look would keep its buffers.
 fn buffer<D: Drm>(drm: &mut D, width: u32, height: u32) -> Result<Buffer, Error> {
     let mut dumb = CreateDumb {
         width,
@@ -531,6 +547,23 @@ fn buffer<D: Drm>(drm: &mut D, width: u32, height: u32) -> Result<Buffer, Error>
         ..CreateDumb::default()
     };
     call(drm, CREATE_DUMB, &mut dumb)?;
+    let mut framebuffer = None;
+    let finished = finish(drm, width, height, &dumb, &mut framebuffer);
+    if finished.is_err() {
+        release(drm, dumb.handle, framebuffer, None);
+    }
+    finished
+}
+
+/// The framebuffer and mapping of the dumb buffer `dumb`; `framebuffer` is
+/// the one made, for [`buffer`] to give back when a later request fails.
+fn finish<D: Drm>(
+    drm: &mut D,
+    width: u32,
+    height: u32,
+    dumb: &CreateDumb,
+    made: &mut Option<u32>,
+) -> Result<Buffer, Error> {
     let row = width
         .checked_mul(BYTES_PER_PIXEL)
         .ok_or(Error::InvalidBuffer)?;
@@ -551,6 +584,7 @@ fn buffer<D: Drm>(drm: &mut D, width: u32, height: u32) -> Result<Buffer, Error>
     framebuffer.handles[0] = dumb.handle;
     framebuffer.pitches[0] = dumb.pitch;
     call(drm, ADD_FB2, &mut framebuffer)?;
+    *made = Some(framebuffer.id);
     let mut map = MapDumb {
         handle: dumb.handle,
         ..MapDumb::default()
@@ -564,7 +598,39 @@ fn buffer<D: Drm>(drm: &mut D, width: u32, height: u32) -> Result<Buffer, Error>
         framebuffer: framebuffer.id,
         pixels,
         pitch: dumb.pitch as usize,
+        handle: dumb.handle,
+        bytes,
     })
+}
+
+/// [`release`] each of `buffers`, none of which the controller shows.
+fn release_all<D: Drm>(drm: &mut D, buffers: &[Buffer]) {
+    for buffer in buffers {
+        release(
+            drm,
+            buffer.handle,
+            Some(buffer.framebuffer),
+            Some((buffer.pixels, buffer.bytes)),
+        );
+    }
+}
+
+/// Give a dumb buffer back: its mapping, its framebuffer and the buffer
+/// itself, in the order Linux needs. A refusal leaves what it names with
+/// the node, whose close frees it.
+fn release<D: Drm>(
+    drm: &mut D,
+    handle: u32,
+    framebuffer: Option<u32>,
+    mapping: Option<(NonNull<u8>, usize)>,
+) {
+    if let Some((pixels, bytes)) = mapping {
+        drm.unmap(pixels, bytes);
+    }
+    if let Some(mut id) = framebuffer {
+        let _ = call(drm, REMOVE_FB, &mut id);
+    }
+    let _ = call(drm, DESTROY_DUMB, &mut DestroyDumb { handle });
 }
 
 fn resources<D: Drm>(drm: &mut D) -> Result<(Vec<u32>, Vec<u32>), Error> {
@@ -622,9 +688,19 @@ impl<D: Drm> Display<D> {
 
     fn run(mut drm: D, crtc: u32, connector: u32, mode: ModeInfo) -> Result<Self, Error> {
         let (width, height) = (u32::from(mode.hdisplay), u32::from(mode.vdisplay));
-        let front = buffer(&mut drm, width, height)?;
-        let back = buffer(&mut drm, width, height)?;
-        let spare = buffer(&mut drm, width, height)?;
+        let mut made = Vec::new();
+        for _ in 0..3 {
+            match buffer(&mut drm, width, height) {
+                Ok(buffer) => made.push(buffer),
+                Err(error) => {
+                    release_all(&mut drm, &made);
+                    return Err(error);
+                }
+            }
+        }
+        let Ok(buffers) = <[Buffer; 3]>::try_from(made) else {
+            return Err(Error::Allocation);
+        };
         let mut display = Self {
             drm,
             crtc,
@@ -632,7 +708,7 @@ impl<D: Drm> Display<D> {
             height,
             refresh: refresh(&mode),
             size_mm: None,
-            buffers: [front, back, spare],
+            buffers,
             // Each buffer holds black, and the front the console's text.
             stale: [0..height as usize, 0..height as usize, 0..height as usize],
             queued: false,
@@ -641,7 +717,10 @@ impl<D: Drm> Display<D> {
             mode,
             lost: false,
         };
-        display.set_mode()?;
+        if let Err(error) = display.set_mode() {
+            release_all(&mut display.drm, &display.buffers);
+            return Err(error);
+        }
         Ok(display)
     }
 

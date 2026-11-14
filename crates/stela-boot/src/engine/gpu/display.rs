@@ -45,6 +45,10 @@ unsafe impl Drm for Node {
         client::map(self.0, offset, bytes)
     }
 
+    fn unmap(&mut self, pixels: NonNull<u8>, _: usize) {
+        client::unmap(pixels);
+    }
+
     fn immediate(&self) -> bool {
         on_boot_cpu()
     }

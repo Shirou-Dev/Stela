@@ -57,6 +57,14 @@ struct Card {
     probes: u32,
     /// Controller mode sets, the ones that turned it off included.
     mode_sets: u32,
+    /// What the next mode set answers instead of setting the mode.
+    set_error: Option<i64>,
+    /// Mappings to refuse.
+    map_refusals: u32,
+    /// Dumb buffers and framebuffers given back, and mappings removed.
+    destroyed: Vec<u32>,
+    removed: Vec<u32>,
+    unmapped: usize,
 }
 
 impl Card {
@@ -79,6 +87,11 @@ impl Card {
             connected: true,
             probes: 0,
             mode_sets: 0,
+            set_error: None,
+            map_refusals: 0,
+            destroyed: Vec::new(),
+            removed: Vec::new(),
+            unmapped: 0,
         }
     }
 
@@ -163,6 +176,9 @@ unsafe impl Drm for &mut Card {
                     let crtc = &*argument.cast::<Crtc>();
                     assert_eq!(crtc.id, 41);
                     self.mode_sets += 1;
+                    if let Some(error) = self.set_error.take() {
+                        return error;
+                    }
                     self.set = (crtc.connector_count != 0).then(|| {
                         assert_eq!((crtc.connectors as *const u32).read(), 51);
                         (crtc.mode, crtc.framebuffer)
@@ -180,13 +196,30 @@ unsafe impl Drm for &mut Card {
                     }
                     self.flips.push((*argument.cast::<PageFlip>()).framebuffer);
                 }
+                REMOVE_FB => self.removed.push(*argument.cast::<u32>()),
+                DESTROY_DUMB => self
+                    .destroyed
+                    .push((*argument.cast::<DestroyDumb>()).handle),
                 other => panic!("request {other:#x}"),
             }
         }
         0
     }
 
+    fn unmap(&mut self, pixels: NonNull<u8>, bytes: usize) {
+        assert!(
+            self.memory
+                .iter()
+                .any(|memory| memory.as_ptr() == pixels.as_ptr() && memory.len() == bytes)
+        );
+        self.unmapped += 1;
+    }
+
     fn map(&mut self, _: u64, bytes: usize) -> Option<NonNull<u8>> {
+        if self.map_refusals != 0 {
+            self.map_refusals -= 1;
+            return None;
+        }
         self.memory.push(vec![0xa5; bytes]);
         NonNull::new(self.memory.last_mut()?.as_mut_ptr())
     }
@@ -206,6 +239,8 @@ fn requests_match_linux() {
     assert_eq!(CREATE_DUMB, 0xc020_64b2);
     assert_eq!(MAP_DUMB, 0xc010_64b3);
     assert_eq!(ADD_FB2, 0xc068_64b8);
+    assert_eq!(REMOVE_FB, 0xc004_64af);
+    assert_eq!(DESTROY_DUMB, 0xc004_64b4);
 }
 
 #[test]
@@ -419,4 +454,40 @@ fn an_output_that_returns_gets_a_full_mode_set_on_the_buffer_on_screen() {
     // The first set, then off and on again.
     assert_eq!(card.mode_sets, 3);
     assert_eq!(card.set, Some((modes[0], front)));
+}
+
+#[test]
+fn a_display_that_is_not_taken_gives_its_buffers_back() {
+    // The mode set is refused: all three buffers go.
+    let mut third = Card::new(vec![mode(1920, 1080, PREFERRED)]);
+    third.set_error = Some(-22);
+    assert!(Display::take(&mut third, (1920, 1080)).is_err());
+    assert_eq!(third.destroyed.len(), 3);
+    assert_eq!(third.removed.len(), 3);
+    assert_eq!(third.unmapped, 3);
+    assert_eq!(third.set, None);
+
+    // A refused mapping: the buffer and its framebuffer go, with no mapping.
+    let mut card = Card::new(vec![mode(1920, 1080, PREFERRED)]);
+    card.map_refusals = 1;
+    assert_eq!(
+        Display::take(&mut card, (1920, 1080)).err(),
+        Some(Error::Map)
+    );
+    assert_eq!(card.destroyed.len(), 1);
+    assert_eq!(card.removed.len(), 1);
+    assert_eq!(card.unmapped, 0);
+
+    // A buffer of the wrong shape has no framebuffer yet.
+    let mut shaped = Card::new(vec![mode(1920, 1080, PREFERRED)]);
+    shaped.invalid_buffer = Some((4, 4));
+    assert_eq!(
+        Display::take(&mut shaped, (1920, 1080)).err(),
+        Some(Error::InvalidBuffer)
+    );
+    assert_eq!(shaped.destroyed.len(), 1);
+    assert!(shaped.removed.is_empty());
+
+    // The next look takes the display.
+    assert!(Display::take(&mut card, (1920, 1080)).is_ok());
 }

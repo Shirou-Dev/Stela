@@ -1193,6 +1193,14 @@ pub(super) fn map(fd: c_int, offset: u64, size: usize) -> Option<NonNull<u8>> {
     }
 }
 
+/// Removes the mapping [`map`] gave at `address`.
+pub(super) fn unmap(address: NonNull<u8>) {
+    let result = submit(Operation::Unmap(address.as_ptr() as u64));
+    if result != 0 {
+        output::arguments(format_args!("GPU unmap of {address:p} refused: {result}\n"));
+    }
+}
+
 /// `NOUVEAU_GETPARAM_CHIPSET_ID` of the bound GPU at `index`.
 pub(super) fn chipset(index: u32) -> Option<u16> {
     let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
