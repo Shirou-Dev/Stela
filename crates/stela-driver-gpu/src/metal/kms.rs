@@ -507,31 +507,48 @@ fn controller<D: Drm>(drm: &mut D, encoders: &[u32], crtcs: &[u32]) -> Result<Op
 /// mode of this width and height at this refresh in millihertz.
 pub type Fits<'a> = &'a dyn Fn(u32, u32, u32) -> bool;
 
-/// The first mode of `wanted` size that `fits`, else the preferred one if
-/// it does, else the first that does: Linux lists an output's preferred
-/// mode first and then the faster of each size first, so this is the
-/// fastest mode of the wanted size the guest can be told of. A monitor's
-/// fastest mode may not fit, as 2560x1440 at 180 Hz. With no mode that
-/// fits, the same choice among all of them.
-fn choose(modes: &[ModeInfo], wanted: (u32, u32), fits: Fits<'_>) -> Option<ModeInfo> {
+/// Which of an output's modes to take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wanted {
+    /// The monitor's own preferred mode, its native one, else a mode of
+    /// this size: for a display taken before the guest's mode is set. A
+    /// firmware often shows a 3840x2160 panel in 1920x1080.
+    Native((u32, u32)),
+    /// A mode of this size, else the preferred one: the guest's mode is
+    /// set, and only that size is shown.
+    Size((u32, u32)),
+}
+
+/// The mode [`Wanted`] names that `fits`, else its second choice if that
+/// fits, else the first that does. Linux lists an output's preferred mode
+/// first and then the faster of each size first, so a size's mode is its
+/// fastest the guest can be told of. A monitor's fastest mode may not fit,
+/// as 2560x1440 at 180 Hz. With no mode that fits, the same choice among
+/// all of them.
+fn choose(modes: &[ModeInfo], wanted: Wanted, fits: Fits<'_>) -> Option<ModeInfo> {
     let size = |mode: &ModeInfo| (u32::from(mode.hdisplay), u32::from(mode.vdisplay));
     let pick = |fits: Fits<'_>| {
         let fitting = |mode: &&ModeInfo| {
             let (width, height) = size(mode);
             fits(width, height, refresh(mode))
         };
-        modes
-            .iter()
-            .filter(fitting)
-            .find(|mode| size(mode) == wanted)
-            .or_else(|| {
-                modes
-                    .iter()
-                    .filter(fitting)
-                    .find(|mode| mode.kind & PREFERRED != 0)
-            })
-            .or_else(|| modes.iter().find(fitting))
-            .copied()
+        let sized = |wanted: (u32, u32)| {
+            modes
+                .iter()
+                .filter(fitting)
+                .find(|mode| size(mode) == wanted)
+        };
+        // The fastest fitting mode of the preferred mode's size.
+        let preferred = || {
+            let native = modes.iter().find(|mode| mode.kind & PREFERRED != 0)?;
+            sized(size(native))
+        };
+        match wanted {
+            Wanted::Native(otherwise) => preferred().or_else(|| sized(otherwise)),
+            Wanted::Size(wanted) => sized(wanted).or_else(preferred),
+        }
+        .or_else(|| modes.iter().find(fitting))
+        .copied()
     };
     pick(fits).or_else(|| pick(&|_, _, _| true))
 }
@@ -663,11 +680,12 @@ impl<D: Drm> Display<D> {
     /// Takes the first connected output of `drm`, showing a black frame in
     /// the mode of `wanted` pixels if it has one, as the firmware's did.
     pub fn take(drm: D, wanted: (u32, u32)) -> Result<Self, Error> {
-        Self::take_fitting(drm, wanted, &|_, _, _| true)
+        Self::take_fitting(drm, Wanted::Size(wanted), &|_, _, _| true)
     }
 
-    /// [`Self::take`] in a mode that `fits`, where the output has one.
-    pub fn take_fitting(mut drm: D, wanted: (u32, u32), fits: Fits<'_>) -> Result<Self, Error> {
+    /// [`Self::take`] in the mode [`Wanted`] names that `fits`, where the
+    /// output has one.
+    pub fn take_fitting(mut drm: D, wanted: Wanted, fits: Fits<'_>) -> Result<Self, Error> {
         let (crtcs, connectors) = resources(&mut drm)?;
         for &id in &connectors {
             let found = output(&mut drm, id)?;

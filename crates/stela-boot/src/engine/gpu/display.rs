@@ -216,7 +216,11 @@ impl KmsScanout {
                 index += 1;
                 continue;
             }
-            match Display::take_fitting(Node(fd), wanted, &stela_soc::dcp::modes::advertisable) {
+            match Display::take_fitting(
+                Node(fd),
+                kms::Wanted::Size(wanted),
+                &stela_soc::dcp::modes::advertisable,
+            ) {
                 Ok(display) if display.size() == wanted => {
                     output::arguments(format_args!("GPU {name}: display detected after start\n"));
                     let screen = screen(&display);
@@ -315,8 +319,10 @@ const RETURN_SECONDS: u64 = 8;
 /// The pause between two detections in that time.
 const RETURN_STEP_MILLIS: u64 = 100;
 
-/// Moves the display to the first bound GPU with an output, in the mode of
-/// `wanted` pixels if it has it. The GPU that showed the firmware's
+/// Moves the display to the first bound GPU with an output, in the
+/// monitor's own mode that macOS can be told of, else in the mode of
+/// `wanted` pixels, the firmware's, if it has it: the guest's mode is not
+/// set yet and follows the display taken. The GPU that showed the firmware's
 /// picture, or the one GPU bound when that is unknown, has a display known
 /// or likely to exist, so it is awaited within [`RETURN_SECONDS`], once.
 /// What stops one GPU is reported with what its connectors detected, and
@@ -345,7 +351,11 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
             false => 0,
         };
         let result = loop {
-            match Display::take_fitting(Node(fd), wanted, &stela_soc::dcp::modes::advertisable) {
+            match Display::take_fitting(
+                Node(fd),
+                kms::Wanted::Native(wanted),
+                &stela_soc::dcp::modes::advertisable,
+            ) {
                 Err(DisplayError::NoOutput) if host::rdtsc().wrapping_sub(began) < patience => {
                     let step = host::rdtsc();
                     while host::rdtsc().wrapping_sub(step) < gpu.tsc_hz / 1000 * RETURN_STEP_MILLIS

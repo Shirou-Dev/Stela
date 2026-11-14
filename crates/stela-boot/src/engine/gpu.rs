@@ -1582,8 +1582,8 @@ pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
     Vec::new()
 }
 
-/// Takes the display for the GPUs [`open`] bound, in the firmware's `screen`
-/// size if it can, and opens their Metal services. `firmware` names the PCI
+/// Takes the display for the GPUs [`open`] bound, in the monitor's own mode
+/// or else the firmware's `screen` size, and opens their Metal services. `firmware` names the PCI
 /// function that showed the firmware's picture, `None` when there was a
 /// picture whose function is unknown.
 pub(super) fn serve(

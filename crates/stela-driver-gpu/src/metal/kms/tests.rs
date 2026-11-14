@@ -251,10 +251,55 @@ fn the_firmwares_size_wins_then_the_preferred_mode() {
         mode(1920, 1080, 0),
     ];
     let any: Fits<'_> = &|_, _, _| true;
-    assert_eq!(choose(&modes, (1920, 1080), any), Some(modes[2]));
-    assert_eq!(choose(&modes, (800, 600), any), Some(modes[1]));
-    assert_eq!(choose(&modes[..1], (800, 600), any), Some(modes[0]));
-    assert_eq!(choose(&[], (800, 600), any), None);
+    assert_eq!(
+        choose(&modes, Wanted::Size((1920, 1080)), any),
+        Some(modes[2])
+    );
+    assert_eq!(
+        choose(&modes, Wanted::Size((800, 600)), any),
+        Some(modes[1])
+    );
+    assert_eq!(
+        choose(&modes[..1], Wanted::Size((800, 600)), any),
+        Some(modes[0])
+    );
+    assert_eq!(choose(&[], Wanted::Size((800, 600)), any), None);
+}
+
+/// Before the guest's mode is set the monitor's own mode wins: its fastest
+/// of the preferred size that fits, then the firmware's size.
+#[test]
+fn a_display_taken_at_start_runs_the_monitors_own_mode() {
+    let at = |width, height, kind, vrefresh| ModeInfo {
+        vrefresh,
+        ..mode(width, height, kind)
+    };
+    let modes = [
+        at(3840, 2160, PREFERRED, 60),
+        at(3840, 2160, 0, 144),
+        at(1920, 1080, 0, 240),
+        at(1920, 1080, 0, 60),
+    ];
+    let any: Fits<'_> = &|_, _, _| true;
+    let firmware = Wanted::Native((1920, 1080));
+    assert_eq!(choose(&modes, firmware, any), Some(modes[0]));
+    assert_eq!(
+        choose(&modes, Wanted::Size((1920, 1080)), any),
+        Some(modes[2])
+    );
+    // The native size cannot be described at all: the firmware's size.
+    let small: Fits<'_> = &|width, _, _| width < 3840;
+    assert_eq!(choose(&modes, firmware, small), Some(modes[2]));
+    // Its listed-first rate cannot: the next of the native size.
+    let fast = [modes[1], at(3840, 2160, PREFERRED, 60), modes[2]];
+    let slow: Fits<'_> = &|_, _, refresh| refresh < 100_000;
+    assert_eq!(choose(&fast, firmware, slow), Some(fast[1]));
+    // No preferred mode: the firmware's size, then the first.
+    assert_eq!(choose(&modes[2..], firmware, any), Some(modes[2]));
+    assert_eq!(
+        choose(&modes[2..], Wanted::Native((800, 600)), any),
+        Some(modes[2])
+    );
 }
 
 /// A monitor lists its fastest mode of a size first. One the guest cannot
@@ -275,13 +320,28 @@ fn a_mode_the_guest_cannot_be_told_of_is_passed_over() {
         at(1920, 1080, 0, 60),
     ];
     let below_165: Fits<'_> = &|_, _, refresh| refresh < 165_000;
-    assert_eq!(choose(&modes, (2560, 1440), below_165), Some(modes[1]));
-    assert_eq!(choose(&modes, (1920, 1080), below_165), Some(modes[4]));
+    assert_eq!(
+        choose(&modes, Wanted::Size((2560, 1440)), below_165),
+        Some(modes[1])
+    );
+    assert_eq!(
+        choose(&modes, Wanted::Size((1920, 1080)), below_165),
+        Some(modes[4])
+    );
     // No mode of that size: the preferred does not fit, so the first that does.
-    assert_eq!(choose(&modes, (800, 600), below_165), Some(modes[1]));
+    assert_eq!(
+        choose(&modes, Wanted::Size((800, 600)), below_165),
+        Some(modes[1])
+    );
     let none: Fits<'_> = &|_, _, _| false;
-    assert_eq!(choose(&modes, (1920, 1080), none), Some(modes[3]));
-    assert_eq!(choose(&modes, (800, 600), none), Some(modes[0]));
+    assert_eq!(
+        choose(&modes, Wanted::Size((1920, 1080)), none),
+        Some(modes[3])
+    );
+    assert_eq!(
+        choose(&modes, Wanted::Size((800, 600)), none),
+        Some(modes[0])
+    );
 }
 
 #[test]
