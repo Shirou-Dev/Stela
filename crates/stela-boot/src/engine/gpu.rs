@@ -415,23 +415,25 @@ impl Host {
     }
 
     fn report(&self, line: core::fmt::Arguments<'_>) {
-        // Queue only: storing the USB log here re-enters the storage driver
-        // from inside a Linux driver call and can deadlock the boot PE. The
-        // GPU wait and the engine's flush_due store at safe points.
         output::arguments(format_args!("LINUX {line}\n"));
+        flush_gpu_log();
     }
 }
 
-/// The stage `alloc_pages_op` reached, set by the Linux DMA shim. Readable
-/// even after the log sink stopped, so a later report says where the
-/// allocation stopped.
+/// The stage `alloc_pages_op` reached, set by the Linux DMA shim. It is also
+/// drawn on the boot screen, so a stop inside the allocator is visible even
+/// when no log store returns.
+static GPU_ALLOC_STAGE: AtomicU32 = AtomicU32::new(0);
+
 fn gpu_alloc_stage() -> u32 {
-    // SAFETY: the C shim returns one volatile word and takes no pointers.
-    unsafe { stela_linux_gpu_alloc_stage() }
+    GPU_ALLOC_STAGE.load(Ordering::Acquire)
 }
 
-unsafe extern "C" {
-    fn stela_linux_gpu_alloc_stage() -> u32;
+/// Called by the Linux DMA shim at each `alloc_pages_op` stage.
+#[unsafe(no_mangle)]
+pub extern "C" fn stela_gpu_stage(stage: u32) {
+    GPU_ALLOC_STAGE.store(stage, Ordering::Release);
+    crate::status::info(&format!("GPU DMA stage {stage}"));
 }
 
 /// Store GPU logs to USB immediately via storage::between_drivers
