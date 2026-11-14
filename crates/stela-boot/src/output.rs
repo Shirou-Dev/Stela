@@ -487,7 +487,30 @@ impl Sink {
             }
         }
     }
+
+    /// [`advance`] with a bound on `wait`: a device that never completes the
+    /// request leaves it in progress for the next store, instead of holding
+    /// the boot processor forever.
+    fn advance_bounded(&mut self, wait: bool) -> Result<(), BlockError> {
+        if !wait {
+            return self.advance(false);
+        }
+        let hz = TSC_HZ.load(Ordering::Relaxed).max(1);
+        let ticks = (hz / 1_000_000).max(1) * STORE_WAIT_MICROS;
+        let started = rdtsc();
+        loop {
+            self.advance(false)?;
+            if self.request.is_none() || rdtsc().wrapping_sub(started) >= ticks {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+    }
 }
+
+/// A waiting store gives up after this many microseconds. A USB request the
+/// device never completes then waits for the next store, not forever.
+const STORE_WAIT_MICROS: u64 = 50_000;
 
 /// Seconds between the machine state's log stores while the engine runs:
 /// ext4's default journal commit interval. A stop stores at once.
@@ -817,7 +840,7 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
             if is_due(sink) && sink.writer.begin_store() {
                 sink.began = Some(rdtsc());
             }
-            match sink.advance(wait) {
+            match sink.advance_bounded(wait) {
                 Ok(()) => index += 1,
                 Err(error) => failed.push((sinks.remove(index).kind, error)),
             }
