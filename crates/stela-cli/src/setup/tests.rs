@@ -6162,7 +6162,7 @@ fn review_and_status_show_the_wifi_country() {
 fn journey_b_a_stick_with_stela_is_not_treated_as_blank() {
     let f = made_by(Some(release::CURRENT));
     let before = stick_files(&f);
-    let (shown, result, done) = plain_stela(&f, &["Nothing to do"], &[]);
+    let (shown, result, done) = plain_stela(&f, &["Quit"], &[]);
     result.unwrap();
     assert!(done, "{shown}");
     assert!(!shown.contains("? Installer"), "{shown}");
@@ -6170,15 +6170,16 @@ fn journey_b_a_stick_with_stela_is_not_treated_as_blank() {
         shown.contains(&format!("● Stela {} · Offline · macOS", release::CURRENT)),
         "{shown}"
     );
-    assert!(
-        shown.contains("● Nothing to do · This stick is ready"),
-        "{shown}"
-    );
+    assert!(shown.contains("This stick is ready."), "{shown}");
+    assert!(!shown.contains("Nothing to do"), "{shown}");
+    // Enter takes Quit, the one row marked: no row that writes the stick.
+    assert!(shown.contains("● Quit"), "{shown}");
     assert!(
         shown.contains("○ Erase it and make a new installer"),
         "{shown}"
     );
-    assert!(shown.contains("└ Nothing to do."), "{shown}");
+    assert!(shown.ends_with("■ Nothing was changed."), "{shown}");
+    assert_eq!(shown.matches("Nothing was changed.").count(), 1, "{shown}");
     assert_eq!(stick_files(&f), before);
     // Erasing it from the menu warns that it holds Stela; Cancel keeps it.
     let (shown, result, done) = plain_stela(

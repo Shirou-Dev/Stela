@@ -582,7 +582,6 @@ fn menu(environment: &Environment<'_>, request: Request, stick: &Stick) -> Resul
     let record = stick.record.as_ref();
     let newest = record.and_then(newer_macos);
     let offline = record.is_some_and(|r| r.active_medium().is_some_and(|m| !m.remote));
-    const NOTHING: usize = 0;
     const MACOS: usize = 1;
     const SETTINGS: usize = 2;
     const CHECK: usize = 3;
@@ -598,9 +597,6 @@ fn menu(environment: &Environment<'_>, request: Request, stick: &Stick) -> Resul
             enabled: true,
         })
     };
-    if matches!(stick.state, State::Healthy) {
-        row(NOTHING, "Nothing to do".into(), "This stick is ready");
-    }
     let macos_hint;
     if let (Some(newest), Some(record)) = (newest, record) {
         macos_hint = macos_text(environment, record, newest.build).0;
@@ -632,8 +628,11 @@ fn menu(environment: &Environment<'_>, request: Request, stick: &Stick) -> Resul
         efi: request.efi.clone(),
         ..Request::default()
     };
-    match ui.select("What next?", &rows, NOTHING)? {
-        NOTHING => ui.outro("Nothing to do. Check it any time with `stela status`."),
+    if matches!(stick.state, State::Healthy) {
+        ui.info("This stick is ready.")?;
+    }
+    // Quit is the choice Enter takes: no row that writes the stick is.
+    match ui.select("What next?", &rows, QUIT)? {
         MACOS => change_macos(
             environment,
             &request,
@@ -644,7 +643,8 @@ fn menu(environment: &Environment<'_>, request: Request, stick: &Stick) -> Resul
             let mut settings = maintenance(Action::Configure);
             match super::settings::ask(environment, &mut settings, record)? {
                 true => perform(environment, settings),
-                false => quit(ui),
+                // The settings' own Cancel said that nothing was changed.
+                false => Ok(()),
             }
         }
         CHECK => perform(
