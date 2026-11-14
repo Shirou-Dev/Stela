@@ -1142,7 +1142,7 @@ mod tests {
         let status = bundle_status(dir.path()).unwrap_err();
         assert_eq!(
             status,
-            "the firmware bundle is incomplete: 3 of 86 files are on the USB"
+            "the firmware bundle is incomplete: 3 of 87 files are on the USB"
         );
     }
 
@@ -1164,7 +1164,7 @@ mod tests {
         )
         .unwrap();
         let status = bundle_status(dir.path()).unwrap_err();
-        assert!(status.contains("lacks 85 of 86 files"), "{status}");
+        assert!(status.contains("lacks 86 of 87 files"), "{status}");
         assert!(
             status.contains("nvidia/ga102/gsp/gsp-570.144.bin"),
             "{status}"
