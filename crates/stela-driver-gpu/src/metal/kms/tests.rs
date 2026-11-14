@@ -215,10 +215,38 @@ fn the_firmwares_size_wins_then_the_preferred_mode() {
         mode(3840, 2160, PREFERRED),
         mode(1920, 1080, 0),
     ];
-    assert_eq!(choose(&modes, (1920, 1080)), Some(modes[2]));
-    assert_eq!(choose(&modes, (800, 600)), Some(modes[1]));
-    assert_eq!(choose(&modes[..1], (800, 600)), Some(modes[0]));
-    assert_eq!(choose(&[], (800, 600)), None);
+    let any: Fits<'_> = &|_, _, _| true;
+    assert_eq!(choose(&modes, (1920, 1080), any), Some(modes[2]));
+    assert_eq!(choose(&modes, (800, 600), any), Some(modes[1]));
+    assert_eq!(choose(&modes[..1], (800, 600), any), Some(modes[0]));
+    assert_eq!(choose(&[], (800, 600), any), None);
+}
+
+/// A monitor lists its fastest mode of a size first. One the guest cannot
+/// be told of is passed over for the next of that size; with none of that
+/// size, the preferred one that fits, then any; and with no mode that fits
+/// at all, the choice is as without the test.
+#[test]
+fn a_mode_the_guest_cannot_be_told_of_is_passed_over() {
+    let at = |width, height, kind, vrefresh| ModeInfo {
+        vrefresh,
+        ..mode(width, height, kind)
+    };
+    let modes = [
+        at(2560, 1440, PREFERRED, 180),
+        at(2560, 1440, 0, 144),
+        at(2560, 1440, 0, 60),
+        at(1920, 1080, 0, 240),
+        at(1920, 1080, 0, 60),
+    ];
+    let below_165: Fits<'_> = &|_, _, refresh| refresh < 165_000;
+    assert_eq!(choose(&modes, (2560, 1440), below_165), Some(modes[1]));
+    assert_eq!(choose(&modes, (1920, 1080), below_165), Some(modes[4]));
+    // No mode of that size: the preferred does not fit, so the first that does.
+    assert_eq!(choose(&modes, (800, 600), below_165), Some(modes[1]));
+    let none: Fits<'_> = &|_, _, _| false;
+    assert_eq!(choose(&modes, (1920, 1080), none), Some(modes[3]));
+    assert_eq!(choose(&modes, (800, 600), none), Some(modes[0]));
 }
 
 #[test]

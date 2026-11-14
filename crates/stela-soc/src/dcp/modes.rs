@@ -167,6 +167,20 @@ pub fn assumed_size_mm(width: u32, height: u32) -> (u32, u32) {
     (mm(w), mm(h))
 }
 
+/// Whether a mode of this size at `refresh` millihertz fits the detailed
+/// timing the DCP model advertises it by ([`detailed_timing`]): a mode that
+/// does not, as 2560x1440 from about 165 Hz or 3840x2160 at 120 Hz with
+/// their pixel clocks past 655.35 MHz, cannot be published to macOS, and
+/// whoever picks the output's mode takes one that does.
+pub fn advertisable(width: u32, height: u32, refresh: u32) -> bool {
+    if width == 0 || height == 0 || width > 0xfff || height > 0xfff {
+        return false;
+    }
+    let (h_front, h_blank, v_blank) = blanking(width, height, refresh);
+    let clock = clock(width, height, (h_front, h_blank, v_blank), refresh);
+    clock != 0 && u16::try_from(clock).is_ok() && v_blank <= 0xfff
+}
+
 /// An 18-byte EDID detailed timing descriptor for `mode` at `refresh`
 /// millihertz, digital separate sync, both polarities positive. A mode
 /// whose fields do not fit the descriptor refuses rather than wraps.
@@ -678,6 +692,34 @@ mod tests {
     use super::super::super::scanout::PixelFormat;
     use super::*;
     use alloc::format;
+
+    #[test]
+    fn a_mode_is_advertisable_exactly_when_its_detailed_timing_is_made() {
+        for (width, height, refresh) in [
+            (1920, 1080, 60_000),
+            (2560, 1440, 60_000),
+            (2560, 1440, 144_000),
+            (2560, 1440, 180_000),
+            (3840, 2160, 60_000),
+            (3840, 2160, 120_000),
+            (5120, 2880, 60_000),
+            (0, 1080, 60_000),
+        ] {
+            let mode = Mode {
+                width,
+                height,
+                format: PixelFormat::Bgra8888,
+            };
+            assert_eq!(
+                advertisable(width, height, refresh),
+                detailed_timing(mode, refresh).is_ok(),
+                "{width}x{height}@{refresh}"
+            );
+        }
+        assert!(advertisable(2560, 1440, 144_000));
+        assert!(!advertisable(2560, 1440, 180_000));
+        assert!(!advertisable(3840, 2160, 120_000));
+    }
 
     const FULL_HD: Mode = Mode {
         width: 1920,

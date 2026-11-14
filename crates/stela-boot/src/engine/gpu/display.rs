@@ -212,7 +212,7 @@ impl KmsScanout {
                 index += 1;
                 continue;
             }
-            match Display::take(Node(fd), wanted) {
+            match Display::take_fitting(Node(fd), wanted, &stela_soc::dcp::modes::advertisable) {
                 Ok(display) if display.size() == wanted => {
                     output::arguments(format_args!("GPU {name}: display detected after start\n"));
                     let screen = screen(&display);
@@ -341,7 +341,7 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
             false => 0,
         };
         let result = loop {
-            match Display::take(Node(fd), wanted) {
+            match Display::take_fitting(Node(fd), wanted, &stela_soc::dcp::modes::advertisable) {
                 Err(DisplayError::NoOutput) if host::rdtsc().wrapping_sub(began) < patience => {
                     let step = host::rdtsc();
                     while host::rdtsc().wrapping_sub(step) < gpu.tsc_hz / 1000 * RETURN_STEP_MILLIS

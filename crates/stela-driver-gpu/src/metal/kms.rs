@@ -489,15 +489,37 @@ fn controller<D: Drm>(drm: &mut D, encoders: &[u32], crtcs: &[u32]) -> Result<Op
     Ok(None)
 }
 
-/// The mode of `wanted` size, else the preferred one, else the first.
-fn choose(modes: &[ModeInfo], wanted: (u32, u32)) -> Option<ModeInfo> {
-    let size = |mode: &&ModeInfo| (u32::from(mode.hdisplay), u32::from(mode.vdisplay));
-    modes
-        .iter()
-        .find(|mode| size(mode) == wanted)
-        .or_else(|| modes.iter().find(|mode| mode.kind & PREFERRED != 0))
-        .or(modes.first())
-        .copied()
+/// Whether whoever shows the output's picture to the guest can describe a
+/// mode of this width and height at this refresh in millihertz.
+pub type Fits<'a> = &'a dyn Fn(u32, u32, u32) -> bool;
+
+/// The first mode of `wanted` size that `fits`, else the preferred one if
+/// it does, else the first that does: Linux lists an output's preferred
+/// mode first and then the faster of each size first, so this is the
+/// fastest mode of the wanted size the guest can be told of. A monitor's
+/// fastest mode may not fit, as 2560x1440 at 180 Hz. With no mode that
+/// fits, the same choice among all of them.
+fn choose(modes: &[ModeInfo], wanted: (u32, u32), fits: Fits<'_>) -> Option<ModeInfo> {
+    let size = |mode: &ModeInfo| (u32::from(mode.hdisplay), u32::from(mode.vdisplay));
+    let pick = |fits: Fits<'_>| {
+        let fitting = |mode: &&ModeInfo| {
+            let (width, height) = size(mode);
+            fits(width, height, refresh(mode))
+        };
+        modes
+            .iter()
+            .filter(fitting)
+            .find(|mode| size(mode) == wanted)
+            .or_else(|| {
+                modes
+                    .iter()
+                    .filter(fitting)
+                    .find(|mode| mode.kind & PREFERRED != 0)
+            })
+            .or_else(|| modes.iter().find(fitting))
+            .copied()
+    };
+    pick(fits).or_else(|| pick(&|_, _, _| true))
 }
 
 /// One buffer of the mode's size, with its framebuffer and mapping.
@@ -574,11 +596,16 @@ fn resources<D: Drm>(drm: &mut D) -> Result<(Vec<u32>, Vec<u32>), Error> {
 impl<D: Drm> Display<D> {
     /// Takes the first connected output of `drm`, showing a black frame in
     /// the mode of `wanted` pixels if it has one, as the firmware's did.
-    pub fn take(mut drm: D, wanted: (u32, u32)) -> Result<Self, Error> {
+    pub fn take(drm: D, wanted: (u32, u32)) -> Result<Self, Error> {
+        Self::take_fitting(drm, wanted, &|_, _, _| true)
+    }
+
+    /// [`Self::take`] in a mode that `fits`, where the output has one.
+    pub fn take_fitting(mut drm: D, wanted: (u32, u32), fits: Fits<'_>) -> Result<Self, Error> {
         let (crtcs, connectors) = resources(&mut drm)?;
         for &id in &connectors {
             let found = output(&mut drm, id)?;
-            let Some(mode) = choose(&found.modes, wanted).filter(|_| found.connected) else {
+            let Some(mode) = choose(&found.modes, wanted, fits).filter(|_| found.connected) else {
                 continue;
             };
             if let Some(crtc) = controller(&mut drm, &found.encoders, &crtcs)? {
