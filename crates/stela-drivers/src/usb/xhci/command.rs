@@ -24,6 +24,19 @@ pub(super) struct Outstanding {
 /// controller that does not run its ring after a restart is given up.
 const RING_RESTARTS: u8 = 1;
 
+impl Outstanding {
+    /// The command's control word, how far its timeout handling went and
+    /// its ring restarts, for the record of a controller's death.
+    pub(super) fn state(&self) -> (u32, &'static str, u8) {
+        let phase = match self.phase {
+            Phase::Running => "running",
+            Phase::Aborting => "aborting",
+            Phase::Stopping => "stopping",
+        };
+        (self.control, phase, self.restarts)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Phase {
     Running,

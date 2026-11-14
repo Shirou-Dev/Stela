@@ -483,6 +483,8 @@ pub struct Controller {
     /// An unacknowledged command still owns its ring entry. Never wrap/reuse
     /// that entry or mutate command-dependent DMA without a controller reset.
     command_poisoned: bool,
+    /// What the controller was doing when it first stopped answering.
+    death: Option<Death>,
     /// Linux CMD_RING_STATE_ABORTED: an abort got no Command Ring Stopped
     /// event, so the ring is not rung until a command times out.
     command_ring_stopped: bool,
@@ -783,6 +785,7 @@ impl Controller {
             error: None,
             settle_from: None,
             command_poisoned: false,
+            death: None,
             command_ring_stopped: false,
             unpublished: 0,
             signalled: false,
@@ -1106,6 +1109,20 @@ impl Controller {
 
     /// Linux xhci_halt and xhci_hc_died: no further command or transfer.
     fn died(&mut self) {
+        if self.death.is_none() {
+            let (command, phase, restarts) = self
+                .outstanding
+                .as_ref()
+                .map_or((0, "none", 0), command::Outstanding::state);
+            self.death = Some(Death {
+                command,
+                phase,
+                restarts,
+                usbcmd: self.registers.read32(self.operational + USBCMD),
+                usbsts: self.registers.read32(self.operational + USBSTS),
+                crcr: self.registers.read32(self.operational + CRCR),
+            });
+        }
         self.command_poisoned = true;
         self.hardware = hardware::State::Died;
         let _ = hardware::halt(&mut *self.registers, self.clock, self.operational, HALT_US);
@@ -1205,7 +1222,47 @@ pub struct Found {
     /// How long each root port took to debounce, reset and enumerate.
     pub probes: Vec<PortProbe>,
 }
+/// What an xHCI controller was doing when it stopped answering commands:
+/// the command left unanswered and the registers read before the halt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Death {
+    /// The unanswered command TRB's control word: type in bits 10 to 15,
+    /// endpoint in 16 to 20, slot in 24 to 31. Zero when none was out.
+    pub command: u32,
+    /// How far the command's timeout handling had gone.
+    pub phase: &'static str,
+    /// Times the stopped command ring was restarted for it.
+    pub restarts: u8,
+    pub usbcmd: u32,
+    pub usbsts: u32,
+    /// CRCR's low half, of which only Command Ring Running reads back.
+    pub crcr: u32,
+}
+
+impl core::fmt::Display for Death {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "unanswered command type {} slot {} endpoint {} ({}, {} ring restarts), \
+             USBCMD {:#x} USBSTS {:#x} CRCR {:#x}",
+            self.command >> 10 & 0x3f,
+            self.command >> 24,
+            self.command >> 16 & 0x1f,
+            self.phase,
+            self.restarts,
+            self.usbcmd,
+            self.usbsts,
+            self.crcr
+        )
+    }
+}
+
 impl Found {
+    /// What the controller that died while its devices started was doing.
+    pub fn controller_death(&self) -> Option<Death> {
+        self.hosts.iter().find_map(Host::death)
+    }
+
     /// Whether the controller died while its devices started.
     pub fn controller_died(&self) -> bool {
         self.hosts.iter().any(Host::died)
@@ -1716,7 +1773,16 @@ mod tests {
         assert_eq!(stuck(&mut c, AbortReply::Ignored), Err(BlockError::Timeout));
         assert!(c.command_poisoned);
         assert!(matches!(c.hardware, hardware::State::Died));
+        // The death names the command left unanswered and where its
+        // handling stood, and a later failure does not replace it.
+        let death = c.death.unwrap();
+        assert_eq!(death.command >> 10 & 0x3f, EVALUATE_CONTEXT);
+        assert_eq!((death.command >> 24, death.phase), (1, "aborting"));
+        assert!(alloc::format!("{death}").starts_with(&alloc::format!(
+            "unanswered command type {EVALUATE_CONTEXT} slot 1 endpoint 0 (aborting, "
+        )));
         assert!(c.command(0, 0, EVALUATE_CONTEXT << 10 | 1 << 24).is_err());
+        assert_eq!(c.death, Some(death));
     }
 
     #[test]

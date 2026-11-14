@@ -75,6 +75,10 @@ impl Host {
             .try_borrow()
             .is_ok_and(|c| matches!(c.hardware, hardware::State::Died))
     }
+    /// What the controller was doing when it stopped answering.
+    pub fn death(&self) -> Option<super::Death> {
+        self.controller.try_borrow().ok().and_then(|c| c.death)
+    }
     /// Transfer this inventory's unbound Address-state device to the
     /// forwarding adapter. A failed constructor keeps the exclusive claim:
     /// neither dropping a handle nor a copied descriptor authorizes rebinding.

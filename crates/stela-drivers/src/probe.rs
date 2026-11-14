@@ -222,6 +222,9 @@ impl fmt::Display for PlatformError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Warning {
     Message(&'static str),
+    /// An xHCI controller stopped answering: what it was doing, and whether
+    /// it was reset and attached again or this was the second attachment.
+    XhciDied(Option<xhci::Death>, bool),
     Realtek(realtek::Warning),
     /// An Intel xHCI took its switchable ports from EHCI.
     IntelPortSwitch(usb::handoff::Switched),
@@ -231,6 +234,17 @@ impl fmt::Display for Warning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Message(message) => f.write_str(message),
+            Self::XhciDied(death, again) => {
+                f.write_str(if *again {
+                    XHCI_DIED_AGAIN
+                } else {
+                    XHCI_RESTARTED
+                })?;
+                match death {
+                    Some(death) => write!(f, " ({death})"),
+                    None => Ok(()),
+                }
+            }
             Self::Realtek(warning) => write!(f, "Realtek {warning}"),
             Self::IntelPortSwitch(switched) => write!(
                 f,
@@ -771,6 +785,10 @@ pub const DEVICE_START_US: u64 = 30_000_000;
 /// and attached a second time.
 const XHCI_RESTARTED: &str = "xHCI: the controller stopped answering while its devices started; \
                               Stela reset it and looked for its devices again";
+
+/// Said when the second attachment of an xHCI controller died as well.
+const XHCI_DIED_AGAIN: &str = "xHCI: the controller stopped answering again after its reset; \
+                               its devices are out of reach for this boot";
 
 /// Why a Wi-Fi adapter is left alone.
 const NO_WIFI_NETWORK: &str = "Wi-Fi adapter stays off: no --wifi network";
@@ -2152,7 +2170,7 @@ fn absorb_xhci(
     {
         devices
             .warnings
-            .push((address, Warning::Message(XHCI_RESTARTED)));
+            .push((address, Warning::XhciDied(found.controller_death(), false)));
         if let Ok(found) = core::mem::replace(
             &mut attached,
             Err(BlockError::Unsupported("xHCI host controller died")),
@@ -2166,6 +2184,13 @@ fn absorb_xhci(
             inputs.firmware,
             inputs.minimum.clone(),
         );
+        if let Ok(found) = &attached
+            && found.controller_died()
+        {
+            devices
+                .warnings
+                .push((address, Warning::XhciDied(found.controller_death(), true)));
+        }
     }
     match attached {
         Ok(found) => devices.absorb_usb(Some(address), found, inputs.firmware),

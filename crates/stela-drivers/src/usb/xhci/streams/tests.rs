@@ -406,6 +406,7 @@ fn controller(
             error: None,
             settle_from: None,
             command_poisoned: false,
+            death: None,
             command_ring_stopped: false,
             unpublished: 0,
             signalled: false,
