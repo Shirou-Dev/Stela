@@ -396,19 +396,32 @@ unsafe fn observe_controls(snapshot: &mut Snapshot, configure_pat: bool) -> Resu
 /// CPUID leaf 0xb's level shifts on this processor: the APIC ID bits that
 /// name the thread, and those that name the thread and the core (Intel SDM
 /// Vol. 3A 9.9.3; AMD Zen reports the same leaf). `None` where the leaf or
-/// either level is absent.
+/// either level is absent and the processor is not an AMD one that gives
+/// them in its extended leaves ([`topology::amd_apic_id_shifts`]).
 fn apic_id_shifts() -> Option<(u32, u32)> {
-    if __cpuid(0).eax < 0xb {
-        return None;
-    }
     let level = |index| {
         let leaf = __cpuid_count(0xb, index);
         (leaf.ebx & 0xffff != 0).then_some(((leaf.ecx >> 8) & 0xff, leaf.eax & 0x1f))
     };
-    match (level(0)?, level(1)?) {
-        ((1, thread), (2, core)) => Some((thread, core)),
-        _ => None,
-    }
+    let leaf_b = || {
+        if __cpuid(0).eax < 0xb {
+            return None;
+        }
+        match (level(0)?, level(1)?) {
+            ((1, thread), (2, core)) => Some((thread, core)),
+            _ => None,
+        }
+    };
+    leaf_b().or_else(|| {
+        // An AMD processor with the topology extensions and no leaf 0xb.
+        let vendor = __cpuid(0);
+        let amd = (vendor.ebx, vendor.edx, vendor.ecx) == (0x6874_7541, 0x6974_6e65, 0x444d_4163);
+        let extended = __cpuid(0x8000_0000).eax;
+        let topoext = extended >= 0x8000_001e && __cpuid(0x8000_0001).ecx & 1 << 22 != 0;
+        (amd && topoext).then(|| {
+            topology::amd_apic_id_shifts(__cpuid(0x8000_0008).ecx, __cpuid(0x8000_001e).ebx)
+        })
+    })
 }
 
 struct Callback {
@@ -510,7 +523,7 @@ pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
         topology::place_by_apic_id(&mut processors, shifts);
         crate::output::arguments(format_args!(
             "HOST PROCESSORS firmware lists {} processors at one location; placed by APIC ID \
-             (CPUID 0xb shifts {shifts:?})\n",
+             (CPUID shifts {shifts:?})\n",
             processors.len()
         ));
     }

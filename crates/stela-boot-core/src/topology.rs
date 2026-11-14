@@ -639,6 +639,22 @@ pub fn locations_collide(processors: &[Processor]) -> bool {
     bootstrap_index(processors) == Err(Refusal::DuplicateThreadLocation)
 }
 
+/// The two APIC ID shifts [`place_by_apic_id`] takes, for an AMD processor
+/// without CPUID leaf 0xb, such as family 17h models 00h to 0fh, from
+/// leaves 8000_0008h (ECX) and 8000_001Eh (EBX) as Linux's
+/// `topology_amd.c` reads them: the threads of a core give the thread bits,
+/// and ApicIdCoreIdSize, or the processor count where it is zero, the bits
+/// of thread and core together.
+pub fn amd_apic_id_shifts(size_ecx: u32, unit_ebx: u32) -> (u32, u32) {
+    let bits = |count: u32| count.next_power_of_two().trailing_zeros();
+    let thread = bits((unit_ebx >> 8 & 0xff) + 1);
+    let core = match size_ecx >> 12 & 0xf {
+        0 => bits((size_ecx & 0xff) + 1),
+        size => size,
+    };
+    (thread, core.max(thread))
+}
+
 /// Place every processor by its APIC ID, as Linux does, for firmware whose
 /// coordinates [`locations_collide`]. `shifts` are CPUID leaf 0xb's two
 /// level shifts from the bootstrap processor: the bits of an APIC ID that

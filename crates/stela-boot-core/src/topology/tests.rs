@@ -993,6 +993,24 @@ fn processors_the_firmware_puts_at_one_location_are_placed_by_apic_id() {
 }
 
 #[test]
+fn an_amd_processor_without_leaf_0xb_gives_its_shifts_from_the_extended_leaves() {
+    // Ryzen 5 2400G: 4 cores of 2 threads, ApicIdCoreIdSize 4, NC 7.
+    assert_eq!(amd_apic_id_shifts(4 << 12 | 7, 1 << 8), (1, 4));
+    // No ApicIdCoreIdSize: the processor count, 8, gives 3 bits.
+    assert_eq!(amd_apic_id_shifts(7, 1 << 8), (1, 3));
+    // One thread a core, 6 cores: no thread bit, 3 bits of core.
+    assert_eq!(amd_apic_id_shifts(5, 0), (0, 3));
+    // The two threads of a core then share it and its package.
+    let mut cores: Vec<_> = (0..8).map(|n| processor(n, 0, 0, 0)).collect();
+    for (index, core) in cores.iter_mut().enumerate() {
+        core.apic_id = index as u64;
+    }
+    place_by_apic_id(&mut cores, Some(amd_apic_id_shifts(4 << 12 | 7, 1 << 8)));
+    assert_eq!(physical_cores(&cores), 4);
+    assert!(cores.iter().all(|core| core.location.package == 0));
+}
+
+#[test]
 fn a_missing_floor_names_each_feature() {
     let baseline = native_snapshot();
     let refusal = |changed: Snapshot| match changed.qualify_native(false) {
