@@ -24,14 +24,14 @@ pub const HEAP_FLOOR: u64 = 2816 * MIB;
 /// runs more and larger pipelines, apps and translation packs.
 pub const HEAP_CEILING: u64 = 16 * GIB;
 /// Free host RAM bytes per byte of the engine heap's base share, which
-/// passes the floor only on hosts with more than about 50 GiB free. The
-/// heap's peak past its window's block records does not grow with the
-/// guest: 2111 MiB with 6.7 GiB of guest DRAM and 1987 MiB with 10.4 GiB
-/// (`BEAT peak=2815M` with a 704 MiB window, `peak=2963M` with 976 MiB),
-/// both under the 2304 MiB the floor keeps past its 512 MiB window. (A
-/// sixteenth, 1816 MiB, was once too little for a 16 GiB guest, under
-/// today's floor.)
-const HEAP_SHARE: u64 = 24;
+/// passes the floor on hosts with more than about 16 GiB free. The floor
+/// is what a boot was measured to need, with little to spare: a PC with 30
+/// GiB free ran its first boot after an install on the floor (3072 MiB with
+/// a 784 MiB window), carved 2673 MiB of it and failed an allocation with
+/// 700 MiB free in extents of at most 192 MiB, while its guest held 25 GiB.
+/// An eighth gives that host 4.5 GiB of heap and takes a twentieth of the
+/// guest's DRAM; hosts near the guest's floor keep the heap's floor.
+const HEAP_SHARE: u64 = 8;
 /// Heap bytes per byte of the board's code window: the shared block records,
 /// successors, recovery rows, index and lookup of the blocks it holds,
 /// once for the board since the block store is shared. An 8-PE 26A434

@@ -63,8 +63,8 @@ fn a_16_gib_host_takes_96_mib_per_runner_for_its_window_and_raises_the_heap_floo
     // executor's 2 MiB of its own.
     assert_eq!(sizes.code.window, 768 * MIB);
     assert_eq!(sizes.code.bytes, 784 * MIB);
-    // The floor plus a byte per window byte past 512 MiB: a twenty-fourth,
-    // the window and 16 MiB per PE are under it.
+    // The floor plus a byte per window byte past 512 MiB: an eighth, the
+    // window and 16 MiB per PE are under it.
     assert_eq!(sizes.heap, HEAP_FLOOR + 256 * MIB);
     assert!(sizes.guest > 10 * GIB);
 }
@@ -108,16 +108,16 @@ fn sizes_of(free: u64) -> Sizes {
 }
 
 #[test]
-fn a_128_gib_host_grows_the_heap_with_its_share_window_and_pes() {
-    let sizes = sizes(free(128), 8, 8).unwrap();
-    let heap = free(128) / HEAP_SHARE + HEAP_PER_WINDOW * 768 * MIB + 8 * PE_HEAP;
+fn a_64_gib_host_grows_the_heap_with_its_share_window_and_pes() {
+    let sizes = sizes(free(64), 8, 8).unwrap();
+    let heap = free(64) / HEAP_SHARE + HEAP_PER_WINDOW * 768 * MIB + 8 * PE_HEAP;
     assert_eq!(sizes.heap, heap / ALIGNMENT * ALIGNMENT);
     assert!(HEAP_FLOOR < sizes.heap && sizes.heap < HEAP_CEILING);
     assert_eq!(sizes.code.bytes, 784 * MIB);
-    // Each runner's halves for the guest's 115 GiB, not a 64th.
-    assert_eq!(sizes.pool, 2022 * MIB);
+    // Each runner's halves for the guest's 51 GiB, not a 64th.
+    assert_eq!(sizes.pool, 1256 * MIB);
     assert!(sizes.pool < 8 * POOL_PER_RUNNER);
-    assert!(sizes.guest > 100 * GIB);
+    assert!(sizes.guest > 50 * GIB);
 }
 
 /// Heap, code, pool and guest MiB for `runners` PEs at `free` GiB, or None
@@ -128,23 +128,23 @@ fn stelas_share_stops_growing_per_pe_past_what_each_pe_takes() {
         (2, 4, None),
         (2, 8, Some([2496, 196, 166, 5334])),
         (2, 16, Some([2496, 196, 198, 13494])),
-        (2, 30, Some([2496, 196, 240, 27788])),
-        (2, 128, Some([5684, 196, 524, 124668])),
+        (2, 30, Some([4064, 196, 236, 26224])),
+        (2, 128, Some([16384, 196, 492, 114000])),
         (8, 4, None),
         (8, 8, Some([2816, 528, 538, 4310])),
         (8, 16, Some([3072, 784, 776, 11752])),
-        (8, 30, Some([3072, 784, 942, 25922])),
-        (8, 128, Some([6356, 784, 2068, 121864])),
+        (8, 30, Some([4736, 784, 924, 24276])),
+        (8, 128, Some([16384, 784, 1950, 111954])),
         (24, 4, None),
         (24, 8, Some([2816, 560, 768, 4048])),
-        (24, 16, Some([3328, 1072, 770, 11214])),
-        (24, 30, Some([4224, 1968, 916, 23612])),
-        (24, 128, Some([7892, 2096, 2034, 119050])),
+        (24, 16, Some([3456, 1072, 768, 11088])),
+        (24, 30, Some([6144, 1968, 894, 21714])),
+        (24, 128, Some([16384, 2096, 1936, 110656])),
         (64, 4, None),
         (64, 8, None),
-        (64, 16, Some([3328, 1152, 2048, 9856])),
-        (64, 30, Some([4224, 2048, 2048, 22400])),
-        (64, 128, Some([8532, 2176, 2048, 118316])),
+        (64, 16, Some([4096, 1152, 2048, 9088])),
+        (64, 30, Some([6784, 2048, 2048, 19840])),
+        (64, 128, Some([16384, 2176, 2048, 110464])),
     ] {
         let actual = sizes(free * GIB, runners, runners)
             .ok()
@@ -171,7 +171,7 @@ fn stelas_share_stops_growing_per_pe_past_what_each_pe_takes() {
 /// - the 16 GiB VM, `free=15710M heap=3280M code=992M pool=1032M
 ///   guest=10406M`: 596 MiB more;
 /// - the 32 GB PC, `free=30242M heap=3672M code=1040M pool=2836M
-///   guest=22694M`: 2726 MiB more.
+///   guest=22694M`: 1170 MiB more.
 #[test]
 fn measured_boots_split_as_expected() {
     for (free, expected) in [
@@ -179,7 +179,7 @@ fn measured_boots_split_as_expected() {
         (HOST_8_GB / MIB, [2768, 480, 476, 3820]),
         (11514, [3008, 720, 722, 7064]),
         (15710, [3072, 784, 768, 11086]),
-        (30242, [3072, 784, 938, 25448]),
+        (30242, [4676, 784, 918, 23864]),
     ] {
         let sizes = sizes(free * MIB, 8, 8).unwrap();
         assert_eq!(
@@ -201,9 +201,9 @@ fn host_sizes_split_as_expected() {
         (8, 8, [2800, 512, 512, 4112], 4096),
         (16, 4, [2688, 392, 392, 12400], 11800),
         (16, 8, [3072, 784, 770, 11246], 10284),
-        (32, 8, [3072, 784, 954, 26934], 23920),
-        (64, 8, [3540, 784, 1316, 57848], 49784),
-        (128, 8, [6186, 784, 2022, 117984], 106012),
+        (32, 8, [4864, 784, 934, 25162], 23920),
+        (64, 8, [8832, 784, 1256, 52616], 49784),
+        (128, 8, [16384, 784, 1904, 107904], 106012),
     ] {
         let sizes = sizes(free(installed), cores, cores).unwrap();
         let split = [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB);
