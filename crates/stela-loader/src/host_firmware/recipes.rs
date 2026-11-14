@@ -733,6 +733,22 @@ const fn gsp(member: &'static str, length: usize, sha256: &'static str) -> Recip
     }
 }
 
+/// The ACR bootloader FWSEC v2 loads on Turing. `tu104` and `tu106` link to
+/// `tu102` in linux-firmware's `WHENCE`, and `tu117` to `tu116`.
+const fn acr(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source: LINUX_FIRMWARE,
+            revision: GSP_REVISION,
+            member,
+            length,
+            sha256,
+        },
+        license: &GSP_LICENSE,
+        consumer: Consumer::Nouveau,
+    }
+}
+
 /// Every GSP-RM file linux-firmware holds for [`GSP_RELEASE`].
 pub const GSP: &[Recipe] = &[
     gsp(
@@ -857,6 +873,21 @@ pub const GSP: &[Recipe] = &[
     ),
 ];
 
+/// The ACR bootloaders linux-firmware holds for the Turing families whose
+/// FWSEC v2 loads one. Both members are byte-identical.
+pub const ACR: &[Recipe] = &[
+    acr(
+        "nvidia/tu102/acr/bl.bin",
+        1280,
+        "01326cc997716bebb0eab9fe1f463fffa0ee586079e4ca0e5bb096ab6fcfedab",
+    ),
+    acr(
+        "nvidia/tu116/acr/bl.bin",
+        1280,
+        "01326cc997716bebb0eab9fe1f463fffa0ee586079e4ca0e5bb096ab6fcfedab",
+    ),
+];
+
 /// The chip whose `gsp` directory linux-firmware's `WHENCE` links `chip`'s to.
 fn gsp_directory(chip: &str) -> Option<&'static str> {
     Some(match chip {
@@ -892,6 +923,25 @@ fn select_gsp(request: &Request) -> Option<&'static Recipe> {
     };
     let member = format!("nvidia/{owner}/gsp/{file}");
     GSP.iter().find(|recipe| recipe.image.member == member)
+}
+
+/// nouveau's request for a Turing chip's ACR bootloader, through `WHENCE`'s
+/// links. FWSEC v2 reads it from `acr/bl` while it boots.
+fn select_acr(request: &Request) -> Option<&'static Recipe> {
+    if request.target.hardware != "nvidia" || request.target.revision != "linux-firmware" {
+        return None;
+    }
+    let (chip, file) = request.name.strip_prefix("nvidia/")?.split_once("/acr/")?;
+    if file != "bl.bin" {
+        return None;
+    }
+    let directory = match chip {
+        "tu102" | "tu104" | "tu106" => "tu102",
+        "tu116" | "tu117" => "tu116",
+        _ => return None,
+    };
+    let member = format!("nvidia/{directory}/acr/{file}");
+    ACR.iter().find(|recipe| recipe.image.member == member)
 }
 
 /// The chip of an NVIDIA GPU with PCI device ID `device`, named as nouveau
@@ -945,6 +995,16 @@ pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
             inventory.observe(request)?;
             found = true;
         }
+    }
+    let name = format!("nvidia/{chip}/acr/bl.bin");
+    let request = Requirement {
+        name: &name,
+        target,
+        minimum_bytes: 1,
+    };
+    if select_acr(&Request::from(request)).is_some() {
+        inventory.observe(request)?;
+        found = true;
     }
     if found {
         Ok(())
@@ -1314,7 +1374,7 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
         "wifi-mt792x" => select_mediatek_wifi(request),
         "mediatek-bluetooth-usb-mt79xx-v1" => select_mediatek_bluetooth(request),
         "realtek-wifi" => select_realtek_wifi(request),
-        "nouveau" => select_gsp(request),
+        "nouveau" => select_gsp(request).or_else(|| select_acr(request)),
         _ => None,
     }
 }
@@ -1597,7 +1657,11 @@ mod tests {
         };
         for name in names("tu104") {
             assert!(gsp_member(&name).is_some(), "{name}");
-            assert!(name.starts_with("nvidia/tu104/gsp/"), "{name}");
+            if name.contains("/acr/") {
+                assert_eq!(name, "nvidia/tu104/acr/bl.bin");
+            } else {
+                assert!(name.starts_with("nvidia/tu104/gsp/"), "{name}");
+            }
         }
         assert!(names("tu104").iter().any(|name| name.contains("/gsp-")));
         assert!(
@@ -1645,6 +1709,26 @@ mod tests {
             "nvidia/gk104/gsp/gsp-570.144.bin",
             "nvidia/ga102/gsp/fmc-570.144.bin",
             "nvidia/ga102/acr/bl-570.144.bin",
+        ] {
+            assert_eq!(gsp_member(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_turing_chip_finds_the_acr_bootloader_of_its_family() {
+        for (name, member) in [
+            ("nvidia/tu102/acr/bl.bin", "nvidia/tu102/acr/bl.bin"),
+            ("nvidia/tu104/acr/bl.bin", "nvidia/tu102/acr/bl.bin"),
+            ("nvidia/tu106/acr/bl.bin", "nvidia/tu102/acr/bl.bin"),
+            ("nvidia/tu116/acr/bl.bin", "nvidia/tu116/acr/bl.bin"),
+            ("nvidia/tu117/acr/bl.bin", "nvidia/tu116/acr/bl.bin"),
+        ] {
+            assert_eq!(gsp_member(name), Some(member), "{name}");
+        }
+        for name in [
+            "nvidia/ga102/acr/bl.bin",
+            "nvidia/tu106/acr/unload_bl.bin",
+            "nvidia/tu106/acr/ucode_ahesasc.bin",
         ] {
             assert_eq!(gsp_member(name), None, "{name}");
         }
