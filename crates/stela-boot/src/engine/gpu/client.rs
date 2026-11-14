@@ -1181,8 +1181,16 @@ pub(super) fn control(fd: c_int, request: u32, argument: *mut c_void) -> i64 {
 
 /// Maps `size` bytes of `fd` at `offset`.
 pub(super) fn map(fd: c_int, offset: u64, size: usize) -> Option<NonNull<u8>> {
-    let address = submit(Operation::Map { fd, offset, size });
-    NonNull::new(u64::try_from(address).ok()? as *mut u8)
+    let result = submit(Operation::Map { fd, offset, size });
+    match stela_boot_core::page_window::mapped_address(result) {
+        Ok(address) => NonNull::new(address as *mut u8),
+        Err(error) => {
+            output::arguments(format_args!(
+                "GPU map of {size} bytes at offset {offset:#x} refused: {error}\n"
+            ));
+            None
+        }
+    }
 }
 
 /// `NOUVEAU_GETPARAM_CHIPSET_ID` of the bound GPU at `index`.

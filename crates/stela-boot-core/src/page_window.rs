@@ -67,6 +67,19 @@ pub fn code_leaf(physical: u64) -> u64 {
     leaf(physical, Cache::WriteBack) & !NO_EXECUTE
 }
 
+/// What a mapping call returned, as Linux's `IS_ERR_VALUE` reads it: the
+/// errno in the last page of the address space, or the mapping's address.
+/// The window is in the upper half of the address space, so its addresses
+/// are negative as an `i64` like an errno is.
+pub fn mapped_address(result: i64) -> Result<u64, i64> {
+    const MAX_ERRNO: i64 = 4095;
+    if (-MAX_ERRNO..=0).contains(&result) {
+        Err(result)
+    } else {
+        Ok(result as u64)
+    }
+}
+
 /// Translate a Linux client protection into a leaf for the shared data window.
 pub fn client_leaf(pfn: u64, prot: u64) -> Option<u64> {
     const MAX_PFN: u64 = (1 << (52 - 12)) - 1;
@@ -265,6 +278,17 @@ pub fn finish_batch(batch: &[Range<u64>], retiring: &mut Retirements, free: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mapping_in_the_upper_half_is_an_address_and_only_an_errno_is_an_error() {
+        let upper = 0xffff_8010_0000_3000u64;
+        assert_eq!(mapped_address(upper as i64), Ok(upper));
+        assert_eq!(mapped_address(0x7000_0000), Ok(0x7000_0000));
+        assert_eq!(mapped_address(-12), Err(-12));
+        assert_eq!(mapped_address(-4095), Err(-4095));
+        assert_eq!(mapped_address(-4096), Ok(-4096i64 as u64));
+        assert_eq!(mapped_address(0), Err(0));
+    }
 
     const GIB: u64 = 1 << 30;
 
