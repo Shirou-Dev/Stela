@@ -562,7 +562,7 @@ fn setup_installs_from_the_usb_and_uninstall_restores_it() {
         options,
         format!(
             "--system --storage @disk --nor @disk --preboot @disk --ecid {ecid} \
-             --external-disks --guest-network\n"
+             --external-disks --guest-network --input\n"
         )
     );
     assert!(!options.contains("--bundle"), "{options}");
@@ -1504,7 +1504,7 @@ fn installed_disk_preserves_boot_choices_and_partitions() {
     let region = format!("{SERIAL}:{REGION_GUID}");
     let line = format!(
         "--system --storage {region} --nor {SERIAL}:{NOR_GUID} --preboot {region} \
-         --ecid {ecid}"
+         --ecid {ecid} --input"
     );
     assert_eq!(
         fs::read_to_string(f.esp.join("EFI/stela/stela.cfg")).unwrap(),
@@ -4318,7 +4318,9 @@ fn machine_state_tail_stays_outside_guest_region() {
     );
     assert_eq!(
         fs::read_to_string(f.esp.join("EFI/stela/stela.cfg")).unwrap(),
-        format!("--system --storage {region} --nor {region} --preboot {region} --ecid {ecid}\n")
+        format!(
+            "--system --storage {region} --nor {region} --preboot {region} --ecid {ecid} --input\n"
+        )
     );
     let choices = Choices::parse(&fs::read_to_string(f.esp.join(CHOICES_PATH)).unwrap()).unwrap();
     assert!(

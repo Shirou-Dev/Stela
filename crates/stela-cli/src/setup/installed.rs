@@ -132,6 +132,9 @@ impl InstalledDisk {
             preboot: Some(region),
             bundle: true,
             ecid: ecid.map(|ecid| ecid.0),
+            // The PC's keyboards and pointers drive the Mac's. An install
+            // runs without them (`bundle_options`).
+            input: true,
             ..self.external()
         })
     }
