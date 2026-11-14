@@ -1003,8 +1003,10 @@ fn prepared(
     (shared, device, endpoints, hardware, dma)
 }
 /// A controller that stops running its command ring ends the command in two
-/// command timeouts, one restart included, and is then dead; under a passed
-/// device start budget the same command ends at once.
+/// command timeouts, one restart included, and is then dead. A passed device
+/// start budget changes neither: a command keeps its own time, so that the
+/// commands that cancel a transfer the budget ended are answered and a
+/// working controller is not declared dead at their doorbell.
 #[test]
 fn a_controller_that_never_runs_its_command_ring_times_out_and_dies() {
     let mut memory = vec![0u64; 262_144];
@@ -1031,8 +1033,23 @@ fn a_controller_that_never_runs_its_command_ring_times_out_and_dies() {
     let result = shared.borrow_mut().command(0, 0, ENABLE_SLOT << 10);
     let took = Clock::ticks() - started;
     assert!(matches!(result, Err(BlockError::Timeout)), "{result:?}");
-    assert!(took < 100_000 + HALT_US + 10_000, "{took}");
-    assert!(budget.expired().unwrap().at.is_some());
+    assert!(
+        (2 * COMMAND_US..2 * COMMAND_US + HALT_US + 1_000_000).contains(&took),
+        "{took}"
+    );
+    assert!(budget.expired().is_some());
+
+    // And one that answers, started after the budget passed, succeeds.
+    let mut memory = vec![0u64; 262_144];
+    let (shared, _device, _hardware, _dma) = fixture(&mut memory, HIGH_SPEED, 32, 4);
+    let budget = stela_driver_base::budget::Budget::start(clock, 1).unwrap();
+    assert!(!clock.wait(10, || false));
+    assert!(budget.expired().is_some());
+    shared
+        .borrow_mut()
+        .command(0, 0, ENABLE_SLOT << 10)
+        .unwrap();
+    assert!(!matches!(shared.borrow().hardware, hardware::State::Died));
 }
 
 #[test]

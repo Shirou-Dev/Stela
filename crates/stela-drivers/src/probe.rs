@@ -853,6 +853,16 @@ impl<'a> DeviceStart<'a> {
         }
     }
 
+    /// A fresh budget for a second start of the same function, as a
+    /// controller reset and attached again gets: the first start's budget,
+    /// which its failure may have used up, would end every wait of the
+    /// second at once.
+    fn renew(&mut self, clock: Clock) {
+        // Dropped first, so the new budget replaces what the old replaced.
+        self.budget = None;
+        self.budget = budget::Budget::start(clock, DEVICE_START_US).ok();
+    }
+
     /// Turn off a function whose budget passed while the probe still holds
     /// it, so a device left half started neither writes memory nor
     /// interrupts.
@@ -1716,7 +1726,7 @@ pub unsafe fn probe_observed(
                 devices.unsupported.push((address, function.class, why));
                 continue;
             }
-            let start = DeviceStart::begin(address, handoff.clock, &mut abandoned);
+            let mut start = DeviceStart::begin(address, handoff.clock, &mut abandoned);
             #[cfg(feature = "native-acpi")]
             if smbus::matches(&function) {
                 smbus_functions.push(address);
@@ -1853,7 +1863,7 @@ pub unsafe fn probe_observed(
                         minimum: &minimum,
                     },
                     dma,
-                    &start,
+                    &mut start,
                     &mut devices,
                 );
                 continue;
@@ -2102,7 +2112,7 @@ pub unsafe fn probe_observed(
             core::mem::forget(started);
             continue;
         }
-        let start = DeviceStart::begin(address, handoff.clock, &mut abandoned);
+        let mut start = DeviceStart::begin(address, handoff.clock, &mut abandoned);
         absorb_xhci(
             Ok(started.finish(dma, firmware)),
             &mut function,
@@ -2112,7 +2122,7 @@ pub unsafe fn probe_observed(
                 minimum: &minimum,
             },
             dma,
-            &start,
+            &mut start,
             &mut devices,
         );
     }
@@ -2161,7 +2171,7 @@ fn absorb_xhci(
     function: &mut Function,
     inputs: &XhciInputs<'_>,
     dma: &mut dyn DmaAllocator,
-    start: &DeviceStart<'_>,
+    start: &mut DeviceStart<'_>,
     devices: &mut Devices,
 ) {
     let address = function.address;
@@ -2177,6 +2187,7 @@ fn absorb_xhci(
         ) {
             core::mem::forget(found);
         }
+        start.renew(inputs.handoff.clock);
         attached = xhci::attach_with_provider(
             function,
             inputs.handoff,
