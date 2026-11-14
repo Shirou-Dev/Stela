@@ -1,5 +1,9 @@
 //! Allocation-free COM1 output and the guest console's nonblocking input.
-use core::{arch::asm, fmt};
+use core::{
+    arch::asm,
+    fmt,
+    sync::atomic::{AtomicBool, Ordering},
+};
 const UART: u16 = 0x3f8;
 unsafe fn out(port: u16, value: u8) {
     // SAFETY: the caller guarantees CPL0 and that `port` is a COM1 register.
@@ -25,10 +29,34 @@ pub fn initialize() {
         out(UART + 3, 3);
         out(UART + 2, 0xc7);
         out(UART + 4, 0x0b);
+        // A PC with no COM1 answers every read of its ports with 0xff: a
+        // line status no UART gives after its FIFOs were cleared, and a
+        // scratch register that keeps nothing. Linux's 8250 probe refuses
+        // such a port the same way.
+        let kept = |pattern: u8| {
+            out(UART + 7, pattern);
+            input(UART + 7) == pattern
+        };
+        let absent = input(UART + 5) == 0xff && !(kept(0x5a) && kept(0xa5));
+        ABSENT.store(absent, Ordering::Relaxed);
     }
+}
+
+/// Whether [`initialize`] found no UART at COM1. Its line status then
+/// always reads as data ready and transmitter empty: without this, the
+/// guest's console was fed 0xff bytes without end and every log byte was
+/// written to a port nothing answers.
+static ABSENT: AtomicBool = AtomicBool::new(false);
+
+/// Whether COM1 has a UART.
+pub fn present() -> bool {
+    !ABSENT.load(Ordering::Relaxed)
 }
 /// One input byte for the guest console's device owner, when available.
 pub fn read() -> Option<u8> {
+    if !present() {
+        return None;
+    }
     // SAFETY: the engine runs at CPL0 after COM1 initialization. Only its
     // console device owner reads RBR; output accesses the separate THR register.
     unsafe { (input(UART + 5) & 1 != 0).then(|| input(UART)) }
@@ -36,6 +64,10 @@ pub fn read() -> Option<u8> {
 
 /// Whether the transmitter is empty: its FIFO takes 16 bytes now.
 pub fn ready() -> bool {
+    if !present() {
+        // What is sent is dropped at once.
+        return true;
+    }
     // SAFETY: reads the line status register of the configured UART.
     let status = unsafe { input(UART + 5) };
     status & 0x20 != 0
@@ -44,6 +76,9 @@ pub fn ready() -> bool {
 /// [`ready`] found empty: at most 16 bytes in all, sent without polling,
 /// as one string output, which a hypervisor takes in one exit.
 pub fn burst(bytes: &[u8]) {
+    if !present() {
+        return;
+    }
     let mut fifo = [0u8; 16];
     let mut length = 0;
     for &byte in bytes {
@@ -67,6 +102,9 @@ pub fn burst(bytes: &[u8]) {
     }
 }
 fn send(byte: u8) {
+    if !present() {
+        return;
+    }
     // Bounded polling has no allocator/runtime callback or lock. A broken
     // UART cannot convert panic into deadlock or resumed execution.
     for _ in 0..100_000 {

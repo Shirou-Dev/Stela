@@ -243,6 +243,11 @@ fn main() -> Status {
         "STELA UEFI MOUNT version={}\n",
         env!("CARGO_PKG_VERSION")
     ));
+    if !serial::present() {
+        output::arguments(format_args!(
+            "SERIAL no UART at COM1: nothing is sent to it or read from it\n"
+        ));
+    }
     stop_firmware_watchdog();
     let heap_bytes =
         initial_heap_bytes().unwrap_or_else(|error| output::early_fatal(error.as_str()));
