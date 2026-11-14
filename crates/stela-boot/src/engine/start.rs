@@ -62,7 +62,7 @@ fn from_disk(
         ecid: options.ecid,
         boot_command: options.boot_command,
         boot_args: format!(
-            "-v serial=3 serial-device-name=uart0 ml-timeout-debug-ack={} noidle=1",
+            "-v serial=3 serial-device-name=uart0 ml-timeout-debug-ack={} noidle=1 io=0",
             stela_boot_core::guest_timeouts::picoseconds(DEBUG_ACK_SECONDS)
         ),
         ..boot_bundle::Options::default()
