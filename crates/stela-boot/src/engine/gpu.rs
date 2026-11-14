@@ -431,7 +431,7 @@ fn gpu_alloc_stage() -> u32 {
 
 /// Called by the Linux DMA shim at each `alloc_pages_op` stage.
 #[unsafe(no_mangle)]
-pub extern "C" fn stela_gpu_stage(stage: u32) {
+pub extern "C" fn stela_linux_gpu_stage(stage: u32) {
     GPU_ALLOC_STAGE.store(stage, Ordering::Release);
     // The display is already off while nouveau resets it, so the log and the
     // serial port are the only live outputs. Store the line now instead of
@@ -1224,8 +1224,8 @@ fn read_register(
 /// (`firmware_boot`), so wait here first, by nouveau's bound, and print what
 /// the start of the old boot flow depends on: the firmware boot, WPR2 (which
 /// FWSEC-FRTS sets) and the VBIOS window the PRAMIN shadow reads.
-/// `GPU AD107: firmware boot completed after N polls: gfw=… plm=… wpr2=…-…
-/// display_fuse=… vbios_window=…`, or `did not complete` and a refusal.
+/// `GPU AD107: firmware boot completed after N polls: gfw=โ€ฆ plm=โ€ฆ wpr2=โ€ฆ-โ€ฆ
+/// display_fuse=โ€ฆ vbios_window=โ€ฆ`, or `did not complete` and a refusal.
 fn wait_for_firmware_boot(
     services: &dyn NativeServices,
     registers: &owned::Resource,
@@ -2369,19 +2369,19 @@ fn pump_waiting() {
     pump();
 }
 
-/// `GPU PUMP runs=… quiet=… unmasked=… forced=… relaxed=… posted=… by_event=…
-/// by_deadline=… idle=… deferred=… mean_us=… longest_us=… delay_mean_us=…
-/// delay_longest_us=… next_us=… next_timer=…`: the pumps since the last
+/// `GPU PUMP runs=โ€ฆ quiet=โ€ฆ unmasked=โ€ฆ forced=โ€ฆ relaxed=โ€ฆ posted=โ€ฆ by_event=โ€ฆ
+/// by_deadline=โ€ฆ idle=โ€ฆ deferred=โ€ฆ mean_us=โ€ฆ longest_us=โ€ฆ delay_mean_us=โ€ฆ
+/// delay_longest_us=โ€ฆ next_us=โ€ฆ next_timer=โ€ฆ`: the pumps since the last
 /// report, by what let each run and why it was due, what they took, how long
 /// ready work waited for one, and Linux's next deadline with the function
 /// of its first timer-list timer, as an offset in this image. Then
-/// `step_longest_us=… step_shootdowns=… step_serving=…`: the longest single
+/// `step_longest_us=โ€ฆ step_shootdowns=โ€ฆ step_serving=โ€ฆ`: the longest single
 /// Linux step, the shootdowns during it and the posted calls being performed
 /// as it began (`-` for none), and `unmaps=device/pages/files/stacks`
-/// ([`UNMAPS`]), and `total_us=enter/children/steps/leave/look:…` the
-/// pumps' time by [`PumpPart`], then `part_longest_us=…` the longest each
-/// part took in one pump. Then `\nGPU LINUX timers=… works=… sleepers=… timeouts=…
-/// steps=…` ([`linux_report`]).
+/// ([`UNMAPS`]), and `total_us=enter/children/steps/leave/look:โ€ฆ` the
+/// pumps' time by [`PumpPart`], then `part_longest_us=โ€ฆ` the longest each
+/// part took in one pump. Then `\nGPU LINUX timers=โ€ฆ works=โ€ฆ sleepers=โ€ฆ timeouts=โ€ฆ
+/// steps=โ€ฆ` ([`linux_report`]).
 pub(super) fn pump_report(tsc_hz: u64) -> Option<String> {
     let gpu = installed()?;
     let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
@@ -2471,7 +2471,7 @@ struct LinuxCounts {
     timeouts: AtomicUsize,
 }
 
-/// `\nGPU LINUX timers=+0x…:N,… works=… sleepers=… timeouts=N steps=N`:
+/// `\nGPU LINUX timers=+0xโ€ฆ:N,โ€ฆ works=โ€ฆ sleepers=โ€ฆ timeouts=N steps=N`:
 /// since the last report, the timer callbacks (timer-list and
 /// high-resolution) and work items that ran in the environment, most first,
 /// by function as an offset in this image (`other:N` for the rest), the tasks
@@ -2551,10 +2551,10 @@ fn linux_report(steps: u64, tsc_hz: u64) -> String {
     )
 }
 
-/// `\nGPU NVKM kind:count/total_us/longest_us …`: where nouveau's page-table
+/// `\nGPU NVKM kind:count/total_us/longest_us โ€ฆ`: where nouveau's page-table
 /// and instance-memory paths spent their time since the last report
 /// (`include/nvkm/core/counts.h`), for kinds that ran, then
-/// `\nGPU NVKM SIZES kind:count/total_kib/largest_kib …` for its page-table
+/// `\nGPU NVKM SIZES kind:count/total_kib/largest_kib โ€ฆ` for its page-table
 /// references by page size and its sparse references. Empty when none ran.
 #[cfg(feature = "nvk")]
 fn nvkm_report() -> String {
