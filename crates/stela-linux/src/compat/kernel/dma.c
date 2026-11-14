@@ -127,7 +127,9 @@ struct page *dma_alloc_pages(struct device *dev, size_t size, dma_addr_t *dma_ha
 	if (stela_linux_kernel_hosted() || !ops->alloc_pages_op)
 		return NULL;
 	gfp &= ~(__GFP_DMA | __GFP_DMA32 | __GFP_HIGHMEM);
+	pr_info("dma_alloc_pages: calling alloc_pages_op\n");
 	page = ops->alloc_pages_op(dev, PAGE_ALIGN(size), dma_handle, dir, gfp);
+	pr_info("dma_alloc_pages: alloc_pages_op returned page=%p\n", page);
 	pr_info("dma_alloc_pages: result page=%p size=%zu dma=0x%llx\n", page, size,
 		(unsigned long long)(page ? *dma_handle : 0));
 	return page;

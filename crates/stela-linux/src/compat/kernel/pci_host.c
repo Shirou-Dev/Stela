@@ -5,6 +5,7 @@
  * dma_map_ops would. x86 caches snoop DMA, so no operation syncs. */
 #include <linux/dma-map-ops.h>
 #include <linux/pci.h>
+#include <linux/printk.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <stela/catalogue.h>
@@ -143,37 +144,39 @@ static void free_coherent(struct device *dev, size_t size, void *cpu, dma_addr_t
 static struct page *alloc_pages_op(struct device *dev, size_t size, dma_addr_t *dma_handle,
 				   enum dma_data_direction dir, gfp_t gfp)
 {
+	pr_info("alloc_pages_op: entered size=%zu dir=%d gfp=0x%x\n",
+		size, (int)dir, (unsigned int)gfp);
 	unsigned int order = (unsigned int)get_order(size);
-	dev_info(dev, "alloc_pages_op: enter size=%zu order=%u dir=%d gfp=0x%x coherent=0x%llx mask=0x%llx\n",
-		 size, order, (int)dir, (unsigned int)gfp,
-		 (unsigned long long)dev->coherent_dma_mask,
-		 (unsigned long long)(dev->dma_mask ? *dev->dma_mask : 0));
-	dev_info(dev, "alloc_pages_op: calling alloc_pages(0x%x, %u)...\n", (unsigned int)(gfp | __GFP_ZERO), order);
+	pr_info("alloc_pages_op: enter size=%zu order=%u dir=%d gfp=0x%x coherent=0x%llx mask=0x%llx\n",
+		size, order, (int)dir, (unsigned int)gfp,
+		(unsigned long long)dev->coherent_dma_mask,
+		(unsigned long long)(dev->dma_mask ? *dev->dma_mask : 0));
+	pr_info("alloc_pages_op: calling alloc_pages(0x%x, %u)...\n", (unsigned int)(gfp | __GFP_ZERO), order);
 	struct page *page = alloc_pages(gfp | __GFP_ZERO, order);
-	dev_info(dev, "alloc_pages_op: alloc_pages attempt 1 finished, page=%p\n", page);
+	pr_info("alloc_pages_op: alloc_pages attempt 1 finished, page=%p\n", page);
 	if (!page) {
-		dev_warn(dev, "alloc_pages_op: first attempt failed, retrying with GFP_KERNEL\n");
+		pr_warn("alloc_pages_op: first attempt failed, retrying with GFP_KERNEL\n");
 		page = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
-		dev_info(dev, "alloc_pages_op: alloc_pages attempt 2 finished, page=%p\n", page);
+		pr_info("alloc_pages_op: alloc_pages attempt 2 finished, page=%p\n", page);
 	}
-	dev_info(dev, "alloc_pages_op: alloc_pages done, page=%p\n", page);
+	pr_info("alloc_pages_op: alloc_pages done, page=%p\n", page);
 
 	if (!page) {
-		dev_warn(dev, "alloc_pages_op: failed to allocate %zu bytes (order %u)\n", size, order);
+		pr_warn("alloc_pages_op: failed to allocate %zu bytes (order %u)\n", size, order);
 		return NULL;
 	}
 	phys_addr_t pa = page_to_phys(page);
-	dev_info(dev, "alloc_pages_op: page_to_phys done, pa=0x%llx\n", (unsigned long long)pa);
+	pr_info("alloc_pages_op: page_to_phys done, pa=0x%llx\n", (unsigned long long)pa);
 
 	dma_addr_t mapped = map_phys(dev, pa, size, dir, 0);
 	if (mapped == DMA_MAPPING_ERROR || mapped == 0) {
-		dev_info(dev, "alloc_pages_op: map_phys returned error/0, using pa directly: 0x%llx\n", (unsigned long long)pa);
+		pr_info("alloc_pages_op: map_phys returned error/0, using pa directly: 0x%llx\n", (unsigned long long)pa);
 		mapped = (dma_addr_t)pa;
 	} else {
-		dev_info(dev, "alloc_pages_op: map_phys success, mapped=0x%llx\n", (unsigned long long)mapped);
+		pr_info("alloc_pages_op: map_phys success, mapped=0x%llx\n", (unsigned long long)mapped);
 	}
 	*dma_handle = mapped;
-	dev_info(dev, "alloc_pages_op: success, dma=0x%llx pa=0x%llx\n", (unsigned long long)*dma_handle, (unsigned long long)pa);
+	pr_info("alloc_pages_op: success, dma=0x%llx pa=0x%llx\n", (unsigned long long)*dma_handle, (unsigned long long)pa);
 	return page;
 }
 
