@@ -415,8 +415,10 @@ impl Host {
     }
 
     fn report(&self, line: core::fmt::Arguments<'_>) {
+        // Queue only: a store from inside a Linux driver call can wait for a
+        // USB request that never completes. The stage markers store their own
+        // lines, so the allocator's progress is still visible.
         output::arguments(format_args!("LINUX {line}\n"));
-        flush_gpu_log();
     }
 }
 
