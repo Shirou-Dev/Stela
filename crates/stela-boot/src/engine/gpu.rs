@@ -415,9 +415,23 @@ impl Host {
     }
 
     fn report(&self, line: core::fmt::Arguments<'_>) {
+        // Queue only: storing the USB log here re-enters the storage driver
+        // from inside a Linux driver call and can deadlock the boot PE. The
+        // GPU wait and the engine's flush_due store at safe points.
         output::arguments(format_args!("LINUX {line}\n"));
-        flush_gpu_log();
     }
+}
+
+/// The stage `alloc_pages_op` reached, set by the Linux DMA shim. Readable
+/// even after the log sink stopped, so a later report says where the
+/// allocation stopped.
+fn gpu_alloc_stage() -> u32 {
+    // SAFETY: the C shim returns one volatile word and takes no pointers.
+    unsafe { stela_linux_gpu_alloc_stage() }
+}
+
+unsafe extern "C" {
+    fn stela_linux_gpu_alloc_stage() -> u32;
 }
 
 /// Store GPU logs to USB immediately via storage::between_drivers
@@ -460,7 +474,8 @@ impl Platform for Host {
         if deadline != 0 && now as u64 >= deadline {
             if !GPU_START_DEADLINE_REPORTED.swap(true, Ordering::AcqRel) {
                 output::arguments(format_args!(
-                    "GPU START DEADLINE PASSED: fast-forwarding Linux time past {START_SECONDS}s\n"
+                    "GPU START DEADLINE PASSED: fast-forwarding Linux time past {START_SECONDS}s (alloc stage {})\n",
+                    gpu_alloc_stage()
                 ));
             }
             // The driver's waits compare two readings of this clock: a jump
@@ -1862,6 +1877,10 @@ fn mount_and_start(
     // The job has returned (or the wait gave up): Linux time no longer needs
     // to be fast-forwarded, and the jump must not leak into later boots.
     GPU_START_DEADLINE_NS.store(0, Ordering::Release);
+    output::arguments(format_args!(
+        "GPU start stage {} after the wait\n",
+        gpu_alloc_stage()
+    ));
     waited?;
     output::arguments(format_args!(
         "GPU mount_and_start child joined successfully\n"
@@ -1909,7 +1928,8 @@ fn wait_for_child(
 
         if time.now_ns().map_err(environment_error)? >= deadline {
             output::arguments(format_args!(
-                "GPU wait_for_child: TIMED OUT after {START_SECONDS}s\n"
+                "GPU wait_for_child: TIMED OUT after {START_SECONDS}s (alloc stage {})\n",
+                gpu_alloc_stage()
             ));
             flush_gpu_log();
             return Err(Error::Timeout);
