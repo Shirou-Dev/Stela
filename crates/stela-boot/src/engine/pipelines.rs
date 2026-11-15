@@ -300,6 +300,11 @@ impl Writer {
     /// carries the same update out on the partition directly.
     fn stall(&mut self, error: &str) {
         output::arguments(format_args!("PIPELINES not written: {error}\n"));
+        if let Some(running) = &mut self.running {
+            // The queued tags belong to the failed try; the stop starts
+            // its pieces again.
+            running.queued = Queued::default();
+        }
         self.failed = true;
     }
 }

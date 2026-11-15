@@ -1298,7 +1298,13 @@ pub fn step() {
         );
         match stepped {
             Ok(events) => events.iter().for_each(report_event),
-            Err(error) => output::arguments(format_args!("TRANSLATIONS not written: {error}\n")),
+            Err(error) => {
+                // The queued tags belong to the write that failed; the
+                // retry starts its pieces again (a rewrite is the same
+                // bytes at the same offset).
+                held.queued = Queued::default();
+                output::arguments(format_args!("TRANSLATIONS not written: {error}\n"));
+            }
         }
         if !idle || !held.writer.idle() {
             let took = super::host::fresh_counter().wrapping_sub(started);
