@@ -32,6 +32,16 @@ pub const HEAP_CEILING: u64 = 16 * GIB;
 /// An eighth gives that host 4.5 GiB of heap and takes a twentieth of the
 /// guest's DRAM; hosts near the guest's floor keep the heap's floor.
 const HEAP_SHARE: u64 = 8;
+/// The most the heap takes ahead of its floor on a host with plenty of free
+/// RAM: a browser's textures and the GPU driver's compiles hold blocks of
+/// tens of MiB live, and a heap at the floor fragments under them until a
+/// 33 MiB upload cannot find one. A 4.5 GiB heap leaves the guest its share
+/// and the large blocks room.
+const HEAP_BOOST_CAP: u64 = 4608 * MIB;
+/// Free host RAM at which the heap takes a quarter of it, up to
+/// [`HEAP_BOOST_CAP`]: a 16 GiB host's 3.9 GiB heap keeps the browser usable,
+/// while an 8 or 12 GiB host keeps the floor and its guest.
+const HEAP_BOOST_FREE: u64 = 12 * GIB;
 /// Heap bytes per byte of the board's code window: the shared block records,
 /// successors, recovery rows, index and lookup of the blocks it holds,
 /// once for the board since the block store is shared. An 8-PE 26A434
@@ -230,6 +240,16 @@ fn estimate_with(free: u64, cores: usize, runners: usize, per_runner: u64) -> Re
     let code = code_reservation_per_runner(free, cores, runners, per_runner)?;
     let running = runners as u64;
     let heap = free / HEAP_SHARE + HEAP_PER_WINDOW * code.window + running * PE_HEAP;
+    // A host with room to spare gives the heap more than its floor: the GPU
+    // driver's compiles and a browser's textures hold blocks of tens of MiB
+    // live, and the floor is where a 33 MiB upload failed with 700 MiB free
+    // but no extent past 23 MiB. The guest keeps the rest.
+    let boosted = if free >= HEAP_BOOST_FREE {
+        (free / 4).min(HEAP_BOOST_CAP)
+    } else {
+        0
+    };
+    let heap = heap.max(boosted);
     let floor = (HEAP_FLOOR + HEAP_PER_WINDOW * code.window)
         .saturating_sub(HEAP_PER_WINDOW * FLOOR_WINDOW)
         / ALIGNMENT

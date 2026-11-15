@@ -155,7 +155,9 @@ pub extern "sysv64" fn entry(handoff: u64) -> ! {
 }
 
 /// The part of the engine heap that holes cannot take from large requests.
-const HEAP_RESERVE_SHARE: usize = 16;
+/// An eighth keeps a contiguous tail for the GPU driver's large uploads and
+/// compiles even after hours of small allocations fragment the rest.
+const HEAP_RESERVE_SHARE: usize = 8;
 
 /// What every phase after the host's reads: the loader's handoff,
 /// `stela.cfg` and the validated physical processors.

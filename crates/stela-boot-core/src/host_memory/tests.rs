@@ -63,9 +63,9 @@ fn a_16_gib_host_takes_96_mib_per_runner_for_its_window_and_raises_the_heap_floo
     // executor's 2 MiB of its own.
     assert_eq!(sizes.code.window, 768 * MIB);
     assert_eq!(sizes.code.bytes, 784 * MIB);
-    // The floor plus a byte per window byte past 512 MiB: an eighth, the
-    // window and 16 MiB per PE are under it.
-    assert_eq!(sizes.heap, HEAP_FLOOR + 256 * MIB);
+    // A quarter of the host's free RAM, under the 4.5 GiB cap: the browser
+    // and the GPU driver keep room for their large blocks above the floor.
+    assert_eq!(sizes.heap, 3968 * MIB);
     assert!(sizes.guest > 10 * GIB);
 }
 
@@ -127,17 +127,17 @@ fn stelas_share_stops_growing_per_pe_past_what_each_pe_takes() {
     for (runners, free, expected) in [
         (2, 4, None),
         (2, 8, Some([2496, 196, 166, 5334])),
-        (2, 16, Some([2496, 196, 198, 13494])),
-        (2, 30, Some([4064, 196, 236, 26224])),
+        (2, 16, Some([4096, 196, 194, 11898])),
+        (2, 30, Some([4608, 196, 234, 25682])),
         (2, 128, Some([16384, 196, 492, 114000])),
         (8, 4, None),
         (8, 8, Some([2816, 528, 538, 4310])),
-        (8, 16, Some([3072, 784, 776, 11752])),
+        (8, 16, Some([4096, 784, 764, 10740])),
         (8, 30, Some([4736, 784, 924, 24276])),
         (8, 128, Some([16384, 784, 1950, 111954])),
         (24, 4, None),
         (24, 8, Some([2816, 560, 768, 4048])),
-        (24, 16, Some([3456, 1072, 768, 11088])),
+        (24, 16, Some([4096, 1072, 768, 10448])),
         (24, 30, Some([6144, 1968, 894, 21714])),
         (24, 128, Some([16384, 2096, 1936, 110656])),
         (64, 4, None),
@@ -178,7 +178,7 @@ fn measured_boots_split_as_expected() {
         (7354, [2752, 464, 458, 3680]),
         (HOST_8_GB / MIB, [2768, 480, 476, 3820]),
         (11514, [3008, 720, 722, 7064]),
-        (15710, [3072, 784, 768, 11086]),
+        (15710, [3926, 784, 760, 10240]),
         (30242, [4676, 784, 918, 23864]),
     ] {
         let sizes = sizes(free * MIB, 8, 8).unwrap();
@@ -199,8 +199,8 @@ fn host_sizes_split_as_expected() {
         (8, 2, [2496, 196, 158, 5086], 4714),
         (8, 4, [2688, 392, 284, 4572], 4346),
         (8, 8, [2800, 512, 512, 4112], 4096),
-        (16, 4, [2688, 392, 392, 12400], 11800),
-        (16, 8, [3072, 784, 770, 11246], 10284),
+        (16, 4, [3968, 392, 384, 11128], 11800),
+        (16, 8, [3968, 784, 760, 10360], 10284),
         (32, 8, [4864, 784, 934, 25162], 23920),
         (64, 8, [8832, 784, 1256, 52616], 49784),
         (128, 8, [16384, 784, 1904, 107904], 106012),
@@ -208,7 +208,12 @@ fn host_sizes_split_as_expected() {
         let sizes = sizes(free(installed), cores, cores).unwrap();
         let split = [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB);
         assert_eq!(split, expected, "{installed} GiB, {cores} cores");
-        assert!(split[3] > before, "{installed} GiB, {cores} cores");
+        // A 16 GiB host gives the heap a quarter for the browser's large
+        // blocks, keeping a guest above 10 GiB; from 32 GiB up the guest still
+        // grows past what v0.1.0 gave it.
+        if installed != 16 {
+            assert!(split[3] > before, "{installed} GiB, {cores} cores");
+        }
         // From 16 GiB up each runner's user half holds at least the 52 MiB
         // the 12 GiB VM filled, beside its kernel half.
         if installed >= 16 {

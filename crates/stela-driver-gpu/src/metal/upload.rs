@@ -106,9 +106,16 @@ impl UploadArena {
                     return Err(Error::OutOfMemory);
                 }
                 // Room for a whole default chunk (or this upload) up front,
-                // so filling it never reallocates and recopies the bytes.
+                // so filling it never reallocates and recopies the bytes. A
+                // request the heap cannot hold fails here, before the fatal
+                // allocation: the driver answers the guest with OutOfMemory
+                // and the rest of the system keeps running.
                 let capacity = chunk.size.min(length.max(CHUNK_BYTES)) as usize;
-                self.chunks.push((chunk, Vec::with_capacity(capacity)));
+                let mut data = Vec::new();
+                if data.try_reserve_exact(capacity).is_err() {
+                    return Err(Error::OutOfMemory);
+                }
+                self.chunks.push((chunk, data));
                 0
             }
         };
@@ -175,6 +182,25 @@ mod tests {
             &chunks[0].1[..],
             &[[1; 10].as_slice(), &[0; 6], &[2; 4]].concat()[..]
         );
+    }
+
+    #[test]
+    fn an_upload_larger_than_the_staging_heap_is_refused() {
+        struct Huge;
+        impl ChunkSource for Huge {
+            fn acquire(&mut self, bytes: u64) -> Result<Chunk> {
+                Ok(Chunk {
+                    buffer: Buffer(1),
+                    address: 1 << 32,
+                    size: bytes,
+                })
+            }
+        }
+        let mut arena = UploadArena::default();
+        assert!(matches!(
+            arena.zeroed(&mut Huge, usize::MAX, 16),
+            Err(Error::OutOfMemory)
+        ));
     }
 
     /// Scratch memory has a chunk of its own that no later upload shares,
