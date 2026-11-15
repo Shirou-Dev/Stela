@@ -492,6 +492,20 @@ fn a_write_that_fails_while_the_guest_runs_is_written_at_the_stop() {
 }
 
 #[test]
+fn a_write_that_fails_once_is_tried_again_while_the_guest_runs() {
+    let mut disk = Disk::new(FILE_BYTES);
+    let mut run = Run::new(load(&disk.bytes.clone(), u64::MAX), 1);
+    let added: BTreeSet<Digest> = run.boot.add(500).into_iter().collect();
+    disk.fail_writes = 1;
+    assert!(run.run(&mut disk, FIRST_DELTA_SECONDS + 1).is_err());
+    assert!(run.writer.failed());
+    // A step after the retry delay writes the same execution again.
+    run.run(&mut disk, RETRY_SECONDS + 2).unwrap();
+    assert!(!run.writer.failed());
+    assert_eq!(keys(&disk.bytes), added);
+}
+
+#[test]
 fn a_segment_without_room_waits_for_a_merge_and_one_larger_than_the_file_is_left_out() {
     let mut disk = Disk::new(DATA_START + 64 * journal::ALIGN);
     let mut run = Run::new(load(&disk.bytes.clone(), u64::MAX), 1);

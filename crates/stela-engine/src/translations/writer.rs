@@ -96,6 +96,13 @@ const LOOKS_PER_SECOND: u64 = 10;
 pub const STEP_WORK: usize = 32;
 /// The most bytes a write step queues.
 pub const PIECE_BYTES: u64 = 512 << 10;
+/// How long the writer waits after a write fails while the guest runs, and
+/// how many times it tries again before leaving the write to the stop. A
+/// busy USB queue can refuse a write once and take it a step later; a pack
+/// blank for the whole boot until a clean shutdown loses everything a crash
+/// would.
+const RETRY_SECONDS: u64 = 30;
+const RETRIES: u8 = 3;
 /// The record bytes a step moves to the arena.
 pub const SETTLE_BYTES: usize = 4 << 20;
 /// The eighths of the limit a full merge keeps, once the file holds records
@@ -324,6 +331,10 @@ pub struct Writer<'a> {
     arena_full: bool,
     arena_reported: bool,
     failed: bool,
+    /// When the writer tries a failed write again, and how many tries it
+    /// has left before the stop.
+    retry_at: u64,
+    retries: u8,
     stats: Stats,
 }
 
@@ -378,6 +389,8 @@ impl<'a> Writer<'a> {
             arena_full: false,
             arena_reported: false,
             failed: false,
+            retry_at: 0,
+            retries: RETRIES,
             stats: Stats::default(),
         };
         writer.segments = segments.into_iter().map(Segment::from).collect();
@@ -890,6 +903,7 @@ impl<'a> Writer<'a> {
 
     /// A write finished: its commit is the file's newest.
     fn finish(&mut self, execution: Box<Execution<'a>>, done: Done<'a>) -> Event {
+        self.retries = RETRIES;
         if let Some(last) = execution.last() {
             self.committed = Some(last);
         }
@@ -943,15 +957,19 @@ impl<'a> Writer<'a> {
         advance: &mut dyn FnMut(&mut Execution<'a>) -> Option<Result<bool, String>>,
     ) -> Result<Vec<Event>, String> {
         let mut events = Vec::new();
+        let now = clock();
         if self.failed {
-            return Ok(events);
+            if self.retries == 0 || now < self.retry_at {
+                return Ok(events);
+            }
+            self.failed = false;
         }
         events.extend(self.govern(entries));
         events.extend(self.settle());
         if self.idle() {
-            events.extend(self.begin(clock(), entries));
+            events.extend(self.begin(now, entries));
         } else {
-            self.hold(clock(), entries);
+            self.hold(now, entries);
         }
         loop {
             self.task = match core::mem::replace(&mut self.task, Task::Idle) {
@@ -1047,11 +1065,13 @@ impl<'a> Writer<'a> {
                     match advance(&mut execution) {
                         Some(Ok(true)) => events.push(self.finish(execution, done)),
                         Some(Err(error)) => {
-                            // Keep the write: the stop carries the same
-                            // execution out on the partition directly, where
-                            // a queue that failed while the guest ran need
-                            // not fail.
+                            // Keep the write: a queue that failed while the
+                            // guest ran may take it a step later, and the
+                            // stop carries the same execution out on the
+                            // partition directly if the tries run out.
                             self.failed = true;
+                            self.retries = self.retries.saturating_sub(1);
+                            self.retry_at = now + self.hz * RETRY_SECONDS;
                             self.task = Task::Write { execution, done };
                             return Err(error);
                         }
