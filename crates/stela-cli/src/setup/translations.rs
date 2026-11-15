@@ -52,8 +52,11 @@ pub(super) const SPARE: &str = "spare.bin";
 /// it does a pack.
 /// A blank one holds nothing yet.
 pub(super) const PIPELINES: &str = "pipeline.bin";
-/// The pipeline store's size, its bound.
-pub(super) const PIPELINE_BYTES: u64 = 64 * MIB;
+/// The pipeline store's size, its bound. The device keeps at most 256 MiB
+/// of compiled pipelines and NIR; a file of 256 MiB gives the journal that
+/// much to place a newer snapshot and its NIR in, four times the 64 MiB the
+/// store had.
+pub(super) const PIPELINE_BYTES: u64 = 256 * MIB;
 /// The translator id bytes a pack's file name holds.
 const NAME_BYTES: usize = 4;
 const MIB: u64 = 1024 * 1024;
@@ -136,14 +139,19 @@ impl Store {
     }
 
     /// Allocate a blank pipeline store, as [`Self::prepare_spare`] does the
-    /// spare. One already of its size keeps what it holds.
+    /// spare. One already of its size keeps what it holds; a smaller one is
+    /// extended in place, so an update does not throw the cache away.
     fn prepare_pipelines(&self) -> Result<()> {
         if self.pipelines_ready() {
             return Ok(());
         }
         let path = self.directory().join(PIPELINES);
-        let file =
-            fs::File::create(&path).with_context(|| format!("cannot create {}", path.display()))?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("cannot create {}", path.display()))?;
         file.set_len(PIPELINE_BYTES)
             .and_then(|()| file.sync_all())
             .with_context(|| {
@@ -486,6 +494,29 @@ pub(super) mod tests {
         let path = directory.join(pack_name(&id));
         fs::write(&path, file).unwrap();
         path
+    }
+
+    #[test]
+    fn a_pipeline_store_extended_to_its_bound_keeps_what_it_held() {
+        use std::io::Read as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store {
+            volume: dir.path().to_path_buf(),
+            pack_bytes: SMALL_PACK as u64,
+        };
+        fs::create_dir_all(store.directory()).unwrap();
+        let path = store.directory().join(PIPELINES);
+        fs::write(&path, b"STLGPIPE").unwrap();
+        store.prepare_pipelines().unwrap();
+        assert!(store.pipelines_ready());
+        let mut head = [0; 8];
+        fs::File::open(&path)
+            .unwrap()
+            .read_exact(&mut head)
+            .unwrap();
+        assert_eq!(&head, b"STLGPIPE");
+        fs::remove_dir_all(checked_directory(&store).unwrap()).unwrap();
     }
 
     #[test]

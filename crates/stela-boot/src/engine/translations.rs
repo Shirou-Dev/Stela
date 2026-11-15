@@ -1228,6 +1228,10 @@ fn report_event(event: &Event) {
         Event::Lost { records } => output::arguments(format_args!(
             "TRANSLATIONS segment of {records} records left out: larger than the file holds\n"
         )),
+        Event::MergeLeftOut { records, bytes } => output::arguments(format_args!(
+            "TRANSLATIONS merge left out records={records} bytes={bytes}: the file had no room \
+             beside its content, so its segments stay and no merge runs again this boot\n"
+        )),
         Event::Shed {
             reason,
             room,

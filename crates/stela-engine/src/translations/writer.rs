@@ -186,6 +186,10 @@ pub enum Event {
     /// A waiting segment found no room after a merge either: it is larger
     /// than the file holds beside the merged content, and left out.
     Lost { records: usize },
+    /// A full merge laid out its segment but the file had no room to commit
+    /// it beside its content: the file keeps the segments it had, and no
+    /// merge runs again this boot. New segments still find room.
+    MergeLeftOut { records: usize, bytes: u64 },
     /// The store began shedding new entries for `reason`, the first time
     /// this boot for it: the heap's room when measured, the pack's bytes
     /// with those pending, and those the laid-out segments hold.
@@ -1022,10 +1026,16 @@ impl<'a> Writer<'a> {
                                 Task::Idle
                             }
                             None => {
-                                self.failed = true;
-                                return Err(String::from(
-                                    "a merged segment found no room beside the file's content",
-                                ));
+                                // The file's newest commit is untouched: only
+                                // this boot's merge found no room. Keep the
+                                // writer alive so the stop and later segments
+                                // still reach the file, and merge no more.
+                                self.partial = true;
+                                events.push(Event::MergeLeftOut {
+                                    records: layout.records(),
+                                    bytes: layout.bytes(),
+                                });
+                                Task::Idle
                             }
                         }
                     }
@@ -1037,7 +1047,12 @@ impl<'a> Writer<'a> {
                     match advance(&mut execution) {
                         Some(Ok(true)) => events.push(self.finish(execution, done)),
                         Some(Err(error)) => {
+                            // Keep the write: the stop carries the same
+                            // execution out on the partition directly, where
+                            // a queue that failed while the guest ran need
+                            // not fail.
                             self.failed = true;
+                            self.task = Task::Write { execution, done };
                             return Err(error);
                         }
                         None | Some(Ok(false)) => self.task = Task::Write { execution, done },
@@ -1062,9 +1077,9 @@ impl<'a> Writer<'a> {
         run: &mut dyn FnMut(&mut Execution<'a>) -> Result<(), String>,
     ) -> Result<Stopped, String> {
         let mut stopped = Stopped::default();
-        if self.failed {
-            return Err(String::from("the writer failed earlier"));
-        }
+        // A write that failed while the guest ran is carried out here, on
+        // the partition directly: a queue that failed then need not fail
+        // now, and the file keeps its newest commit whole if this fails too.
         let mut layouts: Vec<Layout<'a>> = Vec::new();
         match core::mem::replace(&mut self.task, Task::Idle) {
             Task::Write {
