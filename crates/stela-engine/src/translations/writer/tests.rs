@@ -16,6 +16,8 @@ struct Disk {
     left: Option<u64>,
     cut: bool,
     written: u64,
+    /// Writes that fail before touching the disk, as a busy queue's do.
+    fail_writes: u32,
     /// A commit slot was written since the last flush, and the page keys
     /// each commit left, once durable.
     slot: bool,
@@ -31,6 +33,7 @@ impl Disk {
             left: None,
             cut: false,
             written: 0,
+            fail_writes: 0,
             slot: false,
             contents: Vec::new(),
             track: true,
@@ -41,6 +44,10 @@ impl Disk {
 impl Target for Disk {
     type Error = String;
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<bool, String> {
+        if self.fail_writes != 0 {
+            self.fail_writes -= 1;
+            return Err(String::from("the queue was busy"));
+        }
         let take = match self.left {
             Some(left) => (left as usize).min(bytes.len()),
             None => bytes.len(),
@@ -465,6 +472,37 @@ fn records_for(blocks: u64) -> u32 {
         .collect();
     let per_record = Layout::new(&translator, sample).bytes() / 100;
     (blocks * journal::ALIGN / per_record) as u32
+}
+
+#[test]
+fn a_write_that_fails_while_the_guest_runs_is_written_at_the_stop() {
+    let mut disk = Disk::new(FILE_BYTES);
+    let mut run = Run::new(load(&disk.bytes.clone(), u64::MAX), 1);
+    let added: BTreeSet<Digest> = run.boot.add(500).into_iter().collect();
+    // The first write the guest's queue takes fails, as a busy USB's may.
+    disk.fail_writes = 1;
+    assert!(run.run(&mut disk, FIRST_DELTA_SECONDS + 1).is_err());
+    assert!(run.writer.failed());
+    assert!(keys(&disk.bytes).is_empty());
+    // The stop carries the same write out on the partition directly, and
+    // the pack keeps what the boot added.
+    let stopped = run.stop(&mut disk).unwrap();
+    assert!(!stopped.merge_left);
+    assert_eq!(keys(&disk.bytes), added);
+}
+
+#[test]
+fn a_write_that_fails_once_is_tried_again_while_the_guest_runs() {
+    let mut disk = Disk::new(FILE_BYTES);
+    let mut run = Run::new(load(&disk.bytes.clone(), u64::MAX), 1);
+    let added: BTreeSet<Digest> = run.boot.add(500).into_iter().collect();
+    disk.fail_writes = 1;
+    assert!(run.run(&mut disk, FIRST_DELTA_SECONDS + 1).is_err());
+    assert!(run.writer.failed());
+    // A step after the retry delay writes the same execution again.
+    run.run(&mut disk, RETRY_SECONDS + 2).unwrap();
+    assert!(!run.writer.failed());
+    assert_eq!(keys(&disk.bytes), added);
 }
 
 #[test]

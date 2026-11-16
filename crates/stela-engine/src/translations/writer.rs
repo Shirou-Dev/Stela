@@ -96,6 +96,13 @@ const LOOKS_PER_SECOND: u64 = 10;
 pub const STEP_WORK: usize = 32;
 /// The most bytes a write step queues.
 pub const PIECE_BYTES: u64 = 512 << 10;
+/// How long the writer waits after a write fails while the guest runs, and
+/// how many times it tries again before leaving the write to the stop. A
+/// busy USB queue can refuse a write once and take it a step later; a pack
+/// blank for the whole boot until a clean shutdown loses everything a crash
+/// would.
+const RETRY_SECONDS: u64 = 30;
+const RETRIES: u8 = 3;
 /// The record bytes a step moves to the arena.
 pub const SETTLE_BYTES: usize = 4 << 20;
 /// The eighths of the limit a full merge keeps, once the file holds records
@@ -186,6 +193,10 @@ pub enum Event {
     /// A waiting segment found no room after a merge either: it is larger
     /// than the file holds beside the merged content, and left out.
     Lost { records: usize },
+    /// A full merge laid out its segment but the file had no room to commit
+    /// it beside its content: the file keeps the segments it had, and no
+    /// merge runs again this boot. New segments still find room.
+    MergeLeftOut { records: usize, bytes: u64 },
     /// The store began shedding new entries for `reason`, the first time
     /// this boot for it: the heap's room when measured, the pack's bytes
     /// with those pending, and those the laid-out segments hold.
@@ -320,6 +331,10 @@ pub struct Writer<'a> {
     arena_full: bool,
     arena_reported: bool,
     failed: bool,
+    /// When the writer tries a failed write again, and how many tries it
+    /// has left before the stop.
+    retry_at: u64,
+    retries: u8,
     stats: Stats,
 }
 
@@ -374,6 +389,8 @@ impl<'a> Writer<'a> {
             arena_full: false,
             arena_reported: false,
             failed: false,
+            retry_at: 0,
+            retries: RETRIES,
             stats: Stats::default(),
         };
         writer.segments = segments.into_iter().map(Segment::from).collect();
@@ -886,6 +903,7 @@ impl<'a> Writer<'a> {
 
     /// A write finished: its commit is the file's newest.
     fn finish(&mut self, execution: Box<Execution<'a>>, done: Done<'a>) -> Event {
+        self.retries = RETRIES;
         if let Some(last) = execution.last() {
             self.committed = Some(last);
         }
@@ -939,15 +957,19 @@ impl<'a> Writer<'a> {
         advance: &mut dyn FnMut(&mut Execution<'a>) -> Option<Result<bool, String>>,
     ) -> Result<Vec<Event>, String> {
         let mut events = Vec::new();
+        let now = clock();
         if self.failed {
-            return Ok(events);
+            if self.retries == 0 || now < self.retry_at {
+                return Ok(events);
+            }
+            self.failed = false;
         }
         events.extend(self.govern(entries));
         events.extend(self.settle());
         if self.idle() {
-            events.extend(self.begin(clock(), entries));
+            events.extend(self.begin(now, entries));
         } else {
-            self.hold(clock(), entries);
+            self.hold(now, entries);
         }
         loop {
             self.task = match core::mem::replace(&mut self.task, Task::Idle) {
@@ -1022,10 +1044,16 @@ impl<'a> Writer<'a> {
                                 Task::Idle
                             }
                             None => {
-                                self.failed = true;
-                                return Err(String::from(
-                                    "a merged segment found no room beside the file's content",
-                                ));
+                                // The file's newest commit is untouched: only
+                                // this boot's merge found no room. Keep the
+                                // writer alive so the stop and later segments
+                                // still reach the file, and merge no more.
+                                self.partial = true;
+                                events.push(Event::MergeLeftOut {
+                                    records: layout.records(),
+                                    bytes: layout.bytes(),
+                                });
+                                Task::Idle
                             }
                         }
                     }
@@ -1037,7 +1065,14 @@ impl<'a> Writer<'a> {
                     match advance(&mut execution) {
                         Some(Ok(true)) => events.push(self.finish(execution, done)),
                         Some(Err(error)) => {
+                            // Keep the write: a queue that failed while the
+                            // guest ran may take it a step later, and the
+                            // stop carries the same execution out on the
+                            // partition directly if the tries run out.
                             self.failed = true;
+                            self.retries = self.retries.saturating_sub(1);
+                            self.retry_at = now + self.hz * RETRY_SECONDS;
+                            self.task = Task::Write { execution, done };
                             return Err(error);
                         }
                         None | Some(Ok(false)) => self.task = Task::Write { execution, done },
@@ -1062,9 +1097,9 @@ impl<'a> Writer<'a> {
         run: &mut dyn FnMut(&mut Execution<'a>) -> Result<(), String>,
     ) -> Result<Stopped, String> {
         let mut stopped = Stopped::default();
-        if self.failed {
-            return Err(String::from("the writer failed earlier"));
-        }
+        // A write that failed while the guest ran is carried out here, on
+        // the partition directly: a queue that failed then need not fail
+        // now, and the file keeps its newest commit whole if this fails too.
         let mut layouts: Vec<Layout<'a>> = Vec::new();
         match core::mem::replace(&mut self.task, Task::Idle) {
             Task::Write {

@@ -1,0 +1,199 @@
+name: Build Boot EFI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-efi-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "1"
+
+jobs:
+  efi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Clang 21
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends clang-21 lld-21 llvm-21 libclang-21-dev
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-efi-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'crates/stela-boot/Cargo.lock') }}
+          restore-keys: cargo-efi-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustc --version
+          version="$(clang --version)"
+          echo "${version%%$'\n'*}"
+
+      - name: Cache keys
+        id: keys
+        run: |
+          pins="$(git ls-tree HEAD third_party | sha256sum | cut -c1-16)"
+          tools="$(printf '%s\n%s\n' "$(clang --version | head -1)" "$(rustc --version)" | sha256sum | cut -c1-16)"
+          echo "nvk=$pins-$tools" >> "$GITHUB_OUTPUT"
+          echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: .tools/gpu
+          key: gpu-tools-${{ steps.keys.outputs.image }}-${{ hashFiles('xtask/src/gpu/toolchain.rs') }}
+
+      - uses: actions/cache@v4
+        id: nvk
+        with:
+          path: target/gpu
+          key: nvk-${{ steps.keys.outputs.nvk }}-${{ hashFiles('xtask/src/gpu/**', 'crates/stela-driver-gpu/**', 'third_party/patches/**', 'third_party/*.sparse') }}
+          restore-keys: |
+            nvk-${{ steps.keys.outputs.nvk }}-
+
+      - uses: actions/cache@v4
+        id: boot-cache
+        with:
+          path: target/boot
+          key: boot-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/stela-boot/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            boot-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/stela-boot/Cargo.lock') }}-
+            boot-${{ runner.os }}-
+
+      - name: Configure Git identity
+        run: |
+          git config --global user.name "Stela"
+          git config --global user.email "stela@localhost"
+
+      - name: Fetch upstream sources
+        run: cargo xtask gpu fetch
+
+      - name: Keep the restored Mesa and LLVM build current
+        if: steps.nvk.outputs.cache-hit == 'true'
+        run: |
+          find third_party crates/stela-driver-gpu -path '*/.git' -prune -o -type f -print0 \
+            | xargs -0 touch -h -d '2000-01-01T00:00:00Z'
+
+      - name: Build stela.efi
+        run: |
+          cargo xtask boot build --release
+          efi=target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
+          [[ "$(head -c 2 "$efi")" == MZ ]] || { echo "::error::$efi is not a PE image"; exit 1; }
+          mkdir -p dist
+          cp "$efi" dist/stela-deploy.efi
+          cp "$efi" dist/stela.efi
+          ls -l dist/stela-deploy.efi
+          { echo "stela-deploy.efi: $(stat -c %s dist/stela-deploy.efi) bytes"; echo "sha256 $(sha256sum dist/stela-deploy.efi | cut -d' ' -f1)"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-deploy-efi
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # A stela with this run's stela.efi embedded, so `stela update` installs
+  # exactly the image the efi job built instead of the release one.
+  stela:
+    needs: efi
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/stela.exe
+            name: stela.exe
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/stela
+            name: stela
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Put LLVM on PATH
+        run: |
+          case "$RUNNER_OS" in
+            Windows) echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH" ;;
+            Linux)
+              curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+              release="$(lsb_release -cs)"
+              echo "deb http://apt.llvm.org/$release/ llvm-toolchain-$release-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+              sudo apt-get update -q
+              sudo apt-get install -y -q --no-install-recommends clang-21 llvm-21
+              echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+              ;;
+          esac
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-cli-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-cli-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+          rustc --version
+          tools=clang
+          [[ "$RUNNER_OS" == Windows ]] && tools="clang llvm-lib"
+          for tool in $tools; do
+            command -v "$tool" >/dev/null || { echo "::error::$tool is not on PATH"; exit 1; }
+          done
+          clang --version | head -1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stela-deploy-efi
+          path: efi
+
+      - name: Build stela with this run's stela.efi
+        run: |
+          export STELA_EFI="$PWD/efi/stela.efi"
+          cargo build --release --locked -p stela-cli --target "${{ matrix.target }}"
+          mkdir -p dist
+          cp "${{ matrix.binary }}" "dist/${{ matrix.name }}"
+          python=python3
+          [[ "$RUNNER_OS" == Windows ]] && python=python
+          "$python" -c 'import sys; sys.exit(open(sys.argv[1], "rb").read() not in open(sys.argv[2], "rb").read())' efi/stela.efi "dist/${{ matrix.name }}" \
+            || { echo "::error::the binary does not embed this run's stela.efi"; exit 1; }
+          "dist/${{ matrix.name }}" --version
+          echo "${{ matrix.name }}: $(wc -c < "dist/${{ matrix.name }}") bytes, embedding $(wc -c < efi/stela.efi) bytes of stela.efi" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-deploy-${{ matrix.platform }}
+          path: dist/${{ matrix.name }}
+          if-no-files-found: error
+          retention-days: 14

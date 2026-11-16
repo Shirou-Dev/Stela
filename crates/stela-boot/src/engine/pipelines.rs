@@ -296,6 +296,18 @@ impl Writer {
         self.running = None;
         self.failed = true;
     }
+
+    /// A write failed while the guest ran: keep it for the stop, which
+    /// carries the same update out on the partition directly.
+    fn stall(&mut self, error: &str) {
+        output::arguments(format_args!("PIPELINES not written: {error}\n"));
+        if let Some(running) = &mut self.running {
+            // The queued tags belong to the failed try; the stop starts
+            // its pieces again.
+            running.queued = Queued::default();
+        }
+        self.failed = true;
+    }
 }
 
 /// While the guest runs, from a processor that holds no device lock: start
@@ -304,6 +316,9 @@ impl Writer {
 pub fn step() {
     let now = super::host::fresh_counter();
     try_writer(|writer| {
+        if writer.failed {
+            return;
+        }
         if writer.running.is_none() && now < writer.quiet_until {
             return;
         }
@@ -330,7 +345,7 @@ pub fn step() {
                 writer.finish();
                 writer.quiet_until = now + super::host::COUNTER_HZ / 1000 * QUIET_MILLIS;
             }
-            Some(Err(error)) => writer.fail(&error),
+            Some(Err(error)) => writer.stall(&error),
         }
     });
 }
@@ -341,6 +356,9 @@ pub fn step() {
 pub fn write() {
     let started = output::now();
     let written = writer(|writer| {
+        // Retry what a failed step kept: the stop writes on the partition
+        // directly, so a queue that failed while the guest ran need not.
+        writer.failed = false;
         let mut bytes = 0u64;
         loop {
             if !writer.start() {

@@ -1228,6 +1228,10 @@ fn report_event(event: &Event) {
         Event::Lost { records } => output::arguments(format_args!(
             "TRANSLATIONS segment of {records} records left out: larger than the file holds\n"
         )),
+        Event::MergeLeftOut { records, bytes } => output::arguments(format_args!(
+            "TRANSLATIONS merge left out records={records} bytes={bytes}: the file had no room \
+             beside its content, so its segments stay and no merge runs again this boot\n"
+        )),
         Event::Shed {
             reason,
             room,
@@ -1294,7 +1298,13 @@ pub fn step() {
         );
         match stepped {
             Ok(events) => events.iter().for_each(report_event),
-            Err(error) => output::arguments(format_args!("TRANSLATIONS not written: {error}\n")),
+            Err(error) => {
+                // The queued tags belong to the write that failed; the
+                // retry starts its pieces again (a rewrite is the same
+                // bytes at the same offset).
+                held.queued = Queued::default();
+                output::arguments(format_args!("TRANSLATIONS not written: {error}\n"));
+            }
         }
         if !idle || !held.writer.idle() {
             let took = super::host::fresh_counter().wrapping_sub(started);
